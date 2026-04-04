@@ -236,6 +236,20 @@ def get_label_sheet_url(gc: gspread.Client, console_core_url: str, site_code: st
     return sheet_url
 
 
+def load_cfg_fields(gc: gspread.Client, config_sheet_url: str, worksheet_title: str = "Cfg__Fields") -> pd.DataFrame:
+    ws = open_ws(gc, config_sheet_url, worksheet_title)
+    df = ws_to_df(ws)
+    if df.empty:
+        raise ValueError("Cfg__Fields is empty")
+
+    need_cols = ["field_id", "entity_type", "field_key", "expr", "field_type", "data_type"]
+    for c in need_cols:
+        if c not in df.columns:
+            df[c] = ""
+
+    return df.fillna("")
+
+
 def load_export_tab_fields(gc: gspread.Client, config_sheet_url: str, worksheet_title: str = "Cfg__ExportTabFields") -> pd.DataFrame:
     ws = open_ws(gc, config_sheet_url, worksheet_title)
     df = ws_to_df(ws)
@@ -250,12 +264,31 @@ def load_export_tab_fields(gc: gspread.Client, config_sheet_url: str, worksheet_
     return df.fillna("")
 
 
-def build_field_def_map(cfg_df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
-    out = {}
-    for _, r in cfg_df.iterrows():
+def build_field_def_map(cfg_fields_df: pd.DataFrame, cfg_export_df: Optional[pd.DataFrame] = None) -> Dict[str, Dict[str, Any]]:
+    """
+    FIELD_DEF 必须优先来自 Cfg__Fields。
+    这样当某个依赖 field_id 不在当前 view 中时，仍然能补回它的 expr / entity_type / data_type。
+    若 export 里存在同 field_id 的补充信息，则只做兜底合并，不覆盖 Cfg__Fields 主定义。
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+
+    for _, r in cfg_fields_df.fillna("").iterrows():
         fid = _clean_str(r.get("field_id"))
         if fid:
             out[fid] = dict(r)
+
+    if cfg_export_df is not None and not cfg_export_df.empty:
+        for _, r in cfg_export_df.fillna("").iterrows():
+            fid = _clean_str(r.get("field_id"))
+            if not fid:
+                continue
+            if fid not in out:
+                out[fid] = dict(r)
+            else:
+                for k, v in dict(r).items():
+                    if _is_blank(out[fid].get(k)) and not _is_blank(v):
+                        out[fid][k] = v
+
     return out
 
 
@@ -287,16 +320,29 @@ def parse_mf_value_expr(expr: Any) -> Optional[Tuple[str, str]]:
 
 def expand_calc_dependencies(view_df: pd.DataFrame) -> set[str]:
     """
-    找出当前 view 中所有 CALC expr 依赖到的 field_id
+    找出当前 view 中所有 CALC expr 依赖到的 field_id。
+    关键修复：
+    - 递归展开时，不能只看当前 view；
+    - 若占位符 field_id 只存在于 Cfg__Fields，也必须继续向下追。
     """
     deps = set()
     changed = True
 
-    all_rows = { _clean_str(r.get("field_id")): dict(r) for _, r in view_df.iterrows() }
+    view_rows = {_clean_str(r.get("field_id")): dict(r) for _, r in view_df.iterrows()}
+
+    def get_row(fid: str) -> Dict[str, Any]:
+        return view_rows.get(fid) or FIELD_DEF.get(fid) or {}
 
     while changed:
         changed = False
-        for _, r in view_df.iterrows():
+        scan_rows: List[Dict[str, Any]] = [dict(r) for _, r in view_df.iterrows()]
+
+        for dep in list(deps):
+            dep_row = get_row(dep)
+            if dep_row:
+                scan_rows.append(dep_row)
+
+        for r in scan_rows:
             ft = _clean_str(r.get("field_type")).upper()
             ex = _clean_str(r.get("expr"))
             if ft != "CALC" or not ex:
@@ -308,26 +354,19 @@ def expand_calc_dependencies(view_df: pd.DataFrame) -> set[str]:
                     deps.add(fid)
                     changed = True
 
-                dep_row = all_rows.get(fid)
-                if dep_row and _clean_str(dep_row.get("field_type")).upper() == "CALC":
-                    nested = set(_placeholder_re.findall(_clean_str(dep_row.get("expr"))))
-                    for x in nested:
-                        if x not in deps:
-                            deps.add(x)
-                            changed = True
     return deps
 
 
 def make_fetch_df(view_df: pd.DataFrame, deps: set[str]) -> pd.DataFrame:
     """
     规则：
-    - 当前 view 中 RAW 行要取
-    - 当前 view 中 join key 对应字段要取
-    - CALC 自身不取，但其依赖的 field_id 要取
+    - 当前 view 中非 CALC 行要取
+    - CALC 自身不取，但其依赖 field_id 要补进 fetch
+    - 依赖若不在当前 view，必须回到 FIELD_DEF（Cfg__Fields）取完整定义
+    这就是本次修复点；否则像 core.product_gid 这类“被间接依赖但不在当前 view 的字段”会被漏抓。
     """
-    rows = []
-    fid_map = { _clean_str(r.get("field_id")): dict(r) for _, r in view_df.iterrows() }
-
+    rows: List[Dict[str, Any]] = []
+    fid_map_view = {_clean_str(r.get("field_id")): dict(r) for _, r in view_df.iterrows()}
     seen = set()
 
     for _, r in view_df.iterrows():
@@ -336,16 +375,32 @@ def make_fetch_df(view_df: pd.DataFrame, deps: set[str]) -> pd.DataFrame:
         if not fid:
             continue
 
-        if ft != "CALC":
-            if fid not in seen:
-                rows.append(dict(r))
-                seen.add(fid)
+        if ft != "CALC" and fid not in seen:
+            rows.append(dict(r))
+            seen.add(fid)
 
     for dep in deps:
-        dep_row = fid_map.get(dep)
-        if dep_row and dep not in seen:
-            rows.append(dep_row)
-            seen.add(dep)
+        if dep in seen:
+            continue
+
+        dep_row = fid_map_view.get(dep)
+        if dep_row is None:
+            dep_row = dict(FIELD_DEF.get(dep) or {})
+
+        if not dep_row:
+            continue
+
+        dep_row.setdefault("view_id", "__FETCH_DEPS__")
+        dep_row.setdefault("join key", "")
+        dep_row.setdefault("seq", "999999")
+        dep_row.setdefault("alias", "")
+        dep_row.setdefault("required", "")
+        dep_row.setdefault("notes", "auto-added dep for CALC / join")
+        dep_row["field_id"] = dep
+        dep_row["field_type"] = _clean_str(dep_row.get("field_type")).upper() or "RAW"
+
+        rows.append(dep_row)
+        seen.add(dep)
 
     out = pd.DataFrame(rows).fillna("")
     if out.empty:
@@ -881,8 +936,9 @@ def run(
     config_sheet_url = get_label_sheet_url(gc, console_core_url, site_code, "config")
     out_sheet_url = get_label_sheet_url(gc, console_core_url, site_code, "export_product")
 
+    cfg_fields_df = load_cfg_fields(gc, config_sheet_url, worksheet_title="Cfg__Fields")
     cfg_df = load_export_tab_fields(gc, config_sheet_url, worksheet_title=cfg_export_tab_fields_ws)
-    FIELD_DEF = build_field_def_map(cfg_df)
+    FIELD_DEF = build_field_def_map(cfg_fields_df, cfg_df)
 
     def get_effective_mode(default_mode: str, override: str) -> str:
         m = _clean_str(override).upper()
