@@ -1074,6 +1074,7 @@ def apply_plan(
 ) -> dict[str, Any]:
     total = len(set_inputs)
     if total == 0:
+        print("=== Applying metafieldsSet === total=0, batches=0, batch_size=0")
         return {
             "ok_count": 0,
             "fail_count": 0,
@@ -1081,12 +1082,17 @@ def apply_plan(
             "detail_fail_rows": [],
         }
 
+    total_batches = (total + set_batch_size - 1) // set_batch_size
+    print(f"=== Applying metafieldsSet === total={total}, batches={total_batches}, batch_size={set_batch_size}")
+
     ok_count = 0
     fail_count = 0
     detail_fail_rows = []
 
-    for start_idx, batch in _chunk_list(set_inputs, set_batch_size):
+    for batch_no, (start_idx, batch) in enumerate(_chunk_list(set_inputs, set_batch_size), start=1):
         meta_batch = meta_rows[start_idx:start_idx + len(batch)]
+
+        print(f"Batch {batch_no}/{total_batches}: {len(batch)} items ... ", end="", flush=True)
 
         try:
             data = gql(client, M_SET, {"metafields": batch})
@@ -1095,17 +1101,23 @@ def apply_plan(
 
             if not user_errors:
                 ok_count += len(batch)
+                print("OK", flush=True)
                 continue
 
             err_by_i = {}
+            non_indexed_errors = []
+
             for e in user_errors:
                 idx = parse_error_index(e.get("field"))
-                err_by_i.setdefault(idx, []).append(e)
+                if idx is None:
+                    non_indexed_errors.append(e)
+                else:
+                    err_by_i.setdefault(idx, []).append(e)
 
             fail_items = 0
 
             for idx, errs in err_by_i.items():
-                if idx is None or not (0 <= idx < len(meta_batch)):
+                if not (0 <= idx < len(meta_batch)):
                     continue
 
                 fail_items += 1
@@ -1126,20 +1138,48 @@ def apply_plan(
                     ),
                 })
 
+            # Shopify 返回了 userErrors，但没有给出可定位到某一项的 index
             if fail_items == 0:
                 fail_count += len(batch)
+                print(f"FAILED (fail={len(batch)})", flush=True)
+
                 detail_fail_rows.append({
                     "entity_type": "",
                     "owner_id": "",
                     "field_key": "",
                     "error_reason": "shopify_batch_error",
-                    "message": f"batch_error start={start_idx} size={len(batch)} | no per-item index returned",
+                    "message": (
+                        f"batch_error start={start_idx} size={len(batch)} | "
+                        f"no per-item index returned | "
+                        f"user_errors={json.dumps(non_indexed_errors, ensure_ascii=False)[:500]}"
+                    ),
                 })
             else:
+                batch_ok = len(batch) - fail_items
+                ok_count += batch_ok
                 fail_count += fail_items
+
+                print(f"PARTIAL_FAIL (ok={batch_ok}, fail={fail_items})", flush=True)
+
+                for e in non_indexed_errors[:3]:
+                    detail_fail_rows.append({
+                        "entity_type": "",
+                        "owner_id": "",
+                        "field_key": "",
+                        "error_reason": "shopify_batch_error",
+                        "message": (
+                            f"batch_error start={start_idx} size={len(batch)} | "
+                            f"code={e.get('code', '')} | "
+                            f"msg={e.get('message', '')} | "
+                            f"field={e.get('field')}"
+                        ),
+                    })
 
         except Exception as e:
             fail_count += len(batch)
+            print("FAILED", flush=True)
+            print(f"  exception: {e}", flush=True)
+
             for r, inp in zip(meta_batch, batch):
                 detail_fail_rows.append({
                     "entity_type": r.get("entity_type", ""),
@@ -1151,6 +1191,11 @@ def apply_plan(
                         f"ns={inp.get('namespace')} key={inp.get('key')} type={inp.get('type')}"
                     ),
                 })
+
+    print(
+        f"=== Apply done === total={total}, ok={ok_count}, fail={fail_count}",
+        flush=True,
+    )
 
     return {
         "ok_count": ok_count,
