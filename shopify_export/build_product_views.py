@@ -609,7 +609,7 @@ def build_and_write_view(
     df_dl_values_long: pd.DataFrame,
     view_id: str,
     global_filters: Optional[Dict[str, Any]] = None,
-    use_default_filters: bool = True,
+    filter_mode: str = "AND",
     view_filter_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     verbose: bool = True,
 ) -> Dict[str, Any]:
@@ -629,7 +629,7 @@ def build_and_write_view(
     base_entity_type = _safe_str(tab.get("base_entity_type")).upper()
     base_sheet = _safe_str(tab.get("base_sheet")).upper()
     base_key_field_id = _safe_str(tab.get("base_key_field_id"))
-    fixed_filter_mode = _safe_str(tab.get("fixed_filter_mode")) or "AND"
+    fixed_filter_mode = _safe_str(tab.get("fixed_filter_mode")) or filter_mode or "AND"
     fixed_filters_json = _safe_json_loads(tab.get("fixed_filters_json"))
 
     if layout != "WIDE":
@@ -656,7 +656,7 @@ def build_and_write_view(
 
     # ---- filters
     global_pf, global_vf = split_filters_by_entity(global_filters)
-    fixed_pf, fixed_vf = split_filters_by_entity(fixed_filters_json if use_default_filters else {})
+    fixed_pf, fixed_vf = split_filters_by_entity(fixed_filters_json)
     override_pf, override_vf = split_filters_by_entity(view_filter_overrides.get(view_id, {}))
 
     if base_entity_type == "PRODUCT":
@@ -673,7 +673,6 @@ def build_and_write_view(
     base_df = apply_entity_filters(base_df, merged_filters, fixed_filter_mode)
 
     if base_key_field_id and base_key_field_id not in base_df.columns:
-        # 容忍历史 header 未补实体前缀的情况
         short_key = base_key_field_id.split("|", 1)[-1] if "|" in base_key_field_id else base_key_field_id
         if short_key in base_df.columns:
             base_key_field_id = short_key
@@ -749,10 +748,6 @@ def build_and_write_view(
         ws_update(ws, f"A2:{col_to_letter(len(display_headers))}{len(body_values)+1}", body_values)
 
     # ---- 公式 token -> col 映射
-    # 支持三种 token：
-    # 1) {field_id}         例如 {PRODUCT|core.legacy_id}
-    # 2) {alias}            例如 {Product Image}
-    # 3) {output_key}       内部 key
     token_to_col_letter = {}
     for i, fr in enumerate(field_rows, start=1):
         col_letter = col_to_letter(i)
