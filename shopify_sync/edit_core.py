@@ -1396,15 +1396,22 @@ def apply_metafield_plan(
     set_batch_size: int,
 ) -> dict[str, Any]:
     total = len(set_inputs)
+    total_batches = (total + set_batch_size - 1) // set_batch_size if total else 0
+
+    print(f"=== Applying metafieldsSet === total={total}, batches={total_batches}, batch_size={set_batch_size}")
+
     if total == 0:
+        print(f"=== metafieldsSet done === total=0, ok=0, fail=0")
         return {"ok_count": 0, "fail_count": 0, "detail_fail_rows": []}
 
     ok_count = 0
     fail_count = 0
     detail_fail_rows = []
 
-    for start_idx, batch in _chunk_list(set_inputs, set_batch_size):
+    for batch_no, (start_idx, batch) in enumerate(_chunk_list(set_inputs, set_batch_size), start=1):
         meta_batch = meta_rows[start_idx:start_idx + len(batch)]
+        print(f"Batch {batch_no}/{total_batches}: {len(batch)} items ... ", end="", flush=True)
+
         try:
             data = gql(client, M_METAFIELDS_SET, {"metafields": batch})
             resp = data["metafieldsSet"]
@@ -1412,16 +1419,22 @@ def apply_metafield_plan(
 
             if not user_errors:
                 ok_count += len(batch)
+                print("OK", flush=True)
                 continue
 
             err_by_i = {}
+            non_indexed_errors = []
+
             for e in user_errors:
                 idx = parse_error_index(e.get("field"))
-                err_by_i.setdefault(idx, []).append(e)
+                if idx is None:
+                    non_indexed_errors.append(e)
+                else:
+                    err_by_i.setdefault(idx, []).append(e)
 
             fail_items = 0
             for idx, errs in err_by_i.items():
-                if idx is None or not (0 <= idx < len(meta_batch)):
+                if not (0 <= idx < len(meta_batch)):
                     continue
                 fail_items += 1
                 r = meta_batch[idx]
@@ -1439,7 +1452,24 @@ def apply_metafield_plan(
                     ),
                 })
 
-            fail_count += max(fail_items, 1)
+            if fail_items == 0:
+                fail_count += len(batch)
+                detail_fail_rows.append({
+                    "entity_type": "",
+                    "owner_id": "",
+                    "field_key": "",
+                    "error_reason": "shopify_batch_error",
+                    "message": (
+                        f"batch_error start={start_idx} size={len(batch)} | "
+                        f"user_errors={json.dumps(non_indexed_errors, ensure_ascii=False)[:500]}"
+                    ),
+                })
+                print(f"FAILED (fail={len(batch)})", flush=True)
+            else:
+                batch_ok = len(batch) - fail_items
+                ok_count += batch_ok
+                fail_count += fail_items
+                print(f"PARTIAL_FAIL (ok={batch_ok}, fail={fail_items})", flush=True)
 
         except Exception as e:
             fail_count += len(batch)
@@ -1451,9 +1481,11 @@ def apply_metafield_plan(
                     "error_reason": "batch_exception",
                     "message": f"sheet_row={r.get('sheet_row')} | exception: {e}",
                 })
+            print(f"FAILED (fail={len(batch)})", flush=True)
 
+    print(f"=== metafieldsSet done === total={total}, ok={ok_count}, fail={fail_count}")
     return {"ok_count": ok_count, "fail_count": fail_count, "detail_fail_rows": detail_fail_rows}
-
+    
 
 def fetch_product_tags(client: ShopifyClient, product_id: str) -> list[str]:
     q = """
@@ -1478,110 +1510,185 @@ def apply_product_core_plan(
     product_inputs: list[dict[str, Any]],
     product_meta_rows: list[dict[str, Any]],
     tag_delta_rows: list[dict[str, Any]],
+    set_batch_size: int,
 ) -> dict[str, Any]:
+    ops = []
+
+    for inp, meta in zip(product_inputs, product_meta_rows):
+        ops.append({
+            "op_kind": "product_update",
+            "input": inp,
+            "meta": meta,
+        })
+
+    for row in tag_delta_rows:
+        ops.append({
+            "op_kind": "product_tags_delta",
+            "row": row,
+            "meta": {
+                "entity_type": "PRODUCT",
+                "owner_id": row["owner_id"],
+                "field_key": "core.tags",
+                "sheet_rows": row.get("sheet_rows", []),
+            },
+        })
+
+    total = len(ops)
+    total_batches = (total + set_batch_size - 1) // set_batch_size if total else 0
+
+    print(f"=== Applying productUpdate === total={total}, batches={total_batches}, batch_size={set_batch_size}")
+
+    if total == 0:
+        print(f"=== productUpdate done === total=0, ok=0, fail=0")
+        return {"ok_count": 0, "fail_count": 0, "detail_fail_rows": []}
+
     ok_count = 0
     fail_count = 0
     detail_fail_rows = []
 
-    # direct productUpdate for title/productType/tags SET/CLEAR
-    for inp, meta in zip(product_inputs, product_meta_rows):
-        try:
-            data = gql(client, M_PRODUCT_UPDATE, {"input": inp})
-            errs = (data.get("productUpdate") or {}).get("userErrors") or []
-            if errs:
-                fail_count += 1
+    for batch_no, (start_idx, batch_ops) in enumerate(_chunk_list(ops, set_batch_size), start=1):
+        batch_ok = 0
+        batch_fail = 0
+
+        for op in batch_ops:
+            try:
+                if op["op_kind"] == "product_update":
+                    inp = op["input"]
+                    meta = op["meta"]
+
+                    data = gql(client, M_PRODUCT_UPDATE, {"input": inp})
+                    errs = (data.get("productUpdate") or {}).get("userErrors") or []
+                    if errs:
+                        batch_fail += 1
+                        detail_fail_rows.append({
+                            "entity_type": meta.get("entity_type", ""),
+                            "owner_id": meta.get("owner_id", ""),
+                            "field_key": meta.get("field_key", ""),
+                            "error_reason": "product_update_error",
+                            "message": f"sheet_rows={meta.get('sheet_rows')} | msg={errs[0].get('message', '')} | field={errs[0].get('field')}",
+                        })
+                    else:
+                        batch_ok += 1
+
+                elif op["op_kind"] == "product_tags_delta":
+                    row = op["row"]
+
+                    current_tags = fetch_product_tags(client, row["owner_id"])
+                    cur_set = {t.strip() for t in current_tags if _norm_str(t)}
+                    delta = {t.strip() for t in row["tags"] if _norm_str(t)}
+
+                    if row["mode"] == "ADD":
+                        final_tags = sorted(cur_set | delta)
+                    else:
+                        final_tags = sorted(cur_set - delta)
+
+                    data = gql(client, M_PRODUCT_UPDATE, {"input": {"id": row["owner_id"], "tags": final_tags}})
+                    errs = (data.get("productUpdate") or {}).get("userErrors") or []
+                    if errs:
+                        batch_fail += 1
+                        detail_fail_rows.append({
+                            "entity_type": "PRODUCT",
+                            "owner_id": row["owner_id"],
+                            "field_key": "core.tags",
+                            "error_reason": "product_tags_delta_error",
+                            "message": f"sheet_rows={row.get('sheet_rows')} | msg={errs[0].get('message', '')} | field={errs[0].get('field')}",
+                        })
+                    else:
+                        batch_ok += 1
+
+            except Exception as e:
+                batch_fail += 1
+                meta = op["meta"]
                 detail_fail_rows.append({
                     "entity_type": meta.get("entity_type", ""),
                     "owner_id": meta.get("owner_id", ""),
                     "field_key": meta.get("field_key", ""),
-                    "error_reason": "product_update_error",
-                    "message": f"sheet_rows={meta.get('sheet_rows')} | msg={errs[0].get('message', '')} | field={errs[0].get('field')}",
+                    "error_reason": (
+                        "product_tags_delta_exception"
+                        if op["op_kind"] == "product_tags_delta"
+                        else "product_update_exception"
+                    ),
+                    "message": f"sheet_rows={meta.get('sheet_rows')} | exception={e}",
                 })
-            else:
-                ok_count += 1
-        except Exception as e:
-            fail_count += 1
-            detail_fail_rows.append({
-                "entity_type": meta.get("entity_type", ""),
-                "owner_id": meta.get("owner_id", ""),
-                "field_key": meta.get("field_key", ""),
-                "error_reason": "product_update_exception",
-                "message": f"sheet_rows={meta.get('sheet_rows')} | exception={e}",
-            })
 
-    # tag ADD/REMOVE
-    for row in tag_delta_rows:
-        try:
-            current_tags = fetch_product_tags(client, row["owner_id"])
-            cur_set = {t.strip() for t in current_tags if _norm_str(t)}
-            delta = {t.strip() for t in row["tags"] if _norm_str(t)}
-            if row["mode"] == "ADD":
-                final_tags = sorted(cur_set | delta)
-            else:
-                final_tags = sorted(cur_set - delta)
+        ok_count += batch_ok
+        fail_count += batch_fail
 
-            data = gql(client, M_PRODUCT_UPDATE, {"input": {"id": row["owner_id"], "tags": final_tags}})
-            errs = (data.get("productUpdate") or {}).get("userErrors") or []
-            if errs:
-                fail_count += 1
-                detail_fail_rows.append({
-                    "entity_type": "PRODUCT",
-                    "owner_id": row["owner_id"],
-                    "field_key": "core.tags",
-                    "error_reason": "product_tags_delta_error",
-                    "message": f"sheet_rows={row.get('sheet_rows')} | msg={errs[0].get('message', '')} | field={errs[0].get('field')}",
-                })
-            else:
-                ok_count += 1
-        except Exception as e:
-            fail_count += 1
-            detail_fail_rows.append({
-                "entity_type": "PRODUCT",
-                "owner_id": row["owner_id"],
-                "field_key": "core.tags",
-                "error_reason": "product_tags_delta_exception",
-                "message": f"sheet_rows={row.get('sheet_rows')} | exception={e}",
-            })
+        print(f"Batch {batch_no}/{total_batches}: {len(batch_ops)} items ... ", end="", flush=True)
+        if batch_fail == 0:
+            print("OK", flush=True)
+        elif batch_ok == 0:
+            print(f"FAILED (fail={batch_fail})", flush=True)
+        else:
+            print(f"PARTIAL_FAIL (ok={batch_ok}, fail={batch_fail})", flush=True)
 
+    print(f"=== productUpdate done === total={total}, ok={ok_count}, fail={fail_count}")
     return {"ok_count": ok_count, "fail_count": fail_count, "detail_fail_rows": detail_fail_rows}
-
+    
 
 def apply_variant_core_plan(
     client: ShopifyClient,
     variant_inputs: list[dict[str, Any]],
     variant_meta_rows: list[dict[str, Any]],
+    set_batch_size: int,
 ) -> dict[str, Any]:
+    total = len(variant_inputs)
+    total_batches = (total + set_batch_size - 1) // set_batch_size if total else 0
+
+    print(f"=== Applying productVariantUpdate === total={total}, batches={total_batches}, batch_size={set_batch_size}")
+
+    if total == 0:
+        print(f"=== productVariantUpdate done === total=0, ok=0, fail=0")
+        return {"ok_count": 0, "fail_count": 0, "detail_fail_rows": []}
+
     ok_count = 0
     fail_count = 0
     detail_fail_rows = []
 
-    for inp, meta in zip(variant_inputs, variant_meta_rows):
-        try:
-            data = gql(client, M_PRODUCT_VARIANT_UPDATE, {"input": inp})
-            errs = (data.get("productVariantUpdate") or {}).get("userErrors") or []
-            if errs:
-                fail_count += 1
+    for batch_no, (start_idx, batch_inputs) in enumerate(_chunk_list(variant_inputs, set_batch_size), start=1):
+        batch_meta = variant_meta_rows[start_idx:start_idx + len(batch_inputs)]
+        batch_ok = 0
+        batch_fail = 0
+
+        for inp, meta in zip(batch_inputs, batch_meta):
+            try:
+                data = gql(client, M_PRODUCT_VARIANT_UPDATE, {"input": inp})
+                errs = (data.get("productVariantUpdate") or {}).get("userErrors") or []
+                if errs:
+                    batch_fail += 1
+                    detail_fail_rows.append({
+                        "entity_type": meta.get("entity_type", ""),
+                        "owner_id": meta.get("owner_id", ""),
+                        "field_key": meta.get("field_key", ""),
+                        "error_reason": "variant_update_error",
+                        "message": f"sheet_rows={meta.get('sheet_rows')} | msg={errs[0].get('message', '')} | field={errs[0].get('field')}",
+                    })
+                else:
+                    batch_ok += 1
+            except Exception as e:
+                batch_fail += 1
                 detail_fail_rows.append({
                     "entity_type": meta.get("entity_type", ""),
                     "owner_id": meta.get("owner_id", ""),
                     "field_key": meta.get("field_key", ""),
-                    "error_reason": "variant_update_error",
-                    "message": f"sheet_rows={meta.get('sheet_rows')} | msg={errs[0].get('message', '')} | field={errs[0].get('field')}",
+                    "error_reason": "variant_update_exception",
+                    "message": f"sheet_rows={meta.get('sheet_rows')} | exception={e}",
                 })
-            else:
-                ok_count += 1
-        except Exception as e:
-            fail_count += 1
-            detail_fail_rows.append({
-                "entity_type": meta.get("entity_type", ""),
-                "owner_id": meta.get("owner_id", ""),
-                "field_key": meta.get("field_key", ""),
-                "error_reason": "variant_update_exception",
-                "message": f"sheet_rows={meta.get('sheet_rows')} | exception={e}",
-            })
 
+        ok_count += batch_ok
+        fail_count += batch_fail
+
+        print(f"Batch {batch_no}/{total_batches}: {len(batch_inputs)} items ... ", end="", flush=True)
+        if batch_fail == 0:
+            print("OK", flush=True)
+        elif batch_ok == 0:
+            print(f"FAILED (fail={batch_fail})", flush=True)
+        else:
+            print(f"PARTIAL_FAIL (ok={batch_ok}, fail={batch_fail})", flush=True)
+
+    print(f"=== productVariantUpdate done === total={total}, ok={ok_count}, fail={fail_count}")
     return {"ok_count": ok_count, "fail_count": fail_count, "detail_fail_rows": detail_fail_rows}
-
+    
 
 # =========================================================
 # Main entry
