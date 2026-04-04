@@ -416,24 +416,24 @@ def make_fetch_df(view_df: pd.DataFrame, deps: set[str]) -> pd.DataFrame:
 def strip_entity_prefix(expr: str, entity_type: str) -> str:
     """
     统一把 expr 转成 GraphQL 节点下路径。
-    并兼容旧版 variant weight 写法。
+    并兼容旧版 variant weight / weightUnit 写法。
     """
-    s = _clean_str(expr)
-
-    # ---- 兼容旧版 weight 写法 ----
-    if entity_type == "VARIANT":
-        if s == "variant.weight":
-            return "inventoryItem.measurement.weight.value"
-        if s == "variant.weightUnit":
-            return "inventoryItem.measurement.weight.unit"
-
     pref = {
         "PRODUCT": "product.",
         "VARIANT": "variant.",
     }.get(entity_type, "")
 
+    s = _clean_str(expr)
     if pref and s.startswith(pref):
         s = s[len(pref):]
+
+    # ---- 兼容旧版 weight 写法（与原 ipynb 一致：先去前缀，再 remap）----
+    if entity_type == "VARIANT":
+        k = s.strip()
+        if k == "weight":
+            return "inventoryItem.measurement.weight.value"
+        if k == "weightUnit":
+            return "inventoryItem.measurement.weight.unit"
 
     return s
 
@@ -667,6 +667,9 @@ def build_plan(fetch_df: pd.DataFrame, entity_type: str) -> Dict[str, Any]:
             head = parts[0]
             tail = build_nested_fields(parts[1:])
             gql_lines.append(f"{a}: {head} {{ {tail} }}")
+            # 与原 ipynb 一致：普通嵌套对象字段必须记录 leaf_tail，
+            # 否则 node_to_row 会把整个对象直接 json 化写进表里。
+            leaf_tail[fid] = parts[1:]
 
         raw_rows.append((fid, ex))
 
