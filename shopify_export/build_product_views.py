@@ -413,9 +413,16 @@ def _build_row_maps(df_products: pd.DataFrame, df_variants: pd.DataFrame):
     建立 PRODUCT / VARIANT 的常用索引
     """
     product_by_gid = {}
+    product_by_legacy_id = {}
     variant_by_gid = {}
 
     product_gid_col = "PRODUCT|core.gid" if "PRODUCT|core.gid" in df_products.columns else None
+    product_legacy_cols = [
+        "PRODUCT|core.legacy_id",
+        "PRODUCT|core.legacyResourceId",
+        "PRODUCT|product.legacyResourceId",
+    ]
+
     variant_gid_col = "VARIANT|core.gid" if "VARIANT|core.gid" in df_variants.columns else None
 
     if product_gid_col:
@@ -423,6 +430,16 @@ def _build_row_maps(df_products: pd.DataFrame, df_variants: pd.DataFrame):
             gid = _as_scalar(r.get(product_gid_col, ""))
             if gid:
                 product_by_gid[gid] = r
+
+    for _, r in df_products.iterrows():
+        pid = ""
+        for c in product_legacy_cols:
+            if c in df_products.columns:
+                pid = _as_scalar(r.get(c, ""))
+                if pid:
+                    break
+        if pid:
+            product_by_legacy_id[pid] = r
 
     if variant_gid_col:
         for _, r in df_variants.iterrows():
@@ -432,42 +449,73 @@ def _build_row_maps(df_products: pd.DataFrame, df_variants: pd.DataFrame):
 
     return {
         "product_by_gid": product_by_gid,
+        "product_by_legacy_id": product_by_legacy_id,
         "variant_by_gid": variant_by_gid,
     }
 
 
-def _build_variant_product_bridge(df_variants: pd.DataFrame) -> Dict[str, str]:
+def _build_variant_product_bridge(
+    df_variants: pd.DataFrame,
+    row_maps: Dict[str, Any],
+) -> Dict[str, str]:
     """
     让 VARIANT 行能找到所属 PRODUCT gid
-    优先尝试这些列：
-    - VARIANT|core.product.gid
-    - VARIANT|core.parent.gid
-    - PRODUCT|core.gid（如果 merge 后已在变体表里）
+    返回:
+      bridge[variant_gid] = product_gid
+
+    优先：
+    1) 直接从 variant 行里的 product gid 列取
+    2) 再从 variant 行里的 product legacy id 列，去 product_by_legacy_id 反查 product gid
     """
     bridge = {}
     if df_variants is None or df_variants.empty:
         return bridge
 
     variant_gid_col = "VARIANT|core.gid" if "VARIANT|core.gid" in df_variants.columns else None
+    if not variant_gid_col:
+        return bridge
+
     candidate_product_gid_cols = [
         "VARIANT|core.product.gid",
         "VARIANT|core.parent.gid",
         "PRODUCT|core.gid",
     ]
 
-    if not variant_gid_col:
-        return bridge
+    candidate_product_legacy_cols = [
+        "VARIANT|core.product.legacy_id",
+        "VARIANT|core.product.legacyResourceId",
+        "VARIANT|product.legacyResourceId",
+        "PRODUCT|core.legacy_id",
+        "PRODUCT|core.legacyResourceId",
+    ]
 
     for _, r in df_variants.iterrows():
         vg = _as_scalar(r.get(variant_gid_col, ""))
         if not vg:
             continue
+
+        # 1) 先直接找 product gid
         pg = ""
         for c in candidate_product_gid_cols:
             if c in df_variants.columns:
                 pg = _as_scalar(r.get(c, ""))
                 if pg:
                     break
+
+        # 2) gid 没找到，再用 legacy_id 反查
+        if not pg:
+            product_legacy_id = ""
+            for c in candidate_product_legacy_cols:
+                if c in df_variants.columns:
+                    product_legacy_id = _as_scalar(r.get(c, ""))
+                    if product_legacy_id:
+                        break
+
+            if product_legacy_id:
+                product_row = row_maps.get("product_by_legacy_id", {}).get(product_legacy_id)
+                if product_row is not None:
+                    pg = _as_scalar(product_row.get("PRODUCT|core.gid", ""))
+
         if pg:
             bridge[vg] = pg
 
@@ -519,10 +567,37 @@ def _resolve_related_rows(
 
     elif base_entity_type == "VARIANT":
         variant_row = base_row
-        variant_gid = _as_scalar(base_row.get("VARIANT|core.gid", ""))
-        product_gid = variant_product_bridge.get(variant_gid, "")
-        if product_gid:
-            product_row = row_maps["product_by_gid"].get(product_gid)
+
+        # 先尝试直接从当前 variant 行里拿 product gid
+        direct_product_gid_candidates = [
+            "VARIANT|core.product.gid",
+            "VARIANT|core.parent.gid",
+            "PRODUCT|core.gid",
+        ]
+        direct_product_gid = _get_from_row_by_candidates(base_row, direct_product_gid_candidates)
+
+        if direct_product_gid:
+            product_row = row_maps["product_by_gid"].get(direct_product_gid)
+
+        # 再用 bridge
+        if product_row is None:
+            variant_gid = _as_scalar(base_row.get("VARIANT|core.gid", ""))
+            product_gid = variant_product_bridge.get(variant_gid, "")
+            if product_gid:
+                product_row = row_maps["product_by_gid"].get(product_gid)
+
+        # 再 fallback：直接用 product legacy id 反查
+        if product_row is None:
+            direct_product_legacy_candidates = [
+                "VARIANT|core.product.legacy_id",
+                "VARIANT|core.product.legacyResourceId",
+                "VARIANT|product.legacyResourceId",
+                "PRODUCT|core.legacy_id",
+                "PRODUCT|core.legacyResourceId",
+            ]
+            product_legacy_id = _get_from_row_by_candidates(base_row, direct_product_legacy_candidates)
+            if product_legacy_id:
+                product_row = row_maps.get("product_by_legacy_id", {}).get(product_legacy_id)
 
     return {
         "PRODUCT": product_row,
@@ -546,12 +621,14 @@ def _resolve_raw_value(
     field_row: Dict[str, Any],
     related_rows: Dict[str, Optional[pd.Series]],
     long_value_map: Dict[Tuple[str, str, str], str],
+    base_row: Optional[pd.Series] = None,
 ) -> str:
     """
     RAW 取值规则：
     1. 先按 field_id / field_key 到对应实体 row 找
-    2. 找不到再按 expr（非公式）指向的列名找
-    3. 还找不到再去 DL__ValuesLong 按 (entity_type, gid, field_key) 找
+    2. 若当前是 VARIANT base，且要取 PRODUCT 字段，允许直接从 base_row 上取 PRODUCT|... 列
+    3. 找不到再按 expr（非公式）指向的列名找
+    4. 还找不到再去 DL__ValuesLong 按 (entity_type, gid, field_key) 找
     """
     field_id = _safe_str(field_row.get("field_id"))
     field_key = _safe_str(field_row.get("field_key"))
@@ -575,18 +652,33 @@ def _resolve_raw_value(
     if v != "":
         return v
 
-    # 2) expr 非公式时，允许 expr 作为“源列名”
+    # 2) fallback：当前 base_row 里如果已经带了 PRODUCT|... / VARIANT|... 列，也直接拿
+    if base_row is not None:
+        v = _get_from_row_by_candidates(base_row, candidates)
+        if v != "":
+            return v
+
+    # 3) expr 非公式时，允许 expr 作为“源列名”
     if expr and not expr.startswith("="):
         expr_candidates = [expr]
         if "|" not in expr and entity_type:
             expr_candidates.append(f"{entity_type}|{expr}")
+
         v = _get_from_row_by_candidates(row, expr_candidates)
         if v != "":
             return v
 
-    # 3) 去 DL__ValuesLong
+        if base_row is not None:
+            v = _get_from_row_by_candidates(base_row, expr_candidates)
+            if v != "":
+                return v
+
+    # 4) 去 DL__ValuesLong
     if row is not None and field_key:
-        gid = _get_from_row_by_candidates(row, [f"{entity_type}|core.gid", f"{entity_type}|gid", "core.gid", "gid"])
+        gid = _get_from_row_by_candidates(
+            row,
+            [f"{entity_type}|core.gid", f"{entity_type}|gid", "core.gid", "gid"]
+        )
         if gid:
             v = long_value_map.get((entity_type, gid, field_key), "")
             if v != "":
@@ -682,7 +774,7 @@ def build_and_write_view(
 
     # ---- 预备 map
     row_maps = _build_row_maps(df_idx_products, df_idx_variants)
-    variant_product_bridge = _build_variant_product_bridge(df_idx_variants)
+    variant_product_bridge = _build_variant_product_bridge(df_idx_variants, row_maps)
     long_value_map = _build_long_value_map(df_dl_values_long)
 
     # ---- fields
@@ -717,6 +809,7 @@ def build_and_write_view(
                     field_row=fr,
                     related_rows=related_rows,
                     long_value_map=long_value_map,
+                    base_row=base_row,
                 )
 
         out_rows.append(one)
