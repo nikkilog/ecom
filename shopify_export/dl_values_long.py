@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import base64
-import io
 import json
 import re
 import time
@@ -128,7 +127,7 @@ def build_gspread_client_from_b64(sa_b64: str) -> gspread.Client:
 
 
 def now_cn_str() -> str:
-    return pd.Timestamp.utcnow().tz_localize("UTC").tz_convert("Asia/Shanghai").strftime("%Y-%m-%d %H:%M:%S")
+    return pd.Timestamp.now(tz="Asia/Shanghai").strftime("%Y-%m-%d %H:%M:%S")
 
 
 def normalize_str(x: Any) -> str:
@@ -350,16 +349,6 @@ def decide_enabled_views(cfg_tabs: pd.DataFrame, view_toggles: List[Tuple[str, b
 
 
 def parse_default_filters_from_tabs(cfg_tabs: pd.DataFrame, enabled_views: List[str]) -> Dict[str, Dict[str, Tuple[bool, str]]]:
-    """
-    支持 Cfg__ExportTabs 里这些可选列：
-    - view_filters_json
-    - filters_json
-    JSON 结构示例：
-    {
-      "PRODUCT|mf.custom.new_date": [true, "260326"],
-      "VARIANT|core.sku": [false, ""]
-    }
-    """
     out: Dict[str, Dict[str, Tuple[bool, str]]] = {}
     if cfg_tabs is None or cfg_tabs.empty or "view_id" not in cfg_tabs.columns:
         return out
@@ -525,7 +514,6 @@ def build_long_need(
         for _, r in view_df.fillna("").iterrows():
             field_key = normalize_str(r.get("field_key"))
             expr = normalize_str(r.get("expr"))
-            entity_type = normalize_str(r.get("entity_type")).upper()
             field_type = normalize_str(r.get("field_type")).upper()
 
             candidates: List[str] = []
@@ -570,7 +558,6 @@ def build_long_need(
                         warnings.append(f"mo expr parse failed: field_key={fk} expr={expr} view={view_id}")
                         continue
 
-                    # source ref 自己也需要抓
                     if ref_fk.startswith("mf.") and ref_fk not in idx_coverage_product:
                         product_mf.add(ref_fk)
                     if ref_fk.startswith("v_mf.") and ref_fk not in idx_coverage_variant:
@@ -618,7 +605,16 @@ def build_mf_selection_and_map(prefix: str, mf_field_keys: List[str]) -> Tuple[s
             continue
         alias = gql_safe_alias(fk)
         alias_to_fk[alias] = fk
-        lines.append(f'{alias}: metafield(namespace: "{ns}", key: "{key}") {{ value type references(first: 50) {{ nodes {{ __typename ... on Metaobject {{ id type handle }} ... on Collection {{ id }} ... on ProductTaxonomyValue {{ id name fullName }} ... on GenericFile {{ id url }} ... on MediaImage {{ id image {{ url altText }} }} }} }} }}')
+        lines.append(
+            f'{alias}: metafield(namespace: "{ns}", key: "{key}") '
+            '{ value type references(first: 50) { nodes { __typename '
+            '... on Metaobject { id type handle } '
+            '... on Collection { id } '
+            '... on ProductTaxonomyValue { id name fullName } '
+            '... on GenericFile { id url } '
+            '... on MediaImage { id image { url altText } } '
+            '} } }'
+        )
     return "\n".join(lines), alias_to_fk
 
 
@@ -714,16 +710,6 @@ def fetch_metaobjects_for_specs(
     specs: List[Dict[str, Any]],
     chunk_size_ids: int,
 ) -> Dict[str, Dict[str, Any]]:
-    """
-    返回:
-    {
-      metaobject_gid: {
-        "id": "...",
-        "type": "...",
-        "__fields": {"title": {"value": "...", "type": "single_line_text_field"}, ...}
-      }
-    }
-    """
     if not ref_gid_to_expected_type:
         return {}
 
@@ -731,7 +717,24 @@ def fetch_metaobjects_for_specs(
     field_lines = []
     for k in all_meta_keys:
         alias = gql_safe_alias(f"mo_field_{k}")
-        field_lines.append(f'{alias}: field(key: "{k}") {{ key value type reference {{ __typename ... on Metaobject {{ id type handle }} ... on Collection {{ id }} ... on ProductTaxonomyValue {{ id name fullName }} ... on GenericFile {{ id url }} ... on MediaImage {{ id image {{ url altText }} }} }} references(first: 50) {{ nodes {{ __typename ... on Metaobject {{ id type handle }} ... on Collection {{ id }} ... on ProductTaxonomyValue {{ id name fullName }} ... on GenericFile {{ id url }} ... on MediaImage {{ id image {{ url altText }} }} }} }} }}')
+        field_lines.append(
+            f'{alias}: field(key: "{k}") '
+            '{ key value type '
+            'reference { __typename '
+            '... on Metaobject { id type handle } '
+            '... on Collection { id } '
+            '... on ProductTaxonomyValue { id name fullName } '
+            '... on GenericFile { id url } '
+            '... on MediaImage { id image { url altText } } '
+            '} '
+            'references(first: 50) { nodes { __typename '
+            '... on Metaobject { id type handle } '
+            '... on Collection { id } '
+            '... on ProductTaxonomyValue { id name fullName } '
+            '... on GenericFile { id url } '
+            '... on MediaImage { id image { url altText } } '
+            '} } }'
+        )
     sel = "\n".join(field_lines)
 
     out: Dict[str, Dict[str, Any]] = {}
@@ -855,7 +858,6 @@ def run(
     run_id = f"dl_values_long_{pd.Timestamp.utcnow().strftime('%Y%m%d_%H%M%S')}"
     ts_cn = now_cn_str()
     warnings: List[str] = []
-    error_details: List[str] = []
 
     cfg_sites = read_table(gc, console_core_url, cfg_sites_tab).fillna("")
     cfg_tabs = read_table(gc, console_core_url, cfg_tabs_tab).fillna("")
@@ -867,7 +869,7 @@ def run(
 
     site_rows = cfg_sites[cfg_sites["site_code"].astype(str).str.strip().str.upper() == site_code.upper()].copy()
     if site_rows.empty:
-        raise RuntimeError(f"C not found in Cfg__Sites: {site_code}")
+        raise RuntimeError(f"site_code not found in Cfg__Sites: {site_code}")
 
     def get_sheet_url(label: str) -> str:
         x = site_rows[site_rows["label"].astype(str).str.strip() == label]
@@ -964,7 +966,6 @@ def run(
 
     long_rows: List[Dict[str, Any]] = []
 
-    # mf.*
     for owner_type, src_df, node_map, prefix in [
         ("PRODUCT", product_df, product_nodes, "mf."),
         ("VARIANT", variant_df, variant_nodes, "v_mf."),
@@ -998,7 +999,6 @@ def run(
                     }
                 )
 
-    # mo.*
     for owner_type, src_df, node_map in [
         ("PRODUCT", product_df, product_nodes),
         ("VARIANT", variant_df, variant_nodes),
@@ -1013,7 +1013,11 @@ def run(
 
             for fk, spec in mo_specs.items():
                 source_ref_candidates = sorted(spec["source_ref_field_keys"])
-                valid_src = [x for x in source_ref_candidates if (owner_type == "PRODUCT" and x.startswith("mf.")) or (owner_type == "VARIANT" and x.startswith("v_mf."))]
+                valid_src = [
+                    x for x in source_ref_candidates
+                    if (owner_type == "PRODUCT" and x.startswith("mf."))
+                    or (owner_type == "VARIANT" and x.startswith("v_mf."))
+                ]
                 if not valid_src:
                     continue
 
@@ -1041,7 +1045,10 @@ def run(
                         actual_type = normalize_str(mo_entry.get("type"))
                         expected_type = normalize_str(spec["metaobject_type"])
                         if actual_type != expected_type:
-                            warnings.append(f"mo ref type mismatch: owner={owner_gid} src_ref={src_ref_fk} field_key={fk} expected={expected_type} actual={actual_type}")
+                            warnings.append(
+                                f"mo ref type mismatch: owner={owner_gid} src_ref={src_ref_fk} "
+                                f"field_key={fk} expected={expected_type} actual={actual_type}"
+                            )
                             continue
 
                         meta_blk = (mo_entry.get("__fields") or {}).get(spec["meta_field_key"]) or {}
@@ -1091,13 +1098,26 @@ def run(
         "values_long_tab": values_long_tab,
     }
 
-    # runlog: summary 1 条；detail 每种 error_reason 最多 2 条
     runlog_rows = [
         [
-            run_id, ts_cn, "dl_values_long", "apply", "summary", "OK", site_code,
-            "", "", "", len(idx_products) + len(idx_variants), len(product_df) + len(variant_df),
-            len(product_mf) + len(variant_mf) + len(mo_specs), len(long_rows), len(df_long), 0,
-            f"enabled_views={len(enabled_views_non_idx)} warnings={len(warnings)}", ""
+            run_id,
+            ts_cn,
+            "dl_values_long",
+            "apply",
+            "summary",
+            "OK",
+            site_code,
+            "",
+            "",
+            "",
+            len(idx_products) + len(idx_variants),
+            len(product_df) + len(variant_df),
+            len(product_mf) + len(variant_mf) + len(mo_specs),
+            len(long_rows),
+            len(df_long),
+            0,
+            f"enabled_views={len(enabled_views_non_idx)} warnings={len(warnings)}",
+            "",
         ]
     ]
 
@@ -1112,9 +1132,24 @@ def run(
         for msg in msgs:
             runlog_rows.append(
                 [
-                    run_id, ts_cn, "dl_values_long", "apply", "detail", "WARN", site_code,
-                    "", "", "", "", "", "", "", "", "",
-                    msg, reason
+                    run_id,
+                    ts_cn,
+                    "dl_values_long",
+                    "apply",
+                    "detail",
+                    "WARN",
+                    site_code,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    msg,
+                    reason,
                 ]
             )
 
