@@ -110,10 +110,34 @@ mutation productUpdate($input: ProductInput!) {
 }
 """
 
-M_PRODUCT_VARIANT_UPDATE = """
-mutation productVariantUpdate($input: ProductVariantInput!) {
-  productVariantUpdate(input: $input) {
-    productVariant {
+Q_VARIANT_PRODUCT_MAP = """
+query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on ProductVariant {
+      id
+      product {
+        id
+      }
+    }
+  }
+}
+"""
+
+M_PRODUCT_VARIANTS_BULK_UPDATE = """
+mutation productVariantsBulkUpdate(
+  $productId: ID!,
+  $variants: [ProductVariantsBulkInput!]!,
+  $allowPartialUpdates: Boolean
+) {
+  productVariantsBulkUpdate(
+    productId: $productId,
+    variants: $variants,
+    allowPartialUpdates: $allowPartialUpdates
+  ) {
+    product {
+      id
+    }
+    productVariants {
       id
       price
       compareAtPrice
@@ -127,7 +151,10 @@ mutation productVariantUpdate($input: ProductVariantInput!) {
         }
       }
     }
-    userErrors { field message }
+    userErrors {
+      field
+      message
+    }
   }
 }
 """
@@ -802,6 +829,25 @@ def resolve_owner_ids(client: ShopifyClient, df_parsed: pd.DataFrame) -> pd.Data
     return df_ready
 
 
+
+
+def get_variant_product_map(client: ShopifyClient, variant_ids: list[str], chunk_size: int = 80) -> dict[str, str]:
+    out = {}
+    ids = [x for x in variant_ids if isinstance(x, str) and x.strip()]
+    for _, part in _chunk_list(ids, chunk_size):
+        data = gql(client, Q_VARIANT_PRODUCT_MAP, {"ids": part})
+        nodes = data.get("nodes") or []
+        for node in nodes:
+            if not node:
+                continue
+            vid = node.get("id")
+            product = node.get("product") or {}
+            pid = product.get("id")
+            if vid and pid:
+                out[vid] = pid
+    return out
+
+
 # =========================================================
 # Cfg__Fields / metafield typing
 # =========================================================
@@ -1153,7 +1199,8 @@ def build_metafield_plan(
     }
 
 
-def build_core_plan(df_ready: pd.DataFrame) -> dict[str, Any]:
+
+def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, Any]:
     df_core = df_ready[(df_ready["_skip_reason"].eq("")) & (df_ready["row_type"] == "core")].copy()
 
     product_updates = {}
@@ -1178,10 +1225,14 @@ def build_core_plan(df_ready: pd.DataFrame) -> dict[str, Any]:
             variant_updates[owner_id] = {
                 "id": owner_id,
                 "price": None,
+                "compareAtPrice_present": False,
                 "compareAtPrice": None,
+                "weight_value_present": False,
                 "weight_value": None,
+                "weight_unit_present": False,
                 "weight_unit": None,
                 "source_rows": [],
+                "field_keys": [],
             }
         return variant_updates[owner_id]
 
@@ -1250,6 +1301,7 @@ def build_core_plan(df_ready: pd.DataFrame) -> dict[str, Any]:
                 bucket = get_variant_bucket(owner_id)
                 bucket["price"] = parse_decimal_str(desired, fk)
                 bucket["source_rows"].append(sheet_row)
+                bucket["field_keys"].append(fk)
                 preview_rows.append({
                     "sheet_row": sheet_row,
                     "entity_type": entity_type,
@@ -1262,8 +1314,10 @@ def build_core_plan(df_ready: pd.DataFrame) -> dict[str, Any]:
 
             elif fk == "core.compare_at_price":
                 bucket = get_variant_bucket(owner_id)
+                bucket["compareAtPrice_present"] = True
                 bucket["compareAtPrice"] = None if action == "CLEAR" else parse_decimal_str(desired, fk)
                 bucket["source_rows"].append(sheet_row)
+                bucket["field_keys"].append(fk)
                 preview_rows.append({
                     "sheet_row": sheet_row,
                     "entity_type": entity_type,
@@ -1276,8 +1330,10 @@ def build_core_plan(df_ready: pd.DataFrame) -> dict[str, Any]:
 
             elif fk == "core.weight":
                 bucket = get_variant_bucket(owner_id)
+                bucket["weight_value_present"] = True
                 bucket["weight_value"] = None if action == "CLEAR" else parse_decimal_str(desired, fk)
                 bucket["source_rows"].append(sheet_row)
+                bucket["field_keys"].append(fk)
                 preview_rows.append({
                     "sheet_row": sheet_row,
                     "entity_type": entity_type,
@@ -1290,8 +1346,10 @@ def build_core_plan(df_ready: pd.DataFrame) -> dict[str, Any]:
 
             elif fk == "core.weight_unit":
                 bucket = get_variant_bucket(owner_id)
+                bucket["weight_unit_present"] = True
                 bucket["weight_unit"] = None if action == "CLEAR" else normalize_weight_unit(desired)
                 bucket["source_rows"].append(sheet_row)
+                bucket["field_keys"].append(fk)
                 preview_rows.append({
                     "sheet_row": sheet_row,
                     "entity_type": entity_type,
@@ -1322,6 +1380,7 @@ def build_core_plan(df_ready: pd.DataFrame) -> dict[str, Any]:
             input_obj["productType"] = bucket["productType"]
         if bucket["tags_mode"] in {"SET", "CLEAR"}:
             input_obj["tags"] = bucket["tags_value"]
+
         product_inputs.append(input_obj)
         product_meta_rows.append({
             "entity_type": "PRODUCT",
@@ -1334,24 +1393,50 @@ def build_core_plan(df_ready: pd.DataFrame) -> dict[str, Any]:
 
     variant_inputs = []
     variant_meta_rows = []
+
+    variant_owner_ids = list(variant_updates.keys())
+    variant_product_map = get_variant_product_map(client, variant_owner_ids, chunk_size=80)
+
     for owner_id, bucket in variant_updates.items():
+        product_id = variant_product_map.get(owner_id)
+        if not product_id:
+            invalid_rows.append({
+                "sheet_row": bucket["source_rows"][0] if bucket["source_rows"] else None,
+                "entity_type": "VARIANT",
+                "owner_id": owner_id,
+                "field_key": ",".join(bucket["field_keys"]) if bucket["field_keys"] else "core.variant",
+                "error_reason": "cannot_resolve_variant_product_id",
+                "message": f"variant_id={owner_id} | cannot resolve parent product id",
+            })
+            continue
+
         input_obj = {"id": owner_id}
+
         if bucket["price"] is not None:
             input_obj["price"] = bucket["price"]
-        input_obj["compareAtPrice"] = bucket["compareAtPrice"]
-        if bucket["weight_value"] is not None or bucket["weight_unit"] is not None:
+
+        if bucket["compareAtPrice_present"]:
+            input_obj["compareAtPrice"] = bucket["compareAtPrice"]
+
+        has_any_weight = bucket["weight_value_present"] or bucket["weight_unit_present"]
+        if has_any_weight:
             weight_part = {}
-            if bucket["weight_value"] is not None:
+            if bucket["weight_value_present"] and bucket["weight_value"] is not None:
                 weight_part["value"] = float(bucket["weight_value"])
-            if bucket["weight_unit"] is not None:
+            if bucket["weight_unit_present"] and bucket["weight_unit"] is not None:
                 weight_part["unit"] = bucket["weight_unit"]
             if weight_part:
                 input_obj["inventoryItem"] = {"measurement": {"weight": weight_part}}
-        variant_inputs.append(input_obj)
+
+        variant_inputs.append({
+            "product_id": product_id,
+            "variant_input": input_obj,
+        })
         variant_meta_rows.append({
             "entity_type": "VARIANT",
             "owner_id": owner_id,
-            "field_key": "core.variant_bundle",
+            "product_id": product_id,
+            "field_key": ",".join(sorted(set(bucket["field_keys"]))) if bucket["field_keys"] else "core.variant",
             "sheet_rows": bucket["source_rows"],
         })
 
@@ -1626,69 +1711,134 @@ def apply_product_core_plan(
     return {"ok_count": ok_count, "fail_count": fail_count, "detail_fail_rows": detail_fail_rows}
     
 
+
 def apply_variant_core_plan(
     client: ShopifyClient,
     variant_inputs: list[dict[str, Any]],
     variant_meta_rows: list[dict[str, Any]],
     set_batch_size: int,
 ) -> dict[str, Any]:
-    total = len(variant_inputs)
-    total_batches = (total + set_batch_size - 1) // set_batch_size if total else 0
+    grouped_inputs = defaultdict(list)
+    grouped_meta = defaultdict(list)
 
-    print(f"=== Applying productVariantUpdate === total={total}, batches={total_batches}, batch_size={set_batch_size}")
+    for inp, meta in zip(variant_inputs, variant_meta_rows):
+        product_id = inp["product_id"]
+        grouped_inputs[product_id].append(inp["variant_input"])
+        grouped_meta[product_id].append(meta)
+
+    total = len(variant_inputs)
+    total_batches = sum((len(v) + set_batch_size - 1) // set_batch_size for v in grouped_inputs.values()) if total else 0
+
+    print(f"=== Applying productVariantsBulkUpdate === total={total}, batches={total_batches}, batch_size={set_batch_size}")
 
     if total == 0:
-        print(f"=== productVariantUpdate done === total=0, ok=0, fail=0")
+        print("=== productVariantsBulkUpdate done === total=0, ok=0, fail=0")
         return {"ok_count": 0, "fail_count": 0, "detail_fail_rows": []}
 
     ok_count = 0
     fail_count = 0
     detail_fail_rows = []
+    batch_no = 0
 
-    for batch_no, (start_idx, batch_inputs) in enumerate(_chunk_list(variant_inputs, set_batch_size), start=1):
-        batch_meta = variant_meta_rows[start_idx:start_idx + len(batch_inputs)]
-        batch_ok = 0
-        batch_fail = 0
+    for product_id in grouped_inputs.keys():
+        inputs = grouped_inputs[product_id]
+        metas = grouped_meta[product_id]
 
-        for inp, meta in zip(batch_inputs, batch_meta):
+        for start_idx, batch_inputs in _chunk_list(inputs, set_batch_size):
+            batch_no += 1
+            batch_meta = metas[start_idx:start_idx + len(batch_inputs)]
+
+            print(f"Batch {batch_no}/{total_batches}: {len(batch_inputs)} items ... ", end="", flush=True)
+
             try:
-                data = gql(client, M_PRODUCT_VARIANT_UPDATE, {"input": inp})
-                errs = (data.get("productVariantUpdate") or {}).get("userErrors") or []
-                if errs:
-                    batch_fail += 1
+                data = gql(
+                    client,
+                    M_PRODUCT_VARIANTS_BULK_UPDATE,
+                    {
+                        "productId": product_id,
+                        "variants": batch_inputs,
+                        "allowPartialUpdates": True,
+                    },
+                )
+                resp = (data.get("productVariantsBulkUpdate") or {})
+                errs = resp.get("userErrors") or []
+
+                if not errs:
+                    ok_count += len(batch_inputs)
+                    print("OK", flush=True)
+                    continue
+
+                err_map = defaultdict(list)
+                non_indexed = []
+
+                for e in errs:
+                    field = e.get("field") or []
+                    idx = None
+                    if isinstance(field, list):
+                        for i, part in enumerate(field):
+                            if str(part) == "variants" and i + 1 < len(field):
+                                try:
+                                    idx = int(field[i + 1])
+                                    break
+                                except Exception:
+                                    pass
+                    if idx is None:
+                        non_indexed.append(e)
+                    else:
+                        err_map[idx].append(e)
+
+                if not err_map:
+                    fail_count += len(batch_inputs)
+                    for meta in batch_meta:
+                        detail_fail_rows.append({
+                            "entity_type": meta.get("entity_type", ""),
+                            "owner_id": meta.get("owner_id", ""),
+                            "field_key": meta.get("field_key", ""),
+                            "error_reason": "variant_bulk_update_error",
+                            "message": f"sheet_rows={meta.get('sheet_rows')} | product_id={product_id} | user_errors={json.dumps(non_indexed, ensure_ascii=False)[:500]}",
+                        })
+                    print(f"FAILED (fail={len(batch_inputs)})", flush=True)
+                    continue
+
+                batch_fail = 0
+                for idx, item_errs in err_map.items():
+                    if 0 <= idx < len(batch_meta):
+                        meta = batch_meta[idx]
+                        batch_fail += 1
+                        detail_fail_rows.append({
+                            "entity_type": meta.get("entity_type", ""),
+                            "owner_id": meta.get("owner_id", ""),
+                            "field_key": meta.get("field_key", ""),
+                            "error_reason": "variant_bulk_update_error",
+                            "message": f"sheet_rows={meta.get('sheet_rows')} | product_id={product_id} | msg={item_errs[0].get('message', '')} | field={item_errs[0].get('field')}",
+                        })
+
+                batch_ok = len(batch_inputs) - batch_fail
+                ok_count += batch_ok
+                fail_count += batch_fail
+
+                if batch_fail == 0:
+                    print("OK", flush=True)
+                elif batch_ok == 0:
+                    print(f"FAILED (fail={batch_fail})", flush=True)
+                else:
+                    print(f"PARTIAL_FAIL (ok={batch_ok}, fail={batch_fail})", flush=True)
+
+            except Exception as e:
+                fail_count += len(batch_inputs)
+                for meta in batch_meta:
                     detail_fail_rows.append({
                         "entity_type": meta.get("entity_type", ""),
                         "owner_id": meta.get("owner_id", ""),
                         "field_key": meta.get("field_key", ""),
-                        "error_reason": "variant_update_error",
-                        "message": f"sheet_rows={meta.get('sheet_rows')} | msg={errs[0].get('message', '')} | field={errs[0].get('field')}",
+                        "error_reason": "variant_bulk_update_exception",
+                        "message": f"sheet_rows={meta.get('sheet_rows')} | product_id={product_id} | exception={e}",
                     })
-                else:
-                    batch_ok += 1
-            except Exception as e:
-                batch_fail += 1
-                detail_fail_rows.append({
-                    "entity_type": meta.get("entity_type", ""),
-                    "owner_id": meta.get("owner_id", ""),
-                    "field_key": meta.get("field_key", ""),
-                    "error_reason": "variant_update_exception",
-                    "message": f"sheet_rows={meta.get('sheet_rows')} | exception={e}",
-                })
+                print(f"FAILED (fail={len(batch_inputs)})", flush=True)
 
-        ok_count += batch_ok
-        fail_count += batch_fail
-
-        print(f"Batch {batch_no}/{total_batches}: {len(batch_inputs)} items ... ", end="", flush=True)
-        if batch_fail == 0:
-            print("OK", flush=True)
-        elif batch_ok == 0:
-            print(f"FAILED (fail={batch_fail})", flush=True)
-        else:
-            print(f"PARTIAL_FAIL (ok={batch_ok}, fail={batch_fail})", flush=True)
-
-    print(f"=== productVariantUpdate done === total={total}, ok={ok_count}, fail={fail_count}")
+    print(f"=== productVariantsBulkUpdate done === total={total}, ok={ok_count}, fail={fail_count}")
     return {"ok_count": ok_count, "fail_count": fail_count, "detail_fail_rows": detail_fail_rows}
-    
+
 
 # =========================================================
 # Main entry
@@ -1867,7 +2017,7 @@ def run(
         type_override_by_field_key=type_override_by_field_key,
     )
 
-    core_plan = build_core_plan(df_ready)
+    core_plan = build_core_plan(df_ready, shopify)
 
     rows_planned = len(meta_plan["set_inputs"]) + len(core_plan["product_inputs"]) + len(core_plan["tag_delta_rows"]) + len(core_plan["variant_inputs"])
 
