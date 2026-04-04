@@ -382,7 +382,12 @@ def _prepare_field_rows(vf: pd.DataFrame) -> List[Dict[str, Any]]:
         entity_type = _safe_str(r.get("entity_type")).upper()
         field_key = _safe_str(r.get("field_key"))
         data_type = _safe_str(r.get("data_type"))
+
+        # 兼容 "join_key" 和 "join key"
         join_key = _safe_str(r.get("join_key"))
+        if not join_key:
+            join_key = _safe_str(r.get("join key"))
+
         agg = _safe_str(r.get("agg"))
 
         base_key = alias or field_id or "col"
@@ -476,6 +481,7 @@ def _build_variant_product_bridge(
         return bridge
 
     candidate_product_gid_cols = [
+        "VARIANT|core.product_gid",
         "VARIANT|core.product.gid",
         "VARIANT|core.parent.gid",
         "PRODUCT|core.gid",
@@ -570,6 +576,7 @@ def _resolve_related_rows(
 
         # 先尝试直接从当前 variant 行里拿 product gid
         direct_product_gid_candidates = [
+            "VARIANT|core.product_gid",
             "VARIANT|core.product.gid",
             "VARIANT|core.parent.gid",
             "PRODUCT|core.gid",
@@ -876,6 +883,7 @@ def build_and_write_view(
         print(f"view={view_id}")
         print(f"target_sheet={target_sheet}")
         print(f"base_entity_type={base_entity_type}")
+        print(f"base_sheet={base_sheet}")
         print(f"base_key_field_id={base_key_field_id}")
         print(f"rows={len(out_df)} cols={len(display_headers)}")
 
@@ -931,6 +939,8 @@ def run(
         print("  dl rows           :", len(df_dl_values_long))
         print("  products dup cols :", df_idx_products.columns.duplicated().any())
         print("  variants dup cols :", df_idx_variants.columns.duplicated().any())
+        print("  has product_gid   :", "VARIANT|core.product_gid" in df_idx_variants.columns)
+        print("  has product.gid   :", "VARIANT|core.product.gid" in df_idx_variants.columns)
 
     enabled_view_ids = [k for k, v in (view_toggles or {}).items() if bool(v)]
     if not enabled_view_ids:
