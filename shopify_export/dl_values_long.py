@@ -635,7 +635,7 @@ def build_mf_selection_and_map(mf_field_keys: List[str]) -> Tuple[str, Dict[str,
             '... on ProductTaxonomyValue { id name fullName } '
             '... on GenericFile { id url } '
             '... on MediaImage { id image { url altText } } '
-            '} } } }'
+            '} } }'
         )
     return "\n".join(lines), alias_to_fk
 
