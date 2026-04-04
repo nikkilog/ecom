@@ -349,24 +349,41 @@ def decide_enabled_views(cfg_tabs: pd.DataFrame, view_toggles: List[Tuple[str, b
 
 
 def parse_default_filters_from_tabs(cfg_tabs: pd.DataFrame, enabled_views: List[str]) -> Dict[str, Dict[str, Tuple[bool, str]]]:
+    """
+    当前按你的表结构支持：
+    - fixed_filter_mode
+    - fixed_filters_json
+
+    兼容旧列名：
+    - view_filters_json
+    - filters_json
+    """
     out: Dict[str, Dict[str, Tuple[bool, str]]] = {}
     if cfg_tabs is None or cfg_tabs.empty or "view_id" not in cfg_tabs.columns:
         return out
 
     work = cfg_tabs.copy().fillna("")
     work.columns = [normalize_str(c) for c in work.columns]
+
     for v in enabled_views:
         row = work[work["view_id"].astype(str).str.strip() == v]
         if row.empty:
             continue
+
         rr = row.iloc[0].to_dict()
-        raw = normalize_str(rr.get("view_filters_json") or rr.get("filters_json"))
+        raw = normalize_str(
+            rr.get("fixed_filters_json")
+            or rr.get("view_filters_json")
+            or rr.get("filters_json")
+        )
         if not raw:
             continue
+
         try:
             obj = json.loads(raw)
         except Exception:
             continue
+
         if not isinstance(obj, dict):
             continue
 
@@ -375,12 +392,17 @@ def parse_default_filters_from_tabs(cfg_tabs: pd.DataFrame, enabled_views: List[
             kk = normalize_str(k)
             if not kk:
                 continue
+
             if isinstance(val, list) and len(val) >= 2:
                 view_map[kk] = (bool(val[0]), normalize_str(val[1]))
             elif isinstance(val, dict):
                 view_map[kk] = (bool(val.get("enabled")), normalize_str(val.get("value")))
+            else:
+                view_map[kk] = (True, normalize_str(val))
+
         if view_map:
             out[v] = view_map
+
     return out
 
 
@@ -553,7 +575,7 @@ def build_long_need(
                         warnings.append(f"mo expr invalid source ref: field_key={fk} expr={expr} view={view_id}")
                         continue
 
-                    src_prefix, ns, key = parse_mf_field_key(ref_fk)
+                    _, ns, key = parse_mf_field_key(ref_fk)
                     if not ns or not key:
                         warnings.append(f"mo expr parse failed: field_key={fk} expr={expr} view={view_id}")
                         continue
@@ -596,7 +618,7 @@ def build_long_need(
     }, warnings
 
 
-def build_mf_selection_and_map(prefix: str, mf_field_keys: List[str]) -> Tuple[str, Dict[str, str]]:
+def build_mf_selection_and_map(mf_field_keys: List[str]) -> Tuple[str, Dict[str, str]]:
     lines = []
     alias_to_fk = {}
     for fk in mf_field_keys:
@@ -613,7 +635,7 @@ def build_mf_selection_and_map(prefix: str, mf_field_keys: List[str]) -> Tuple[s
             '... on ProductTaxonomyValue { id name fullName } '
             '... on GenericFile { id url } '
             '... on MediaImage { id image { url altText } } '
-            '} } }'
+            '} } } }'
         )
     return "\n".join(lines), alias_to_fk
 
@@ -625,7 +647,7 @@ def fetch_nodes_products(client: ShopifyClient, ids: List[str], mf_field_keys: L
     out: Dict[str, dict] = {}
     for id_part in chunk_list(ids, chunk_size_ids):
         for mf_part in chunk_list(mf_field_keys, chunk_size_mf):
-            sel, alias_to_fk = build_mf_selection_and_map("mf", mf_part)
+            sel, alias_to_fk = build_mf_selection_and_map(mf_part)
             q = f"""
 query NodesProducts($ids: [ID!]!) {{
   nodes(ids: $ids) {{
@@ -668,7 +690,7 @@ def fetch_nodes_variants(client: ShopifyClient, ids: List[str], mf_field_keys: L
     out: Dict[str, dict] = {}
     for id_part in chunk_list(ids, chunk_size_ids):
         for mf_part in chunk_list(mf_field_keys, chunk_size_mf):
-            sel, alias_to_fk = build_mf_selection_and_map("v_mf", mf_part)
+            sel, alias_to_fk = build_mf_selection_and_map(mf_part)
             q = f"""
 query NodesVariants($ids: [ID!]!) {{
   nodes(ids: $ids) {{
@@ -859,13 +881,10 @@ def run(
     ts_cn = now_cn_str()
     warnings: List[str] = []
 
+    # 1) Cfg__Sites 只从 console_core 读
     cfg_sites = read_table(gc, console_core_url, cfg_sites_tab).fillna("")
-    cfg_tabs = read_table(gc, console_core_url, cfg_tabs_tab).fillna("")
-    cfg_fields = read_table(gc, console_core_url, cfg_fields_tab).fillna("")
-    cfg_export = read_table(gc, console_core_url, cfg_export_tab).fillna("")
-
-    if cfg_export.empty:
-        raise RuntimeError("Cfg__ExportTabFields is empty")
+    if cfg_sites.empty:
+        raise RuntimeError(f"{cfg_sites_tab} is empty in console_core_url")
 
     site_rows = cfg_sites[cfg_sites["site_code"].astype(str).str.strip().str.upper() == site_code.upper()].copy()
     if site_rows.empty:
@@ -877,19 +896,34 @@ def run(
             return ""
         return normalize_str(x.iloc[0].get("sheet_url"))
 
+    config_sheet_url = get_sheet_url("config")
     data_sheet_url = get_sheet_url("export_product")
     runlog_sheet_url = get_sheet_url("runlog_sheet")
 
+    if not config_sheet_url:
+        raise RuntimeError(f"site {site_code} missing label=config in Cfg__Sites")
     if not data_sheet_url:
         raise RuntimeError(f"site {site_code} missing label=export_product in Cfg__Sites")
+
+    # 2) 配置表从 label=config 的 sheet 读
+    cfg_tabs = read_table(gc, config_sheet_url, cfg_tabs_tab).fillna("")
+    cfg_fields = read_table(gc, config_sheet_url, cfg_fields_tab).fillna("")
+    cfg_export = read_table(gc, config_sheet_url, cfg_export_tab).fillna("")
+
+    if cfg_export.empty:
+        raise RuntimeError(f"{cfg_export_tab} is empty in config sheet")
 
     enabled_views = decide_enabled_views(cfg_tabs, view_toggles)
     enabled_views_non_idx = [v for v in enabled_views if v not in (idx_view_products, idx_view_variants)]
 
     idx_p_cfg = get_view_cfg(cfg_export, idx_view_products)
     idx_v_cfg = get_view_cfg(cfg_export, idx_view_variants)
-    idx_coverage_product = set([normalize_str(x) for x in idx_p_cfg.get("field_key", pd.Series(dtype=str)).tolist() if normalize_str(x)])
-    idx_coverage_variant = set([normalize_str(x) for x in idx_v_cfg.get("field_key", pd.Series(dtype=str)).tolist() if normalize_str(x)])
+    idx_coverage_product = set(
+        [normalize_str(x) for x in idx_p_cfg.get("field_key", pd.Series(dtype=str)).tolist() if normalize_str(x)]
+    )
+    idx_coverage_variant = set(
+        [normalize_str(x) for x in idx_v_cfg.get("field_key", pd.Series(dtype=str)).tolist() if normalize_str(x)]
+    )
 
     need_result, need_warnings = build_long_need(
         cfg_fields=cfg_fields,
@@ -904,6 +938,7 @@ def run(
     variant_mf = need_result["variant_mf"]
     mo_specs = need_result["mo_specs"]
 
+    # 3) IDX / Long 从 export_product 的 sheet 读写
     idx_products = read_idx_df(gc, data_sheet_url, idx_products_tab, "PRODUCT")
     idx_variants = read_idx_df(gc, data_sheet_url, idx_variants_tab, "VARIANT")
 
@@ -966,6 +1001,7 @@ def run(
 
     long_rows: List[Dict[str, Any]] = []
 
+    # mf.*
     for owner_type, src_df, node_map, prefix in [
         ("PRODUCT", product_df, product_nodes, "mf."),
         ("VARIANT", variant_df, variant_nodes, "v_mf."),
@@ -999,6 +1035,7 @@ def run(
                     }
                 )
 
+    # mo.*
     for owner_type, src_df, node_map in [
         ("PRODUCT", product_df, product_nodes),
         ("VARIANT", variant_df, variant_nodes),
@@ -1052,7 +1089,7 @@ def run(
                             continue
 
                         meta_blk = (mo_entry.get("__fields") or {}).get(spec["meta_field_key"]) or {}
-                        vv, vt = extract_mo_value(meta_blk, mo_list_join_sep)
+                        vv, _ = extract_mo_value(meta_blk, mo_list_join_sep)
                         if vv == "":
                             continue
                         mo_vals.append(vv)
@@ -1094,6 +1131,7 @@ def run(
         "rows_skipped": 0,
         "warning_count": len(warnings),
         "warnings": warnings,
+        "config_sheet_url": config_sheet_url,
         "data_sheet_url": data_sheet_url,
         "values_long_tab": values_long_tab,
     }
