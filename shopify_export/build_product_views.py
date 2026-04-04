@@ -7,6 +7,7 @@ import json
 import time
 import base64
 import random
+from collections import defaultdict
 from typing import Dict, List, Tuple, Any, Optional
 
 import pandas as pd
@@ -171,6 +172,13 @@ def ws_update(ws, a1_range: str, values, value_input_option="RAW", max_retry=6):
 
 def clear_worksheet(ws):
     ws.clear()
+
+
+def resize_worksheet(ws, rows: int, cols: int):
+    rows = max(int(rows or 1), 1)
+    cols = max(int(cols or 1), 1)
+    if ws.row_count != rows or ws.col_count != cols:
+        ws.resize(rows=rows, cols=cols)
 
 
 def ensure_worksheet(sh, title: str, rows: int = 1000, cols: int = 50):
@@ -352,37 +360,57 @@ def _group_contiguous_cols(formula_cols):
     return blocks
 
 
-def write_formula_columns_chunked(
+def write_formula_columns_filldown(
     ws,
     formula_cols,      # [(ci, expr, output_key), ...]
     start_row_1based: int,
     nrows: int,
     token_to_col_letter: Dict[str, str],
-    chunk_rows: int = 1200,
 ):
     if nrows <= 0 or not formula_cols:
         return
 
     blocks = _group_contiguous_cols(formula_cols)
-    total_chunks = (nrows + chunk_rows - 1) // chunk_rows
 
-    for chunk_i in range(total_chunks):
-        r_start = start_row_1based + chunk_i * chunk_rows
-        r_end = min(start_row_1based + nrows - 1, r_start + chunk_rows - 1)
+    # 先只写第 2 行（或 start_row_1based 指定行）
+    for block in blocks:
+        c0 = block[0][0]
+        c1 = block[-1][0]
+        a1 = f"{col_to_letter(c0)}{start_row_1based}:{col_to_letter(c1)}{start_row_1based}"
+        values = [[compile_formula(expr0, start_row_1based, token_to_col_letter) for (_, expr0, _) in block]]
+        ws_update(ws, a1, values, value_input_option="USER_ENTERED")
 
-        for block in blocks:
-            c0 = block[0][0]
-            c1 = block[-1][0]
-            a1 = f"{col_to_letter(c0)}{r_start}:{col_to_letter(c1)}{r_end}"
+    # 只有一行数据时，到这里就够了
+    if nrows <= 1:
+        return
 
-            values = []
-            for rr in range(r_start, r_end + 1):
-                row_vals = []
-                for (ci, expr0, output_key) in block:
-                    row_vals.append(compile_formula(expr0, rr, token_to_col_letter))
-                values.append(row_vals)
+    requests = []
+    for block in blocks:
+        c0 = block[0][0]
+        c1 = block[-1][0]
+        requests.append({
+            "copyPaste": {
+                "source": {
+                    "sheetId": ws.id,
+                    "startRowIndex": start_row_1based - 1,
+                    "endRowIndex": start_row_1based,
+                    "startColumnIndex": c0 - 1,
+                    "endColumnIndex": c1,
+                },
+                "destination": {
+                    "sheetId": ws.id,
+                    "startRowIndex": start_row_1based,
+                    "endRowIndex": start_row_1based - 1 + nrows,
+                    "startColumnIndex": c0 - 1,
+                    "endColumnIndex": c1,
+                },
+                "pasteType": "PASTE_FORMULA",
+                "pasteOrientation": "NORMAL",
+            }
+        })
 
-            ws_update(ws, a1, values, value_input_option="USER_ENTERED")
+    if requests:
+        ws.spreadsheet.batch_update({"requests": requests})
 
 
 # =========================================================
@@ -809,6 +837,70 @@ def _field_id_to_long_field_key(field_id: str) -> str:
     return _safe_str(field_id.split("|", 1)[1])
 
 
+def _agg_series_values(s: pd.Series, agg_name: str):
+    agg_name = _safe_str(agg_name).upper()
+    ss = s.fillna("").astype(str)
+    ss = ss[ss.str.strip() != ""]
+    if len(ss) == 0:
+        return ""
+    if agg_name in ("", "FIRST"):
+        return ss.iloc[0]
+    if agg_name == "FIRST_SORTED":
+        return ss.sort_values().iloc[0]
+    if agg_name == "LIST":
+        return ", ".join(ss.tolist())
+    if agg_name == "LIST_DISTINCT":
+        seen = []
+        for x in ss.tolist():
+            if x not in seen:
+                seen.append(x)
+        return ", ".join(seen)
+    return ss.iloc[0]
+
+
+def _aggregate_variant_fields_to_product(df_variants: pd.DataFrame, variant_rows: pd.DataFrame) -> pd.DataFrame:
+    if df_variants is None or df_variants.empty or variant_rows is None or variant_rows.empty:
+        return pd.DataFrame(columns=["PRODUCT|core.gid"])
+
+    if "VARIANT|core.product_gid" not in df_variants.columns:
+        raise ValueError("IDX__Variants 缺 VARIANT|core.product_gid，无法把 VARIANT 聚合到 PRODUCT")
+
+    agg_groups: Dict[str, List[str]] = defaultdict(list)
+    seen_fids = set()
+    for _, r in variant_rows.iterrows():
+        fid = _safe_str(r.get("field_id"))
+        agg_name = _safe_str(r.get("agg")).upper() or "FIRST"
+        if not fid or fid not in df_variants.columns or fid in seen_fids:
+            continue
+        agg_groups[agg_name].append(fid)
+        seen_fids.add(fid)
+
+    if not agg_groups:
+        return pd.DataFrame(columns=["PRODUCT|core.gid"])
+
+    needed_cols = sorted(seen_fids)
+    variant_work = df_variants[["VARIANT|core.product_gid"] + needed_cols].copy()
+    variant_work["__product_gid_norm"] = variant_work["VARIANT|core.product_gid"].map(_extract_gid_like)
+    variant_work = variant_work[variant_work["__product_gid_norm"].astype(str).str.strip() != ""].copy()
+    if variant_work.empty:
+        return pd.DataFrame(columns=["PRODUCT|core.gid"])
+
+    pieces = []
+    for agg_name, fids in agg_groups.items():
+        sub = variant_work[["__product_gid_norm"] + fids].copy()
+        grouped = sub.groupby("__product_gid_norm", sort=False, dropna=False)
+        agg_df = grouped[fids].agg(lambda s, agg_name=agg_name: _agg_series_values(s, agg_name))
+        pieces.append(agg_df)
+
+    if not pieces:
+        return pd.DataFrame(columns=["PRODUCT|core.gid"])
+
+    variant_agg_df = pd.concat(pieces, axis=1)
+    variant_agg_df = variant_agg_df.loc[:, ~variant_agg_df.columns.duplicated()].reset_index()
+    variant_agg_df = variant_agg_df.rename(columns={"__product_gid_norm": "PRODUCT|core.gid"})
+    return variant_agg_df
+
+
 def ensure_columns_from_long(
     df: pd.DataFrame,
     needed_cols: List[str],
@@ -867,8 +959,9 @@ def build_and_write_view(
     cfg_fields_df: pd.DataFrame,
     df_idx_products: pd.DataFrame,
     df_idx_variants: pd.DataFrame,
-    df_dl_values_long: pd.DataFrame,
     view_id: str,
+    long_value_map: Optional[Dict[Tuple[str, str, str], str]] = None,
+    df_dl_values_long: Optional[pd.DataFrame] = None,
     global_filters: Optional[Dict[str, Any]] = None,
     filter_mode: str = "AND",
     view_filter_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -878,6 +971,8 @@ def build_and_write_view(
     view_id = _safe_str(view_id)
     global_filters = global_filters or {}
     view_filter_overrides = view_filter_overrides or {}
+    if long_value_map is None:
+        long_value_map = _build_long_value_map(df_dl_values_long if df_dl_values_long is not None else pd.DataFrame())
 
     tab_row = cfg_tabs_df[cfg_tabs_df["view_id"].astype(str).str.strip() == view_id]
     if tab_row.empty:
@@ -910,11 +1005,9 @@ def build_and_write_view(
     if "agg" not in vf.columns:
         vf["agg"] = ""
 
-    # ---- base df
     df_products = _dedupe_columns_keep_first(df_idx_products.copy())
     df_variants = _dedupe_columns_keep_first(df_idx_variants.copy())
 
-    # ---- filters
     global_pf, global_vf = split_filters_by_entity(global_filters)
     fixed_pf, fixed_vf = split_filters_by_entity(fixed_filters_json)
     override_pf, override_vf = split_filters_by_entity(view_filter_overrides.get(view_id, {}))
@@ -929,17 +1022,14 @@ def build_and_write_view(
     merged_vf.update(fixed_vf)
     merged_vf.update(override_vf)
 
-    # ---- ensure needed cols from DL
     needed_product_cols = set(vf[vf["entity_type"].astype(str).str.upper().eq("PRODUCT")]["field_id"].astype(str).tolist())
     needed_variant_cols = set(vf[vf["entity_type"].astype(str).str.upper().eq("VARIANT")]["field_id"].astype(str).tolist())
     needed_product_cols |= set(merged_pf.keys())
     needed_variant_cols |= set(merged_vf.keys())
 
-    long_value_map = _build_long_value_map(df_dl_values_long)
     df_products = ensure_columns_from_long(df_products, list(needed_product_cols), long_value_map)
     df_variants = ensure_columns_from_long(df_variants, list(needed_variant_cols), long_value_map)
 
-    # ---- variant base: if product filters exist, prefilter variants by allowed products
     product_filters_exist = len(merged_pf) > 0
     if base_entity_type == "VARIANT" and product_filters_exist:
         df_products_for_filter = apply_entity_filters(df_products.copy(), merged_pf, fixed_filter_mode)
@@ -959,58 +1049,21 @@ def build_and_write_view(
         if verbose:
             print(f"prefilter variants by product filters: {before_n} -> {len(df_variants)}")
 
-    # ---- choose base + entity-specific filters
     if base_entity_type == "PRODUCT":
         base_df = apply_entity_filters(df_products.copy(), merged_pf, fixed_filter_mode)
     else:
         base_df = apply_entity_filters(df_variants.copy(), merged_vf, fixed_filter_mode)
 
-    # ---- PRODUCT-base: aggregate VARIANT fields up to product
     if base_entity_type == "PRODUCT":
         variant_rows = vf[vf["entity_type"].astype(str).str.upper().eq("VARIANT")].copy()
         if not variant_rows.empty:
-            if "VARIANT|core.product_gid" not in df_variants.columns:
-                raise ValueError("IDX__Variants 缺 VARIANT|core.product_gid，无法把 VARIANT 聚合到 PRODUCT")
             if "PRODUCT|core.gid" not in base_df.columns:
                 raise ValueError("IDX__Products 缺 PRODUCT|core.gid，无法 merge 聚合后的 VARIANT 字段")
 
-            def agg_series(s: pd.Series, agg_name: str):
-                agg_name = _safe_str(agg_name).upper()
-                ss = s.fillna("").astype(str)
-                ss = ss[ss.str.strip() != ""]
-                if len(ss) == 0:
-                    return ""
-                if agg_name in ("", "FIRST"):
-                    return ss.iloc[0]
-                if agg_name == "FIRST_SORTED":
-                    return ss.sort_values().iloc[0]
-                if agg_name == "LIST":
-                    return ", ".join(ss.tolist())
-                if agg_name == "LIST_DISTINCT":
-                    seen = []
-                    for x in ss.tolist():
-                        if x not in seen:
-                            seen.append(x)
-                    return ", ".join(seen)
-                return ss.iloc[0]
-
-            variant_work = df_variants.copy()
-            variant_work["__product_gid_norm"] = variant_work["VARIANT|core.product_gid"].map(_extract_gid_like)
-
-            pieces = []
-            for _, r in variant_rows.iterrows():
-                fid = _safe_str(r.get("field_id"))
-                agg_name = _safe_str(r.get("agg"))
-                if not fid or fid not in variant_work.columns:
-                    continue
-                g = variant_work.groupby("__product_gid_norm")[fid].apply(lambda s: agg_series(s, agg_name)).rename(fid)
-                pieces.append(g)
-
-            if pieces:
-                variant_agg_df = pd.concat(pieces, axis=1).reset_index().rename(columns={"__product_gid_norm": "PRODUCT|core.gid"})
+            variant_agg_df = _aggregate_variant_fields_to_product(df_variants, variant_rows)
+            if not variant_agg_df.empty:
                 base_df = base_df.merge(variant_agg_df, how="left", on="PRODUCT|core.gid")
 
-    # ---- VARIANT base: join PRODUCT fields onto variants
     if base_entity_type == "VARIANT":
         if "VARIANT|core.product_gid" not in base_df.columns:
             raise ValueError("IDX__Variants 缺 VARIANT|core.product_gid，无法 join PRODUCT 字段")
@@ -1043,14 +1096,12 @@ def build_and_write_view(
     if base_key_field_id and base_key_field_id not in base_df.columns:
         raise ValueError(f"view_id={view_id} 的 base_key_field_id 在 base_df 中不存在：{base_key_field_id}")
 
-    # ---- fields
     field_rows = _prepare_field_rows(vf)
 
     output_keys = [fr["output_key"] for fr in field_rows]
     display_headers_raw = [fr["alias"] or fr["field_id"] or fr["output_key"] for fr in field_rows]
     display_headers = _make_display_headers(display_headers_raw)
 
-    # ---- 构造数据
     out_rows = []
     for _, base_row in base_df.iterrows():
         base_row = base_row.copy()
@@ -1070,13 +1121,10 @@ def build_and_write_view(
 
     out_df = pd.DataFrame(out_rows, columns=output_keys).fillna("")
 
-    # ---- 写表
-    ws = ensure_worksheet(
-        sh_data,
-        target_sheet,
-        rows=max(len(out_df) + 20, 1000),
-        cols=max(len(display_headers) + 10, 50),
-    )
+    target_rows = max(len(out_df) + 20, 1000)
+    target_cols = max(len(display_headers) + 10, 50)
+    ws = ensure_worksheet(sh_data, target_sheet, rows=target_rows, cols=target_cols)
+    resize_worksheet(ws, target_rows, target_cols)
     clear_worksheet(ws)
 
     if len(display_headers) == 0:
@@ -1114,7 +1162,7 @@ def build_and_write_view(
             formula_cols.append((i, expr, fr["output_key"]))
 
     if formula_cols and len(out_df) > 0:
-        write_formula_columns_chunked(
+        write_formula_columns_filldown(
             ws=ws,
             formula_cols=formula_cols,
             start_row_1based=2,
@@ -1172,6 +1220,7 @@ def run(
 
     df_idx_products = normalize_idx_columns(df_idx_products, "PRODUCT")
     df_idx_variants = normalize_idx_columns(df_idx_variants, "VARIANT")
+    long_value_map = _build_long_value_map(df_dl_values_long)
 
     if verbose:
         print("loaded:")
@@ -1180,6 +1229,7 @@ def run(
         print("  idx products rows :", len(df_idx_products))
         print("  idx variants rows :", len(df_idx_variants))
         print("  dl rows           :", len(df_dl_values_long))
+        print("  dl long keys      :", len(long_value_map))
         print("  products dup cols :", df_idx_products.columns.duplicated().any())
         print("  variants dup cols :", df_idx_variants.columns.duplicated().any())
         print("  has product_gid   :", "VARIANT|core.product_gid" in df_idx_variants.columns)
@@ -1199,8 +1249,8 @@ def run(
             cfg_fields_df=cfg_fields_df,
             df_idx_products=df_idx_products,
             df_idx_variants=df_idx_variants,
-            df_dl_values_long=df_dl_values_long,
             view_id=vid,
+            long_value_map=long_value_map,
             global_filters=global_filters or {},
             filter_mode=filter_mode,
             view_filter_overrides=view_filter_overrides or {},
