@@ -112,6 +112,32 @@ def _as_scalar(v):
     return _safe_str(v)
 
 
+
+
+def _extract_gid_like(v):
+    """
+    支持：
+    - 纯 gid: gid://shopify/Product/123
+    - JSON 字符串: {"id":"gid://shopify/Product/123"}
+    - dict: {"id":"gid://shopify/Product/123"}
+    其他情况回退为字符串本身
+    """
+    if isinstance(v, dict):
+        if "id" in v:
+            return _safe_str(v.get("id"))
+        return _safe_str(v)
+    s = _safe_str(v)
+    if not s:
+        return ""
+    if s.startswith("{") and s.endswith("}"):
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict) and "id" in obj:
+                return _safe_str(obj.get("id"))
+        except Exception:
+            pass
+    return s
+
 def col_to_letter(n: int) -> str:
     s = ""
     while n > 0:
@@ -464,17 +490,61 @@ def _build_variant_product_bridge(
     row_maps: Dict[str, Any],
 ) -> Dict[str, str]:
     """
-    让 VARIANT 行能找到所属 PRODUCT gid
-    返回:
-      bridge[variant_gid] = product_gid
-
-    优先：
-    1) 直接从 variant 行里的 product gid 列取
-    2) 再从 variant 行里的 product legacy id 列，去 product_by_legacy_id 反查 product gid
+    bridge[variant_gid] = product_gid
+    兼容 VARIANT|core.product_gid 为纯 gid / JSON 字符串 / dict
     """
     bridge = {}
     if df_variants is None or df_variants.empty:
         return bridge
+
+    variant_gid_col = "VARIANT|core.gid" if "VARIANT|core.gid" in df_variants.columns else None
+    if not variant_gid_col:
+        return bridge
+
+    candidate_product_gid_cols = [
+        "VARIANT|core.product_gid",
+        "VARIANT|core.product.gid",
+        "VARIANT|core.parent.gid",
+        "PRODUCT|core.gid",
+    ]
+
+    candidate_product_legacy_cols = [
+        "VARIANT|core.product.legacy_id",
+        "VARIANT|core.product.legacyResourceId",
+        "VARIANT|product.legacyResourceId",
+        "PRODUCT|core.legacy_id",
+        "PRODUCT|core.legacyResourceId",
+    ]
+
+    for _, r in df_variants.iterrows():
+        vg = _extract_gid_like(r.get(variant_gid_col, ""))
+        if not vg:
+            continue
+
+        pg = ""
+        for c in candidate_product_gid_cols:
+            if c in df_variants.columns:
+                pg = _extract_gid_like(r.get(c, ""))
+                if pg:
+                    break
+
+        if not pg:
+            product_legacy_id = ""
+            for c in candidate_product_legacy_cols:
+                if c in df_variants.columns:
+                    product_legacy_id = _as_scalar(r.get(c, ""))
+                    if product_legacy_id:
+                        break
+
+            if product_legacy_id:
+                product_row = row_maps.get("product_by_legacy_id", {}).get(product_legacy_id)
+                if product_row is not None:
+                    pg = _extract_gid_like(product_row.get("PRODUCT|core.gid", ""))
+
+        if pg:
+            bridge[vg] = pg
+
+    return bridge
 
     variant_gid_col = "VARIANT|core.gid" if "VARIANT|core.gid" in df_variants.columns else None
     if not variant_gid_col:
@@ -528,31 +598,69 @@ def _build_variant_product_bridge(
     return bridge
 
 
+def _normalize_long_field_keys(owner_type: str, fk: str) -> List[str]:
+    owner_type = _safe_str(owner_type).upper()
+    fk0 = _safe_str(fk)
+    if not fk0:
+        return []
+
+    keys = [fk0]
+    if fk0.startswith("custom."):
+        if owner_type == "PRODUCT":
+            keys.append("mf." + fk0)
+        elif owner_type == "VARIANT":
+            keys.append("v_mf." + fk0)
+    if fk0.startswith("mf.custom."):
+        keys.append(fk0.replace("mf.", "", 1))
+    if fk0.startswith("v_mf.custom."):
+        keys.append(fk0.replace("v_mf.", "", 1))
+
+    out = []
+    seen = set()
+    for k in keys:
+        if k not in seen:
+            out.append(k)
+            seen.add(k)
+    return out
+
+
 def _build_long_value_map(df_dl_values_long: pd.DataFrame) -> Dict[Tuple[str, str, str], str]:
     """
-    key = (entity_type, gid_or_handle, field_key)
+    兼容两种 DL 结构：
+    A) owner_entity_type / owner_gid / field_key / value
+    B) entity_type / gid_or_handle / field_key / desired_value
     """
     dl = df_dl_values_long.copy()
     if dl is None or dl.empty:
         return {}
 
     dl.columns = [_safe_str(c) for c in dl.columns]
-    required_cols = {"entity_type", "gid_or_handle", "field_key", "desired_value"}
-    if not required_cols.issubset(set(dl.columns)):
-        return {}
 
-    dl["entity_type"] = dl["entity_type"].astype(str).str.upper().str.strip()
-    dl["gid_or_handle"] = dl["gid_or_handle"].astype(str).str.strip()
-    dl["field_key"] = dl["field_key"].astype(str).str.strip()
+    if {"owner_entity_type", "owner_gid", "field_key", "value"}.issubset(set(dl.columns)):
+        et_col = "owner_entity_type"
+        gid_col = "owner_gid"
+        val_col = "value"
+    elif {"owner_type", "owner_gid", "field_key", "value"}.issubset(set(dl.columns)):
+        et_col = "owner_type"
+        gid_col = "owner_gid"
+        val_col = "value"
+    elif {"entity_type", "gid_or_handle", "field_key", "desired_value"}.issubset(set(dl.columns)):
+        et_col = "entity_type"
+        gid_col = "gid_or_handle"
+        val_col = "desired_value"
+    else:
+        return {}
 
     mp = {}
     for _, r in dl.iterrows():
-        et = _safe_str(r["entity_type"]).upper()
-        gid = _safe_str(r["gid_or_handle"])
-        fk = _safe_str(r["field_key"])
-        dv = _safe_str(r["desired_value"])
-        if et and gid and fk:
-            mp[(et, gid, fk)] = dv
+        et = _safe_str(r.get(et_col)).upper()
+        gid = _extract_gid_like(r.get(gid_col))
+        fk = _safe_str(r.get("field_key"))
+        val = _safe_str(r.get(val_col))
+        if not (et and gid and fk):
+            continue
+        for fk_norm in _normalize_long_field_keys(et, fk):
+            mp[(et, gid, fk_norm)] = val
     return mp
 
 
@@ -694,6 +802,60 @@ def _resolve_raw_value(
     return ""
 
 
+
+def _field_id_to_long_field_key(field_id: str) -> str:
+    if "|" not in field_id:
+        return _safe_str(field_id)
+    return _safe_str(field_id.split("|", 1)[1])
+
+
+def ensure_columns_from_long(
+    df: pd.DataFrame,
+    needed_cols: List[str],
+    long_value_map: Dict[Tuple[str, str, str], str],
+) -> pd.DataFrame:
+    if df is None or df.empty or not needed_cols:
+        return df
+
+    cols_missing = [c for c in needed_cols if c not in df.columns]
+    if not cols_missing:
+        return df
+
+    var_gid_col = "VARIANT|core.gid"
+    prd_gid_col = "PRODUCT|core.gid"
+    var_prd_gid = "VARIANT|core.product_gid"
+
+    has_var_gid = var_gid_col in df.columns
+    has_prd_gid = prd_gid_col in df.columns
+    has_var_prd = var_prd_gid in df.columns
+
+    var_gids = [_extract_gid_like(x) for x in df[var_gid_col].tolist()] if has_var_gid else None
+    prd_gids = (
+        [_extract_gid_like(x) for x in df[prd_gid_col].tolist()] if has_prd_gid
+        else ([_extract_gid_like(x) for x in df[var_prd_gid].tolist()] if has_var_prd else None)
+    )
+
+    for col in cols_missing:
+        if not isinstance(col, str) or "|" not in col:
+            continue
+        ent = _safe_str(col.split("|", 1)[0]).upper()
+        fk = _field_id_to_long_field_key(col)
+
+        if not (fk.startswith("mf.") or fk.startswith("v_mf.") or fk.startswith("custom.")):
+            continue
+
+        if ent == "VARIANT":
+            if not var_gids:
+                continue
+            df[col] = [long_value_map.get(("VARIANT", gid, fk), "") for gid in var_gids]
+        elif ent == "PRODUCT":
+            if not prd_gids:
+                continue
+            df[col] = [long_value_map.get(("PRODUCT", gid, fk), "") for gid in prd_gids]
+
+    return df
+
+
 # =========================================================
 # 主流程
 # =========================================================
@@ -745,31 +907,133 @@ def build_and_write_view(
         vf["seq"] = pd.to_numeric(vf["seq"], errors="coerce")
         vf = vf.sort_values(["seq", "field_id"], na_position="last")
 
-    # ---- base df
-    if base_entity_type == "PRODUCT":
-        base_df = df_idx_products.copy()
-    else:
-        base_df = df_idx_variants.copy()
+    if "agg" not in vf.columns:
+        vf["agg"] = ""
 
-    base_df = _dedupe_columns_keep_first(base_df)
+    # ---- base df
+    df_products = _dedupe_columns_keep_first(df_idx_products.copy())
+    df_variants = _dedupe_columns_keep_first(df_idx_variants.copy())
 
     # ---- filters
     global_pf, global_vf = split_filters_by_entity(global_filters)
     fixed_pf, fixed_vf = split_filters_by_entity(fixed_filters_json)
     override_pf, override_vf = split_filters_by_entity(view_filter_overrides.get(view_id, {}))
 
-    if base_entity_type == "PRODUCT":
-        merged_filters = {}
-        merged_filters.update(global_pf)
-        merged_filters.update(fixed_pf)
-        merged_filters.update(override_pf)
-    else:
-        merged_filters = {}
-        merged_filters.update(global_vf)
-        merged_filters.update(fixed_vf)
-        merged_filters.update(override_vf)
+    merged_pf = {}
+    merged_pf.update(global_pf)
+    merged_pf.update(fixed_pf)
+    merged_pf.update(override_pf)
 
-    base_df = apply_entity_filters(base_df, merged_filters, fixed_filter_mode)
+    merged_vf = {}
+    merged_vf.update(global_vf)
+    merged_vf.update(fixed_vf)
+    merged_vf.update(override_vf)
+
+    # ---- ensure needed cols from DL
+    needed_product_cols = set(vf[vf["entity_type"].astype(str).str.upper().eq("PRODUCT")]["field_id"].astype(str).tolist())
+    needed_variant_cols = set(vf[vf["entity_type"].astype(str).str.upper().eq("VARIANT")]["field_id"].astype(str).tolist())
+    needed_product_cols |= set(merged_pf.keys())
+    needed_variant_cols |= set(merged_vf.keys())
+
+    long_value_map = _build_long_value_map(df_dl_values_long)
+    df_products = ensure_columns_from_long(df_products, list(needed_product_cols), long_value_map)
+    df_variants = ensure_columns_from_long(df_variants, list(needed_variant_cols), long_value_map)
+
+    # ---- variant base: if product filters exist, prefilter variants by allowed products
+    product_filters_exist = len(merged_pf) > 0
+    if base_entity_type == "VARIANT" and product_filters_exist:
+        df_products_for_filter = apply_entity_filters(df_products.copy(), merged_pf, fixed_filter_mode)
+
+        if "PRODUCT|core.gid" not in df_products_for_filter.columns:
+            raise ValueError("IDX__Products 缺 PRODUCT|core.gid，无法按 PRODUCT filters 预筛 VARIANT")
+
+        allowed_product_gids = set(_extract_gid_like(x) for x in df_products_for_filter["PRODUCT|core.gid"].tolist())
+
+        if "VARIANT|core.product_gid" not in df_variants.columns:
+            raise ValueError("IDX__Variants 缺 VARIANT|core.product_gid，无法按 PRODUCT filters 预筛 VARIANT")
+
+        before_n = len(df_variants)
+        df_variants = df_variants[
+            df_variants["VARIANT|core.product_gid"].map(_extract_gid_like).isin(allowed_product_gids)
+        ].copy()
+        if verbose:
+            print(f"prefilter variants by product filters: {before_n} -> {len(df_variants)}")
+
+    # ---- choose base + entity-specific filters
+    if base_entity_type == "PRODUCT":
+        base_df = apply_entity_filters(df_products.copy(), merged_pf, fixed_filter_mode)
+    else:
+        base_df = apply_entity_filters(df_variants.copy(), merged_vf, fixed_filter_mode)
+
+    # ---- PRODUCT-base: aggregate VARIANT fields up to product
+    if base_entity_type == "PRODUCT":
+        variant_rows = vf[vf["entity_type"].astype(str).str.upper().eq("VARIANT")].copy()
+        if not variant_rows.empty:
+            if "VARIANT|core.product_gid" not in df_variants.columns:
+                raise ValueError("IDX__Variants 缺 VARIANT|core.product_gid，无法把 VARIANT 聚合到 PRODUCT")
+            if "PRODUCT|core.gid" not in base_df.columns:
+                raise ValueError("IDX__Products 缺 PRODUCT|core.gid，无法 merge 聚合后的 VARIANT 字段")
+
+            def agg_series(s: pd.Series, agg_name: str):
+                agg_name = _safe_str(agg_name).upper()
+                ss = s.fillna("").astype(str)
+                ss = ss[ss.str.strip() != ""]
+                if len(ss) == 0:
+                    return ""
+                if agg_name in ("", "FIRST"):
+                    return ss.iloc[0]
+                if agg_name == "FIRST_SORTED":
+                    return ss.sort_values().iloc[0]
+                if agg_name == "LIST":
+                    return ", ".join(ss.tolist())
+                if agg_name == "LIST_DISTINCT":
+                    seen = []
+                    for x in ss.tolist():
+                        if x not in seen:
+                            seen.append(x)
+                    return ", ".join(seen)
+                return ss.iloc[0]
+
+            variant_work = df_variants.copy()
+            variant_work["__product_gid_norm"] = variant_work["VARIANT|core.product_gid"].map(_extract_gid_like)
+
+            pieces = []
+            for _, r in variant_rows.iterrows():
+                fid = _safe_str(r.get("field_id"))
+                agg_name = _safe_str(r.get("agg"))
+                if not fid or fid not in variant_work.columns:
+                    continue
+                g = variant_work.groupby("__product_gid_norm")[fid].apply(lambda s: agg_series(s, agg_name)).rename(fid)
+                pieces.append(g)
+
+            if pieces:
+                variant_agg_df = pd.concat(pieces, axis=1).reset_index().rename(columns={"__product_gid_norm": "PRODUCT|core.gid"})
+                base_df = base_df.merge(variant_agg_df, how="left", on="PRODUCT|core.gid")
+
+    # ---- VARIANT base: join PRODUCT fields onto variants
+    if base_entity_type == "VARIANT":
+        if "VARIANT|core.product_gid" not in base_df.columns:
+            raise ValueError("IDX__Variants 缺 VARIANT|core.product_gid，无法 join PRODUCT 字段")
+        if "PRODUCT|core.gid" not in df_products.columns:
+            raise ValueError("IDX__Products 缺 PRODUCT|core.gid，无法 join 到 VARIANT")
+
+        needed_product_cols2 = set(vf[vf["entity_type"].astype(str).str.upper().eq("PRODUCT")]["field_id"].astype(str).tolist())
+        needed_product_cols2 |= set(merged_pf.keys())
+
+        take_cols = ["PRODUCT|core.gid"] + [c for c in needed_product_cols2 if c in df_products.columns]
+        prod_take = df_products[take_cols].drop_duplicates(subset=["PRODUCT|core.gid"]).copy()
+        prod_take["__product_gid_norm"] = prod_take["PRODUCT|core.gid"].map(_extract_gid_like)
+
+        base_df = base_df.copy()
+        base_df["__variant_product_gid_norm"] = base_df["VARIANT|core.product_gid"].map(_extract_gid_like)
+        base_df = base_df.merge(
+            prod_take.drop(columns=["PRODUCT|core.gid"]).rename(columns={"__product_gid_norm": "__variant_product_gid_norm"}),
+            how="left",
+            on="__variant_product_gid_norm",
+        )
+
+        if product_filters_exist:
+            base_df = apply_entity_filters(base_df, merged_pf, fixed_filter_mode)
 
     if base_key_field_id and base_key_field_id not in base_df.columns:
         short_key = base_key_field_id.split("|", 1)[-1] if "|" in base_key_field_id else base_key_field_id
@@ -778,11 +1042,6 @@ def build_and_write_view(
 
     if base_key_field_id and base_key_field_id not in base_df.columns:
         raise ValueError(f"view_id={view_id} 的 base_key_field_id 在 base_df 中不存在：{base_key_field_id}")
-
-    # ---- 预备 map
-    row_maps = _build_row_maps(df_idx_products, df_idx_variants)
-    variant_product_bridge = _build_variant_product_bridge(df_idx_variants, row_maps)
-    long_value_map = _build_long_value_map(df_dl_values_long)
 
     # ---- fields
     field_rows = _prepare_field_rows(vf)
@@ -793,37 +1052,25 @@ def build_and_write_view(
 
     # ---- 构造数据
     out_rows = []
-
     for _, base_row in base_df.iterrows():
         base_row = base_row.copy()
-        related_rows = _resolve_related_rows(
-            base_entity_type=base_entity_type,
-            base_row=base_row,
-            row_maps=row_maps,
-            variant_product_bridge=variant_product_bridge,
-        )
-
         one = {}
 
         for fr in field_rows:
             field_type = _safe_str(fr["field_type"]).upper()
             output_key = fr["output_key"]
+            fid = _safe_str(fr.get("field_id"))
 
             if field_type == "CALC" and _safe_str(fr["expr"]).startswith("="):
                 one[output_key] = ""
             else:
-                one[output_key] = _resolve_raw_value(
-                    field_row=fr,
-                    related_rows=related_rows,
-                    long_value_map=long_value_map,
-                    base_row=base_row,
-                )
+                one[output_key] = _as_scalar(base_row.get(fid, "")) if fid else ""
 
         out_rows.append(one)
 
     out_df = pd.DataFrame(out_rows, columns=output_keys).fillna("")
 
-    # ---- 写表：header + raw body
+    # ---- 写表
     ws = ensure_worksheet(
         sh_data,
         target_sheet,
@@ -847,22 +1094,18 @@ def build_and_write_view(
         body_values = out_df[output_keys].astype(str).values.tolist()
         ws_update(ws, f"A2:{col_to_letter(len(display_headers))}{len(body_values)+1}", body_values)
 
-    # ---- 公式 token -> col 映射
     token_to_col_letter = {}
     for i, fr in enumerate(field_rows, start=1):
         col_letter = col_to_letter(i)
-
         output_key = fr["output_key"]
         field_id = _safe_str(fr["field_id"])
         alias = _safe_str(fr["alias"])
-
         token_to_col_letter[output_key] = col_letter
         if field_id:
             token_to_col_letter[field_id] = col_letter
         if alias:
             token_to_col_letter[alias] = col_letter
 
-    # ---- 公式列
     formula_cols = []
     for i, fr in enumerate(field_rows, start=1):
         expr = _safe_str(fr["expr"])
