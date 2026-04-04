@@ -1987,24 +1987,36 @@ def run(
             "meta": {"site_code": site_code, "job_name": job_name, "run_id": run_id},
         }
 
+    print("\n====================================")
+    print("APPLY START")
+    print("====================================")
+
     metafield_apply = apply_metafield_plan(
         client=shopify,
         set_inputs=meta_plan["set_inputs"],
         meta_rows=meta_plan["meta_rows"],
         set_batch_size=set_batch_size,
     )
+
     product_apply = apply_product_core_plan(
         client=shopify,
         product_inputs=core_plan["product_inputs"],
         product_meta_rows=core_plan["product_meta_rows"],
         tag_delta_rows=core_plan["tag_delta_rows"],
+        set_batch_size=set_batch_size,
     )
+
     variant_apply = apply_variant_core_plan(
         client=shopify,
         variant_inputs=core_plan["variant_inputs"],
         variant_meta_rows=core_plan["variant_meta_rows"],
+        set_batch_size=set_batch_size,
     )
 
+    print("====================================")
+    print("APPLY END")
+    print("====================================")
+    
     rows_written = metafield_apply["ok_count"] + product_apply["ok_count"] + variant_apply["ok_count"]
     apply_fail_count = metafield_apply["fail_count"] + product_apply["fail_count"] + variant_apply["fail_count"]
 
