@@ -800,7 +800,8 @@ def run(
     console_core_url: str,
     gsheet_sa_b64: str,
     view_toggles: Dict[str, bool],
-    use_default_filters: bool = True,
+    global_filters: Optional[Dict[str, Any]] = None,
+    filter_mode: str = "AND",
     view_filter_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     verbose: bool = True,
 ):
@@ -854,8 +855,8 @@ def run(
             df_idx_variants=df_idx_variants,
             df_dl_values_long=df_dl_values_long,
             view_id=vid,
-            global_filters={},
-            use_default_filters=use_default_filters,
+            global_filters=global_filters or {},
+            filter_mode=filter_mode,
             view_filter_overrides=view_filter_overrides or {},
             verbose=verbose,
         )
