@@ -632,7 +632,6 @@ def build_mf_selection_and_map(mf_field_keys: List[str]) -> Tuple[str, Dict[str,
             '{ value type references(first: 50) { nodes { __typename '
             '... on Metaobject { id type handle } '
             '... on Collection { id } '
-            '... on ProductTaxonomyValue { id name fullName } '
             '... on GenericFile { id url } '
             '... on MediaImage { id image { url altText } } '
             '} } }'
@@ -735,7 +734,9 @@ def fetch_metaobjects_for_specs(
     if not ref_gid_to_expected_type:
         return {}
 
-    all_meta_keys = sorted({normalize_str(s["meta_field_key"]) for s in specs if normalize_str(s.get("meta_field_key"))})
+    all_meta_keys = sorted(
+        {normalize_str(s["meta_field_key"]) for s in specs if normalize_str(s.get("meta_field_key"))}
+    )
     field_lines = []
     for k in all_meta_keys:
         alias = gql_safe_alias(f"mo_field_{k}")
@@ -745,17 +746,15 @@ def fetch_metaobjects_for_specs(
             'reference { __typename '
             '... on Metaobject { id type handle } '
             '... on Collection { id } '
-            '... on ProductTaxonomyValue { id name fullName } '
             '... on GenericFile { id url } '
             '... on MediaImage { id image { url altText } } '
             '} '
             'references(first: 50) { nodes { __typename '
             '... on Metaobject { id type handle } '
             '... on Collection { id } '
-            '... on ProductTaxonomyValue { id name fullName } '
             '... on GenericFile { id url } '
             '... on MediaImage { id image { url altText } } '
-            '} } }'
+            '} } } }'
         )
     sel = "\n".join(field_lines)
 
@@ -810,8 +809,6 @@ def serialize_reference_node(node: Dict[str, Any]) -> str:
         return normalize_str(node.get("id"))
     if t == "Collection":
         return normalize_str(node.get("id"))
-    if t == "ProductTaxonomyValue":
-        return normalize_str(node.get("fullName") or node.get("name") or node.get("id"))
     if t == "GenericFile":
         return normalize_str(node.get("url") or node.get("id"))
     if t == "MediaImage":
