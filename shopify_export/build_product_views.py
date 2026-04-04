@@ -927,25 +927,30 @@ def ensure_columns_from_long(
         else ([_extract_gid_like(x) for x in df[var_prd_gid].tolist()] if has_var_prd else None)
     )
 
+    add_cols = {}
     for col in cols_missing:
         if not isinstance(col, str) or "|" not in col:
             continue
+
         ent = _safe_str(col.split("|", 1)[0]).upper()
         fk = _field_id_to_long_field_key(col)
-
         if not (fk.startswith("mf.") or fk.startswith("v_mf.") or fk.startswith("custom.")):
             continue
 
         if ent == "VARIANT":
             if not var_gids:
                 continue
-            df[col] = [long_value_map.get(("VARIANT", gid, fk), "") for gid in var_gids]
+            add_cols[col] = [long_value_map.get(("VARIANT", gid, fk), "") for gid in var_gids]
         elif ent == "PRODUCT":
             if not prd_gids:
                 continue
-            df[col] = [long_value_map.get(("PRODUCT", gid, fk), "") for gid in prd_gids]
+            add_cols[col] = [long_value_map.get(("PRODUCT", gid, fk), "") for gid in prd_gids]
 
-    return df
+    if not add_cols:
+        return df
+
+    add_df = pd.DataFrame(add_cols, index=df.index)
+    return pd.concat([df, add_df], axis=1).copy()
 
 
 # =========================================================
