@@ -115,6 +115,21 @@ RUNLOG_HEADERS = [
 # 可继续追加，但建议保持 field_type = RAW / CALC 的统一语义
 # =========================================================
 
+def split_field_key(field_key: str) -> Tuple[str, str]:
+    if not field_key:
+        return "", ""
+    if field_key.startswith("mf.") or field_key.startswith("v_mf.") or field_key.startswith("mo."):
+        parts = field_key.split(".")
+        if len(parts) >= 3:
+            return parts[1], ".".join(parts[2:])
+    if field_key.startswith("core."):
+        return "core", field_key.replace("core.", "", 1)
+    if "." in field_key:
+        ns, k = field_key.split(".", 1)
+        return ns, k
+    return "", field_key
+
+
 def _core_row(
     entity_type: str,
     field_key: str,
@@ -240,13 +255,11 @@ class RunContext:
 # =========================================================
 
 def now_ts_cn() -> str:
-    # 这里沿用你项目习惯：Asia/Shanghai
-    # 不额外引入 pytz，直接写 +08:00
+    # Asia/Shanghai
+    from datetime import timedelta
     utc_now = datetime.now(timezone.utc)
-    cn_now = utc_now.astimezone(timezone.utc).replace(tzinfo=None)  # 先取 naive
-    # 简化：如果你后续需要严格上海时区，可换 zoneinfo
-    return (utc_now.astimezone(timezone.utc).timestamp() and
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+    cn_now = utc_now.astimezone(timezone(timedelta(hours=8)))
+    return cn_now.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def make_run_id(prefix: str = "cfg") -> str:
@@ -260,19 +273,6 @@ def extract_sheet_id(sheet_url: str) -> str:
     return m.group(1)
 
 
-def split_field_key(field_key: str) -> Tuple[str, str]:
-    if not field_key:
-        return "", ""
-    if field_key.startswith("mf.") or field_key.startswith("v_mf.") or field_key.startswith("mo."):
-        parts = field_key.split(".")
-        if len(parts) >= 3:
-            return parts[1], ".".join(parts[2:])
-    if field_key.startswith("core."):
-        return "core", field_key.replace("core.", "", 1)
-    if "." in field_key:
-        ns, k = field_key.split(".", 1)
-        return ns, k
-    return "", field_key
 
 
 def normalize_text(v: Any) -> str:
