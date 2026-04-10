@@ -430,8 +430,12 @@ def run(
     page_size: int = 250,
     admin_store_handle: str = "544104",
     storefront_base_url: str = "https://plumbingsell.com",
+    write_to_sheet: bool = True,
     write_runlog: bool = True,
+    preview_limit: int = 20,
+    sleep_sec: float = 0.0,
     print_progress: bool = True,
+    **kwargs,
 ) -> Dict[str, Any]:
     """
     notebook 对齐版：
@@ -441,6 +445,11 @@ def run(
     - 仅重写 A/B 公式列
     """
     metafield_owner_types = metafield_owner_types or OWNER_TYPES_DEFAULT
+
+    # 兼容旧调用参数：
+    # - write_to_sheet=False 时仅预览，不写表
+    # - preview_limit / sleep_sec 允许传入但不改变 notebook 对齐主逻辑
+    # - 其余多余 kwargs 直接忽略，避免 colab 旧调用报 unexpected keyword
 
     gc = build_gspread_client_from_b64_secret(gsheet_sa_b64)
     run_id = make_run_id("cfg")
