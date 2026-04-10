@@ -644,4 +644,4 @@ def run(
         print("Done.")
         print(json.dumps(summary, ensure_ascii=False, indent=2))
 
-    return summary
+    return {"summary": summary, "preview": [], "warnings": []}
