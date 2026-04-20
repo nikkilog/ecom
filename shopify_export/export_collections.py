@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import gspread
 import requests
 from google.oauth2.service_account import Credentials
+from gspread.utils import rowcol_to_a1
 
 
 JOB_NAME = "export_collections"
@@ -41,16 +42,18 @@ MF_LIST: List[Tuple[str, str]] = [
 ]
 
 OUT_HEADER = [
+    "Category ID",
     "collection_id",
-    "collection_name",
-    "handle",
-    "StoreFront URL",
-    "Admin URL",
     "Category Name 1",
     "Category Name 2",
     "Category Name 3",
     "Category Name 4",
-    "Category ID",
+    "collection_name",
+    "handle",
+    "StoreFront URL",
+    "Admin URL",
+    "Theme template name（templateSuffix）",
+    "image url",
     "Collection level",
     "Parent Category",
     "Top Category",
@@ -63,10 +66,7 @@ OUT_HEADER = [
     "规则4",
     "规则5",
     "是否发布（Online Store）",
-    "Theme template name（templateSuffix）",
-    "image url",
-    "更新时间（updatedAt）",
-    "同步时间",
+    "最后两个更新时间（updatedAt）",
 ]
 
 RUNLOG_HEADER = [
@@ -106,7 +106,7 @@ class ExportConfig:
     runlog_label: str = "runlog_sheet"
 
     write_mode: str = "REPLACE"  # REPLACE / APPEND
-    write_header_and_desc: bool = True
+    write_header_and_desc: bool = False
 
     status_enabled: bool = True
     online_store_publication_id: str = ""
@@ -145,6 +145,8 @@ class ShopifyClient:
             try:
                 r = requests.post(self.url, headers=self.headers, json=payload, timeout=self.timeout)
                 if r.status_code == 429:
+                    wait_s = round(1.2 * (i + 1), 2)
+                    print(f"⚠️ Shopify 429，等待 {wait_s}s 后重试（{i + 1}/{self.retry}）")
                     time.sleep(1.2 * (i + 1))
                     continue
                 r.raise_for_status()
@@ -155,13 +157,14 @@ class ShopifyClient:
                 return data["data"]
             except Exception as e:
                 last_err = e
+                wait_s = round(1.0 * (i + 1), 2)
+                print(f"⚠️ GraphQL 请求失败，{wait_s}s 后重试（{i + 1}/{self.retry}）：{e}")
                 time.sleep(1.0 * (i + 1))
 
         raise RuntimeError(f"GraphQL failed after retries. Last error: {last_err}")
 
 
 def now_cn() -> str:
-    # 你之前体系一直偏向中国时间
     return (dt.datetime.utcnow() + dt.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -205,7 +208,6 @@ def build_gspread_client(gsheet_sa_b64: str):
 
 
 def gs_url_to_csv_export(url: str, sheet_name: str) -> str:
-    # 统一按 worksheet title 走，不依赖 gid
     m = requests.utils.urlparse(url)
     path = m.path
     if "/edit" in path:
@@ -240,17 +242,21 @@ def ensure_tab(ws_book, tab_name: str):
     try:
         return ws_book.worksheet(tab_name)
     except Exception:
+        print(f"⚠️ 输出 tab 不存在，自动创建：{tab_name}")
         return ws_book.add_worksheet(title=tab_name, rows=1000, cols=30)
 
 
 def write_table(ws, rows: List[List[Any]], write_mode: str = "REPLACE"):
     write_mode = (write_mode or "REPLACE").upper().strip()
     if write_mode == "REPLACE":
+        print(f"🧹 清空目标表：{ws.title}")
         ws.clear()
         if rows:
+            print(f"✍️ 一次性写入 {len(rows)} 行")
             ws.update("A1", rows, value_input_option="RAW")
     elif write_mode == "APPEND":
         if rows:
+            print(f"➕ 追加写入 {len(rows)} 行")
             ws.append_rows(rows, value_input_option="RAW")
     else:
         raise RuntimeError(f"不支持 WRITE_MODE: {write_mode}")
@@ -258,9 +264,15 @@ def write_table(ws, rows: List[List[Any]], write_mode: str = "REPLACE"):
 
 def append_rows_chunked(ws, rows: List[List[Any]], chunk_size: int = 2000):
     if not rows:
+        print("ℹ️ 没有可追加的数据")
         return
-    for i in range(0, len(rows), chunk_size):
+    total = len(rows)
+    batch_total = (total + chunk_size - 1) // chunk_size
+    print(f"✍️ 开始分块追加：total_rows={total} | batches={batch_total} | chunk_size={chunk_size}")
+    for i in range(0, total, chunk_size):
         chunk = rows[i:i + chunk_size]
+        batch_no = i // chunk_size + 1
+        print(f"   - append batch {batch_no}/{batch_total} | rows={len(chunk)}")
         ws.append_rows(chunk, value_input_option="RAW")
 
 
@@ -387,38 +399,6 @@ def resolve_online_store_publication_id(client: ShopifyClient, cfg: ExportConfig
     return pub_id, pubs
 
 
-def build_desc_row(shop_domain: str, storefront_base_url: str) -> List[str]:
-    handle = shop_domain.split(".")[0]
-    return [
-        "collection id，数字格式（legacyResourceId）",
-        "collection_name（title）",
-        "handle",
-        f"{storefront_base_url.strip().rstrip('/')}/collections/{{handle}}",
-        f"https://admin.shopify.com/store/{handle}/collections/{{collection_id}}",
-        "custom.category_name_1",
-        "custom.category_name_2",
-        "custom.category_name_3",
-        "custom.category_name_4",
-        "custom.category_id",
-        "custom.collection_level",
-        "custom.parent_category",
-        "custom.top_category",
-        "custom.breadcrumb_leaf",
-        "SMART/MANUAL（ruleSet 有=SMART）",
-        "all/any（AND/OR；ruleSet.appliedDisjunctively=false=all, true=any）",
-        "ruleSet.rules[0] => column relation condition",
-        "ruleSet.rules[1]",
-        "ruleSet.rules[2]",
-        "ruleSet.rules[3]",
-        "ruleSet.rules[4]",
-        "publishedOnPublication(Online Store) => TRUE/FALSE（pub_id 有效时）",
-        "templateSuffix",
-        "image.url",
-        "updatedAt",
-        "syncedAt（本次同步时间）",
-    ]
-
-
 def export_rows(client: ShopifyClient, cfg: ExportConfig, pub_id: str) -> Dict[str, Any]:
     include_status = bool(cfg.status_enabled and pub_id)
     include_filter_mf = bool(cfg.filter_enabled)
@@ -432,7 +412,18 @@ def export_rows(client: ShopifyClient, cfg: ExportConfig, pub_id: str) -> Dict[s
     skipped = 0
     page_count = 0
     after = None
-    synced_at = now_cn()
+
+    print("🚀 开始拉取 Collections")
+    print(
+        f"   - page_size={cfg.page_size}"
+        f" | status_enabled={include_status}"
+        f" | filter_enabled={include_filter_mf}"
+    )
+    if include_filter_mf:
+        print(
+            f"   - filter: {cfg.filter_namespace}.{cfg.filter_key} "
+            f"{cfg.filter_match_mode} {cfg.filter_value}"
+        )
 
     while True:
         variables: Dict[str, Any] = {
@@ -450,18 +441,25 @@ def export_rows(client: ShopifyClient, cfg: ExportConfig, pub_id: str) -> Dict[s
         edges = page["edges"]
         page_count += 1
 
+        page_loaded = 0
+        page_kept = 0
+        page_skipped = 0
+
         for edge in edges:
             node = edge["node"]
             loaded += 1
+            page_loaded += 1
 
             if include_filter_mf:
                 filter_mf = node.get("__filter_mf")
                 ok = match_metafield(filter_mf, cfg.filter_value, cfg.filter_match_mode)
                 if not ok:
                     skipped += 1
+                    page_skipped += 1
                     continue
 
             kept += 1
+            page_kept += 1
 
             legacy_id = safe_str(node.get("legacyResourceId"))
             handle = safe_str(node.get("handle"))
@@ -473,16 +471,18 @@ def export_rows(client: ShopifyClient, cfg: ExportConfig, pub_id: str) -> Dict[s
             rules = rule_set.get("rules") or []
 
             row = [
+                get_mf_value(node, "custom", "category_id"),
                 legacy_id,
-                title,
-                handle,
-                build_storefront_url(cfg.storefront_base_url, handle),
-                build_admin_url(cfg.shop_domain, legacy_id),
                 get_mf_value(node, "custom", "category_name_1"),
                 get_mf_value(node, "custom", "category_name_2"),
                 get_mf_value(node, "custom", "category_name_3"),
                 get_mf_value(node, "custom", "category_name_4"),
-                get_mf_value(node, "custom", "category_id"),
+                title,
+                handle,
+                build_storefront_url(cfg.storefront_base_url, handle),
+                build_admin_url(cfg.shop_domain, legacy_id),
+                template_suffix,
+                image_url,
                 get_mf_value(node, "custom", "collection_level"),
                 get_mf_value(node, "custom", "parent_category"),
                 get_mf_value(node, "custom", "top_category"),
@@ -495,21 +495,28 @@ def export_rows(client: ShopifyClient, cfg: ExportConfig, pub_id: str) -> Dict[s
                 friendly_rule(*(list(rules[3].values()) if len(rules) > 3 else [None, None, None])),
                 friendly_rule(*(list(rules[4].values()) if len(rules) > 4 else [None, None, None])),
                 safe_str(node.get("publishedOnPublication")) if include_status else "",
-                template_suffix,
-                image_url,
                 updated_at,
-                synced_at,
             ]
             all_rows.append(row)
             if len(preview_rows) < 8:
                 preview_rows.append(row)
 
+        print(
+            f"📦 page {page_count} done"
+            f" | loaded={page_loaded}"
+            f" | kept={page_kept}"
+            f" | skipped={page_skipped}"
+            f" | total_kept={kept}"
+        )
+
         page_info = page["pageInfo"]
         if not page_info["hasNextPage"]:
+            print("✅ Collections 拉取完成：已到最后一页")
             break
         after = page_info["endCursor"]
 
         if cfg.sleep_every_n_calls > 0 and page_count % cfg.sleep_every_n_calls == 0:
+            print(f"😴 达到 sleep_every_n_calls={cfg.sleep_every_n_calls}，暂停 {cfg.sleep_seconds}s")
             time.sleep(cfg.sleep_seconds)
 
     return {
@@ -519,7 +526,6 @@ def export_rows(client: ShopifyClient, cfg: ExportConfig, pub_id: str) -> Dict[s
         "rows_written": kept,
         "rows_skipped": skipped,
         "page_count": page_count,
-        "synced_at": synced_at,
         "pub_id_used": pub_id,
     }
 
@@ -532,9 +538,11 @@ def write_runlog(gc, runlog_sheet_url: str, records: List[List[Any]]):
         ws = ensure_tab(book, RUNLOG_TAB_NAME)
         existing = ws.row_values(1)
         if existing != RUNLOG_HEADER:
+            print("🧾 RunLog 表头不一致，重建表头")
             ws.clear()
             ws.update("A1", [RUNLOG_HEADER], value_input_option="RAW")
         if records:
+            print(f"🧾 写入 RunLog：{len(records)} 行")
             ws.append_rows(records, value_input_option="RAW")
     except Exception as e:
         print(f"⚠️ RunLog 写入失败：{e}")
@@ -573,6 +581,52 @@ def make_runlog_summary(
     ]
 
 
+def write_export_sheet(ws, header: List[str], data_rows: List[List[Any]], write_mode: str, chunk_size: int):
+    ncols = len(header)
+    write_mode = (write_mode or "REPLACE").upper().strip()
+    total_rows = len(data_rows)
+
+    need_rows = max(ws.row_count, total_rows + 10)
+    need_cols = max(ws.col_count, ncols)
+    if need_rows != ws.row_count or need_cols != ws.col_count:
+        print(f"📐 调整 sheet 尺寸：rows {ws.row_count}->{need_rows} | cols {ws.col_count}->{need_cols}")
+        ws.resize(rows=need_rows, cols=need_cols)
+
+    existing = ws.get_all_values()
+
+    if write_mode == "REPLACE":
+        print("🧹 REPLACE 模式：清空后重写")
+        ws.clear()
+        print(f"✍️ 写入表头：1 行 × {ncols} 列")
+        ws.update(range_name="A1", values=[header], value_input_option="RAW")
+
+        if not data_rows:
+            print("ℹ️ 没有数据行，只写入表头")
+            return
+
+        batch_total = (total_rows + chunk_size - 1) // chunk_size
+        r0 = 2
+        print(f"✍️ 开始分块写入数据：total_rows={total_rows} | batches={batch_total} | chunk_size={chunk_size}")
+        for i in range(0, total_rows, chunk_size):
+            block = data_rows[i:i + chunk_size]
+            batch_no = i // chunk_size + 1
+            r1 = r0 + len(block) - 1
+            a1 = rowcol_to_a1(r0, 1)
+            b1 = rowcol_to_a1(r1, ncols)
+            rng = f"{a1}:{b1}"
+            print(f"   - write batch {batch_no}/{batch_total} | range={rng} | rows={len(block)}")
+            ws.update(range_name=rng, values=block, value_input_option="RAW")
+            r0 += len(block)
+    elif write_mode == "APPEND":
+        print("➕ APPEND 模式")
+        if not existing:
+            print("✍️ 空表，先写入表头")
+            ws.update(range_name="A1", values=[header], value_input_option="RAW")
+        append_rows_chunked(ws, data_rows, chunk_size=chunk_size)
+    else:
+        raise RuntimeError(f"不支持 WRITE_MODE: {write_mode}")
+
+
 def run(
     *,
     site_code: str,
@@ -586,7 +640,7 @@ def run(
     export_tab_name: str = EXPORT_TAB_DEFAULT,
     runlog_label: str = "runlog_sheet",
     write_mode: str = "REPLACE",
-    write_header_and_desc: bool = True,
+    write_header_and_desc: bool = False,
     status_enabled: bool = True,
     online_store_publication_id: str = "",
     auto_find_online_store_publication_id: bool = True,
@@ -615,7 +669,7 @@ def run(
         export_tab_name=(export_tab_name or EXPORT_TAB_DEFAULT).strip(),
         runlog_label=(runlog_label or "runlog_sheet").strip(),
         write_mode=(write_mode or "REPLACE").strip().upper(),
-        write_header_and_desc=bool(write_header_and_desc),
+        write_header_and_desc=False,
         status_enabled=bool(status_enabled),
         online_store_publication_id=(online_store_publication_id or "").strip(),
         auto_find_online_store_publication_id=bool(auto_find_online_store_publication_id),
@@ -635,7 +689,12 @@ def run(
     run_id = now_run_id()
     ts_cn = now_cn()
 
+    print(f"========== {JOB_NAME} | start ==========")
+    print(f"site_code={cfg.site_code} | shop_domain={cfg.shop_domain} | tab={cfg.export_tab_name}")
+
     gc = build_gspread_client(cfg.gsheet_sa_b64)
+    print("✅ Google Sheets client ready")
+
     client = ShopifyClient(
         shop_domain=cfg.shop_domain,
         api_version=cfg.api_version,
@@ -643,9 +702,13 @@ def run(
         retry=cfg.retry,
         timeout=cfg.request_timeout,
     )
+    print("✅ Shopify client ready")
 
     export_sheet_url = find_site_label_url(cfg.console_core_url, cfg.site_code, cfg.export_label)
+    print(f"✅ export_sheet_url: {export_sheet_url}")
+
     runlog_sheet_url = find_site_label_url(cfg.console_core_url, cfg.site_code, cfg.runlog_label)
+    print(f"✅ runlog_sheet_url: {runlog_sheet_url}")
 
     pub_id, pubs = resolve_online_store_publication_id(client, cfg)
     print(f"✅ Publications found: {len(pubs)}")
@@ -656,23 +719,17 @@ def run(
 
     result = export_rows(client, cfg, pub_id=pub_id)
 
+    print(f"📄 打开输出表：{cfg.export_tab_name}")
     book = gc.open_by_url(export_sheet_url)
     ws = ensure_tab(book, cfg.export_tab_name)
 
-    rows_to_write: List[List[Any]] = []
-    if cfg.write_header_and_desc:
-        rows_to_write.append(OUT_HEADER)
-        rows_to_write.append(build_desc_row(cfg.shop_domain, cfg.storefront_base_url))
-    rows_to_write.extend(result["rows"])
-
-    if cfg.write_mode == "REPLACE":
-        write_table(ws, rows_to_write, write_mode="REPLACE")
-    else:
-        if cfg.write_header_and_desc:
-            existing = ws.get_all_values()
-            if not existing:
-                ws.update("A1", [OUT_HEADER, build_desc_row(cfg.shop_domain, cfg.storefront_base_url)], value_input_option="RAW")
-        append_rows_chunked(ws, result["rows"], chunk_size=cfg.write_chunk_rows)
+    write_export_sheet(
+        ws=ws,
+        header=OUT_HEADER,
+        data_rows=result["rows"],
+        write_mode=cfg.write_mode,
+        chunk_size=cfg.write_chunk_rows,
+    )
 
     msg = (
         f"export ok | pages={result['page_count']} | "
@@ -711,4 +768,5 @@ def run(
     }
 
     print("✅", msg)
+    print(f"========== {JOB_NAME} | end ==========")
     return out
