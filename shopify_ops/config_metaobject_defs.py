@@ -165,6 +165,18 @@ class SiteRouting:
     runlog_sheet_url: str
 
 
+@dataclass
+class AccountConfig:
+    shop_domain: str
+    api_version: str
+    gsheet_sa_b64_secret: str
+    shopify_token_secret: str
+    storefront_base_url: str = ""
+    admin_base_url: str = ""
+    meta_ad_account_id: str = ""
+    awin_advertiser_id: str = ""
+
+
 def _resolve_site_routing(
     gc: gspread.Client,
     console_core_url: str,
@@ -206,6 +218,114 @@ def _resolve_site_routing(
         config_sheet_url=pick(config_sheet_label),
         runlog_sheet_url=pick(runlog_sheet_label),
     )
+
+
+def _load_account_config(
+    gc: gspread.Client,
+    console_core_url: str,
+    tab_cfg_account_id: str,
+) -> AccountConfig:
+    """
+    Read account-level runtime config from Console Core / Cfg__account_id.
+
+    Expected sheet shape:
+      column A = config key
+      column B = config value
+
+    Required keys:
+      SHOP_DOMAIN
+      SHOPIFY_API_VERSION
+      GSHEET_SA_B64_SECRET
+      SHOPIFY_TOKEN_SECRET
+
+    This function is intentionally strict:
+    - missing tab -> error
+    - duplicated keys -> error
+    - missing required key -> error
+    - empty required value -> error
+    """
+    sh = gc.open_by_url(console_core_url)
+    ws = sh.worksheet(tab_cfg_account_id)
+    values = ws.get_all_values()
+
+    if not values:
+        raise ValueError(f"{tab_cfg_account_id} is empty: {console_core_url}")
+
+    kv: Dict[str, str] = {}
+    duplicates: List[str] = []
+
+    for row_idx, row in enumerate(values, start=1):
+        if not row:
+            continue
+
+        key = str(row[0]).strip() if len(row) >= 1 else ""
+        val = str(row[1]).strip() if len(row) >= 2 else ""
+
+        if not key:
+            continue
+
+        # Allow a human-readable header row without treating it as config.
+        if row_idx == 1 and key.lower() in {"key", "config_key", "name", "setting"}:
+            continue
+
+        if key in kv:
+            duplicates.append(key)
+            continue
+
+        kv[key] = val
+
+    if duplicates:
+        raise ValueError(f"{tab_cfg_account_id} has duplicated keys: {sorted(set(duplicates))}")
+
+    required = [
+        "SHOP_DOMAIN",
+        "SHOPIFY_API_VERSION",
+        "GSHEET_SA_B64_SECRET",
+        "SHOPIFY_TOKEN_SECRET",
+    ]
+    missing = [k for k in required if k not in kv]
+    empty = [k for k in required if k in kv and not kv[k]]
+
+    if missing:
+        raise ValueError(f"{tab_cfg_account_id} missing required keys: {missing}")
+    if empty:
+        raise ValueError(f"{tab_cfg_account_id} has empty required values: {empty}")
+
+    return AccountConfig(
+        shop_domain=kv["SHOP_DOMAIN"],
+        api_version=kv["SHOPIFY_API_VERSION"],
+        gsheet_sa_b64_secret=kv["GSHEET_SA_B64_SECRET"],
+        shopify_token_secret=kv["SHOPIFY_TOKEN_SECRET"],
+        storefront_base_url=kv.get("STOREFRONT_BASE_URL", ""),
+        admin_base_url=kv.get("ADMIN_BASE_URL", ""),
+        meta_ad_account_id=kv.get("META_AD_ACCOUNT_ID", ""),
+        awin_advertiser_id=kv.get("AWIN_ADVERTISER_ID", ""),
+    )
+
+
+def _is_excluded_metaobject_type(mo_type: str, excluded_type_contains: Tuple[str, ...]) -> bool:
+    s = str(mo_type or "").strip().lower()
+    return any(x and x.lower() in s for x in excluded_type_contains)
+
+
+def _filter_metaobject_defs(
+    nodes: List[Dict[str, Any]],
+    excluded_type_contains: Tuple[str, ...],
+) -> Tuple[List[Dict[str, Any]], int]:
+    if not excluded_type_contains:
+        return nodes, 0
+
+    kept: List[Dict[str, Any]] = []
+    excluded = 0
+
+    for node in nodes:
+        mo_type = _safe_str(node.get("type"))
+        if _is_excluded_metaobject_type(mo_type, excluded_type_contains):
+            excluded += 1
+            continue
+        kept.append(node)
+
+    return kept, excluded
 
 
 def _fetch_all_metaobject_defs(client: ShopifyGraphQLClient, page_size: int) -> List[Dict[str, Any]]:
@@ -536,14 +656,16 @@ def _upsert_cfg_fields(
 def run(
     *,
     site_code: str,
-    shop_domain: str,
-    api_version: str,
     console_core_url: str,
-    gsheet_sa_b64_secret: str,
-    shopify_token_secret: str,
+    bootstrap_gsheet_sa_b64_secret: str,
+    shop_domain: Optional[str] = None,
+    api_version: Optional[str] = None,
+    gsheet_sa_b64_secret: Optional[str] = None,
+    shopify_token_secret: Optional[str] = None,
     sa_b64_value: Optional[str] = None,
     shopify_token_value: Optional[str] = None,
     tab_cfg_sites: str = "Cfg__Sites",
+    tab_cfg_account_id: str = "Cfg__account_id",
     tab_cfg_fields: str = "Cfg__Fields",
     tab_cfg_metaobject_defs: str = "Cfg__MetaobjectDefs",
     tab_runlog: str = "Ops__RunLog",
@@ -556,9 +678,10 @@ def run(
     dry_run: bool = True,
     confirmed: bool = False,
     write_mode: str = "OVERWRITE",
+    excluded_type_contains: Tuple[str, ...] = ("shopify",),
     tz_name: str = "Asia/Shanghai",
     run_id: Optional[str] = None,
-    job_name: str = "export_metaobject_defs",
+    job_name: str = "config_metaobject_defs",
 ) -> Dict[str, Any]:
     phase = "preview" if dry_run else "apply"
 
@@ -570,10 +693,39 @@ def run(
 
     run_id = run_id or _gen_run_id(job_name, tz_name)
 
-    sa_b64 = _load_secret(gsheet_sa_b64_secret, explicit_value=sa_b64_value)
-    shopify_token = _load_secret(shopify_token_secret, explicit_value=shopify_token_value)
+    # Bootstrap is required because Cfg__account_id itself lives in Google Sheets.
+    # Do not hide mismatch: after reading Cfg__account_id, we validate the secret name.
+    bootstrap_sa_b64 = _load_secret(bootstrap_gsheet_sa_b64_secret, explicit_value=sa_b64_value)
+    gc = _build_gspread_client(bootstrap_sa_b64)
 
-    gc = _build_gspread_client(sa_b64)
+    account = _load_account_config(
+        gc=gc,
+        console_core_url=console_core_url,
+        tab_cfg_account_id=tab_cfg_account_id,
+    )
+
+    resolved_shop_domain = (shop_domain or account.shop_domain).strip()
+    resolved_api_version = (api_version or account.api_version).strip()
+    resolved_gsheet_sa_secret = (gsheet_sa_b64_secret or account.gsheet_sa_b64_secret).strip()
+    resolved_shopify_token_secret = (shopify_token_secret or account.shopify_token_secret).strip()
+
+    if not resolved_shop_domain:
+        raise ValueError("Resolved SHOP_DOMAIN is empty.")
+    if not resolved_api_version:
+        raise ValueError("Resolved SHOPIFY_API_VERSION is empty.")
+    if not resolved_gsheet_sa_secret:
+        raise ValueError("Resolved GSHEET_SA_B64_SECRET is empty.")
+    if not resolved_shopify_token_secret:
+        raise ValueError("Resolved SHOPIFY_TOKEN_SECRET is empty.")
+
+    if resolved_gsheet_sa_secret != bootstrap_gsheet_sa_b64_secret:
+        raise ValueError(
+            "BOOTSTRAP_GSHEET_SA_B64_SECRET does not match Cfg__account_id.GSHEET_SA_B64_SECRET. "
+            f"bootstrap={bootstrap_gsheet_sa_b64_secret}, cfg={resolved_gsheet_sa_secret}"
+        )
+
+    shopify_token = _load_secret(resolved_shopify_token_secret, explicit_value=shopify_token_value)
+
     route = _resolve_site_routing(
         gc=gc,
         console_core_url=console_core_url,
@@ -597,8 +749,8 @@ def run(
     )
 
     gql_client = ShopifyGraphQLClient(
-        shop_domain=shop_domain,
-        api_version=api_version,
+        shop_domain=resolved_shop_domain,
+        api_version=resolved_api_version,
         access_token=shopify_token,
     )
 
@@ -622,10 +774,14 @@ def run(
         detail_counter[error_reason] = n + 1
 
     try:
-        nodes = _fetch_all_metaobject_defs(gql_client, page_size=page_size)
+        nodes_all = _fetch_all_metaobject_defs(gql_client, page_size=page_size)
+        nodes, rows_excluded = _filter_metaobject_defs(
+            nodes_all,
+            excluded_type_contains=excluded_type_contains,
+        )
         df_defs = _build_defs_df(nodes, tz_name=tz_name)
 
-        rows_loaded = len(nodes)
+        rows_loaded = len(nodes_all)
         rows_recognized = len(df_defs)
         rows_planned = len(df_defs)
         rows_written = 0
@@ -689,6 +845,7 @@ def run(
                 rows_skipped=rows_skipped,
                 message=(
                     f"dry_run preview only | defs_rows={len(df_defs)} | "
+                    f"excluded_types={rows_excluded} | "
                     f"cfg_fields_updated={cfg_fields_stats['updated']} | "
                     f"cfg_fields_inserted={cfg_fields_stats['inserted']}"
                 ),
@@ -708,6 +865,7 @@ def run(
                     "rows_planned": rows_planned,
                     "rows_written": 0,
                     "rows_skipped": rows_skipped,
+                    "rows_excluded": rows_excluded,
                     "cfg_fields_updated": cfg_fields_stats["updated"],
                     "cfg_fields_inserted": cfg_fields_stats["inserted"],
                     "warnings_count": len(warnings),
@@ -720,9 +878,15 @@ def run(
                 "targets": {
                     "config_sheet_url": route.config_sheet_url,
                     "runlog_sheet_url": route.runlog_sheet_url,
+                    "tab_cfg_account_id": tab_cfg_account_id,
                     "tab_cfg_metaobject_defs": tab_cfg_metaobject_defs,
                     "tab_cfg_fields": tab_cfg_fields,
                     "tab_runlog": tab_runlog,
+                    "shop_domain": resolved_shop_domain,
+                    "api_version": resolved_api_version,
+                    "gsheet_sa_b64_secret": resolved_gsheet_sa_secret,
+                    "shopify_token_secret": resolved_shopify_token_secret,
+                    "excluded_type_contains": list(excluded_type_contains),
                 },
             }
 
@@ -766,6 +930,7 @@ def run(
                 "rows_planned": rows_planned,
                 "rows_written": rows_written,
                 "rows_skipped": 0,
+                "rows_excluded": rows_excluded,
                 "cfg_fields_updated": cfg_fields_stats["updated"],
                 "cfg_fields_inserted": cfg_fields_stats["inserted"],
                 "warnings_count": len(warnings),
