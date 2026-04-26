@@ -230,7 +230,16 @@ def _clear_and_write(
     ws.clear()
 
     if values:
-        ws.update("A1", values, value_input_option="USER_ENTERED")
+        # IMPORTANT:
+        # Use RAW, not USER_ENTERED.
+        #
+        # Cfg__Fields.expr contains internal formula templates like:
+        #   =IF(LEN({PRODUCT|core.handle}&"")=0,"",...)
+        #
+        # These are NOT Google Sheets formulas to execute now.
+        # They are templates for downstream jobs.
+        # If written as USER_ENTERED, Google Sheets will parse them and return #ERROR!.
+        ws.update("A1", values, value_input_option="RAW")
 
 
 # ============================================================
