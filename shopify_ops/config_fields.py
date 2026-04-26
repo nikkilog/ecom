@@ -7,6 +7,16 @@ Job: config_fields
 Purpose:
 - Multi-site Shopify field dictionary sync.
 - Read site account config from Console Core / Cfg__account_id.
+- Cfg__account_id uses vertical key-value structure:
+    SHOP_DOMAIN              544104.myshopify.com
+    SHOPIFY_API_VERSION      2026-01
+    META_AD_ACCOUNT_ID       399370612438108
+    AWIN_ADVERTISER_ID       77532
+    STOREFRONT_BASE_URL      https://plumbingsell.com/
+    ADMIN_BASE_URL           https://admin.shopify.com/store/544104/
+    GSHEET_SA_B64_SECRET     PBS_GSHEET
+    SHOPIFY_TOKEN_SECRET     PBS_SHOPIFY_ACCESS_TOKEN
+
 - Read business sheet route from Console Core / Cfg__Sites.
 - Export core fields + Shopify metafield definitions into Cfg__Fields.
 - Generate admin/storefront URL formula fields using ADMIN_BASE_URL and STOREFRONT_BASE_URL.
@@ -22,7 +32,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -147,6 +156,7 @@ def _read_secret(secret_name: str) -> str:
 
 def _make_gspread_client_from_b64_secret(secret_name: str) -> gspread.Client:
     raw_b64 = _read_secret(secret_name)
+
     try:
         sa_json = base64.b64decode(raw_b64).decode("utf-8")
         sa_info = json.loads(sa_json)
@@ -166,6 +176,7 @@ def _make_gspread_client_from_b64_secret(secret_name: str) -> gspread.Client:
 def _open_spreadsheet(gc: gspread.Client, sheet_url: str) -> gspread.Spreadsheet:
     if not sheet_url:
         raise ConfigFieldsError("Google Sheet URL is empty.")
+
     try:
         return gc.open_by_url(sheet_url)
     except Exception as e:
@@ -183,10 +194,9 @@ def _get_worksheet(ss: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
 
 def _get_records(ws: gspread.Worksheet) -> List[Dict[str, Any]]:
     try:
-        rows = ws.get_all_records()
+        return ws.get_all_records()
     except Exception as e:
         raise ConfigFieldsError(f"Failed to read worksheet: {ws.title}") from e
-    return rows
 
 
 def _normalize_header_name(s: Any) -> str:
@@ -199,6 +209,7 @@ def _require_columns(rows: List[Dict[str, Any]], required: List[str], tab_name: 
 
     columns = set(_normalize_header_name(k) for k in rows[0].keys())
     missing = [c for c in required if c not in columns]
+
     if missing:
         raise ConfigFieldsError(
             f"Tab {tab_name} missing required columns: {missing}. "
@@ -206,12 +217,18 @@ def _require_columns(rows: List[Dict[str, Any]], required: List[str], tab_name: 
         )
 
 
-def _clear_and_write(ws: gspread.Worksheet, rows: List[Dict[str, Any]], columns: List[str]) -> None:
+def _clear_and_write(
+    ws: gspread.Worksheet,
+    rows: List[Dict[str, Any]],
+    columns: List[str],
+) -> None:
     values = [columns]
+
     for r in rows:
         values.append([r.get(c, "") for c in columns])
 
     ws.clear()
+
     if values:
         ws.update("A1", values, value_input_option="USER_ENTERED")
 
@@ -228,43 +245,70 @@ def _read_account_config(
     """
     Read Cfg__account_id from Console Core.
 
-    Required schema:
-    - one row per site
-    - has column: site_code
-    - has all REQUIRED_ACCOUNT_FIELDS
+    Expected structure: vertical key-value table.
+
+    Example:
+        SHOP_DOMAIN              544104.myshopify.com
+        SHOPIFY_API_VERSION      2026-01
+        META_AD_ACCOUNT_ID       399370612438108
+        AWIN_ADVERTISER_ID       77532
+        STOREFRONT_BASE_URL      https://plumbingsell.com/
+        ADMIN_BASE_URL           https://admin.shopify.com/store/544104/
+        GSHEET_SA_B64_SECRET     PBS_GSHEET
+        SHOPIFY_TOKEN_SECRET     PBS_SHOPIFY_ACCESS_TOKEN
+
+    No fallback:
+    - missing tab raises
+    - missing required key raises
+    - empty required value raises, except META_AD_ACCOUNT_ID / AWIN_ADVERTISER_ID
+    - BOOTSTRAP_GSHEET_SA_B64_SECRET mismatch raises
     """
     gc = _make_gspread_client_from_b64_secret(bootstrap_gsheet_sa_b64_secret)
     ss = _open_spreadsheet(gc, console_core_url)
     ws = _get_worksheet(ss, ACCOUNT_TAB)
-    rows = _get_records(ws)
 
-    _require_columns(rows, ["site_code"] + REQUIRED_ACCOUNT_FIELDS, ACCOUNT_TAB)
+    try:
+        values = ws.get_all_values()
+    except Exception as e:
+        raise ConfigFieldsError(f"Failed to read worksheet: {ACCOUNT_TAB}") from e
 
-    matched = [
-        r for r in rows
-        if str(r.get("site_code", "")).strip().upper() == str(site_code).strip().upper()
-    ]
+    if not values:
+        raise ConfigFieldsError(f"Tab {ACCOUNT_TAB} is empty.")
 
-    if not matched:
+    cfg: Dict[str, str] = {}
+
+    for row_idx, row in enumerate(values, start=1):
+        if not row:
+            continue
+
+        key = str(row[0] if len(row) >= 1 else "").strip()
+        value = str(row[1] if len(row) >= 2 else "").strip()
+
+        if not key:
+            continue
+
+        # Skip possible header rows.
+        if key.lower() in ["key", "field", "config_key", "name"]:
+            continue
+
+        cfg[key] = value
+
+    missing = [k for k in REQUIRED_ACCOUNT_FIELDS if k not in cfg]
+    if missing:
         raise ConfigFieldsError(
-            f"No account config found in {ACCOUNT_TAB} for SITE_CODE={site_code}."
+            f"Tab {ACCOUNT_TAB} missing required config keys: {missing}. "
+            f"Existing keys: {sorted(cfg.keys())}"
         )
-
-    if len(matched) > 1:
-        raise ConfigFieldsError(
-            f"Multiple account config rows found in {ACCOUNT_TAB} for SITE_CODE={site_code}."
-        )
-
-    row = matched[0]
-    cfg = {k: str(row.get(k, "")).strip() for k in REQUIRED_ACCOUNT_FIELDS}
 
     empty_required = [
         k for k in REQUIRED_ACCOUNT_FIELDS
-        if cfg.get(k, "") == "" and k not in ["META_AD_ACCOUNT_ID", "AWIN_ADVERTISER_ID"]
+        if str(cfg.get(k, "")).strip() == ""
+        and k not in ["META_AD_ACCOUNT_ID", "AWIN_ADVERTISER_ID"]
     ]
+
     if empty_required:
         raise ConfigFieldsError(
-            f"{ACCOUNT_TAB} SITE_CODE={site_code} has empty required fields: {empty_required}"
+            f"Tab {ACCOUNT_TAB} has empty required config values: {empty_required}"
         )
 
     if cfg["GSHEET_SA_B64_SECRET"] != bootstrap_gsheet_sa_b64_secret:
@@ -276,6 +320,7 @@ def _read_account_config(
         )
 
     cfg["SITE_CODE"] = site_code
+
     return gc, cfg
 
 
@@ -324,6 +369,7 @@ def _find_sheet_url_by_label(
         )
 
     sheet_url = str(matched[0].get("sheet_url", "")).strip()
+
     if not sheet_url:
         raise ConfigFieldsError(
             f"{SITES_TAB} label={label} has empty sheet_url for SITE_CODE={site_code}."
@@ -406,6 +452,7 @@ def _fetch_metafield_definitions(
 
     for owner_type in SHOPIFY_OWNER_TYPES:
         after = None
+
         while True:
             data = _shopify_graphql(
                 shop_domain=shop_domain,
@@ -419,11 +466,12 @@ def _fetch_metafield_definitions(
             )
 
             conn = data["data"]["metafieldDefinitions"]
+
             for edge in conn.get("edges", []):
                 node = edge.get("node", {})
                 namespace = str(node.get("namespace", "")).strip()
 
-                # Requirement 3:
+                # Requirement:
                 # namespace = shopify must not be exported.
                 if namespace.lower() == "shopify":
                     continue
@@ -431,6 +479,7 @@ def _fetch_metafield_definitions(
                 out.append(node)
 
             page_info = conn.get("pageInfo", {})
+
             if not page_info.get("hasNextPage"):
                 break
 
@@ -446,20 +495,26 @@ def _fetch_metafield_definitions(
 
 def _ensure_trailing_slash(url: str, field_name: str) -> str:
     url = str(url or "").strip()
+
     if not url:
         raise ConfigFieldsError(f"{field_name} is empty.")
+
     return url if url.endswith("/") else url + "/"
 
 
 def _formula_safe_url(url: str) -> str:
-    return url.replace('"', '""')
+    return str(url).replace('"', '""')
 
 
 def _core_rows(admin_base_url: str, storefront_base_url: str) -> List[Dict[str, Any]]:
-    admin_base_url = _formula_safe_url(_ensure_trailing_slash(admin_base_url, "ADMIN_BASE_URL"))
-    storefront_base_url = _formula_safe_url(_ensure_trailing_slash(storefront_base_url, "STOREFRONT_BASE_URL"))
+    admin_base_url = _formula_safe_url(
+        _ensure_trailing_slash(admin_base_url, "ADMIN_BASE_URL")
+    )
+    storefront_base_url = _formula_safe_url(
+        _ensure_trailing_slash(storefront_base_url, "STOREFRONT_BASE_URL")
+    )
 
-    rows = [
+    return [
         {
             "field_handle": "PRODUCT|core.gid",
             "field_id": "PRODUCT|core.gid",
@@ -566,7 +621,10 @@ def _core_rows(admin_base_url: str, storefront_base_url: str) -> List[Dict[str, 
             "display_name": "Admin URL",
             "entity_type": "PRODUCT",
             "field_key": "core.product.admin_url",
-            "expr": f'=IF(LEN({{PRODUCT|core.legacy_id}}&"")=0,"","{admin_base_url}products/"&{{PRODUCT|core.legacy_id}})',
+            "expr": (
+                f'=IF(LEN({{PRODUCT|core.legacy_id}}&"")=0,"",'
+                f'"{admin_base_url}products/"&{{PRODUCT|core.legacy_id}})'
+            ),
             "field_type": "CALC",
             "data_type": "url",
             "source_type": "CALC",
@@ -591,7 +649,10 @@ def _core_rows(admin_base_url: str, storefront_base_url: str) -> List[Dict[str, 
             "display_name": "StoreFront URL",
             "entity_type": "PRODUCT",
             "field_key": "core.product.storefront_url",
-            "expr": f'=IF(LEN({{PRODUCT|core.handle}}&"")=0,"","{storefront_base_url}products/"&{{PRODUCT|core.handle}})',
+            "expr": (
+                f'=IF(LEN({{PRODUCT|core.handle}}&"")=0,"",'
+                f'"{storefront_base_url}products/"&{{PRODUCT|core.handle}})'
+            ),
             "field_type": "CALC",
             "data_type": "url",
             "source_type": "CALC",
@@ -691,7 +752,12 @@ def _core_rows(admin_base_url: str, storefront_base_url: str) -> List[Dict[str, 
             "display_name": "Variant Admin URL",
             "entity_type": "VARIANT",
             "field_key": "core.variant.admin_url",
-            "expr": f'=IF(OR(LEN({{PRODUCT|core.legacy_id}}&"")=0,LEN({{VARIANT|core.legacy_id}}&"")=0),"","{admin_base_url}products/"&{{PRODUCT|core.legacy_id}}&"/variants/"&{{VARIANT|core.legacy_id}})',
+            "expr": (
+                f'=IF(OR(LEN({{PRODUCT|core.legacy_id}}&"")=0,'
+                f'LEN({{VARIANT|core.legacy_id}}&"")=0),"",'
+                f'"{admin_base_url}products/"&{{PRODUCT|core.legacy_id}}'
+                f'&"/variants/"&{{VARIANT|core.legacy_id}})'
+            ),
             "field_type": "CALC",
             "data_type": "url",
             "source_type": "CALC",
@@ -716,7 +782,10 @@ def _core_rows(admin_base_url: str, storefront_base_url: str) -> List[Dict[str, 
             "display_name": "Variant StoreFront URL",
             "entity_type": "VARIANT",
             "field_key": "core.variant.storefront_url",
-            "expr": f'=IF(LEN({{PRODUCT|core.handle}}&"")=0,"","{storefront_base_url}products/"&{{PRODUCT|core.handle}})',
+            "expr": (
+                f'=IF(LEN({{PRODUCT|core.handle}}&"")=0,"",'
+                f'"{storefront_base_url}products/"&{{PRODUCT|core.handle}})'
+            ),
             "field_type": "CALC",
             "data_type": "url",
             "source_type": "CALC",
@@ -737,13 +806,13 @@ def _core_rows(admin_base_url: str, storefront_base_url: str) -> List[Dict[str, 
         },
     ]
 
-    return rows
-
 
 def _owner_type_to_entity_type(owner_type: str) -> str:
     owner_type = str(owner_type or "").strip().upper()
+
     if owner_type == "PRODUCTVARIANT":
         return "VARIANT"
+
     return owner_type
 
 
@@ -762,35 +831,38 @@ def _metafield_rows(defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         field_key = f"{prefix}.{namespace}.{key}"
 
         display_name = str(d.get("name", "") or key).strip()
+
         data_type = ""
         if isinstance(d.get("type"), dict):
             data_type = str(d["type"].get("name", "")).strip()
 
-        rows.append({
-            "field_handle": f"{entity_type}|{field_key}",
-            "field_id": f"{entity_type}|{field_key}",
-            "display_name": display_name,
-            "entity_type": entity_type,
-            "field_key": field_key,
-            "expr": f"metafield:{namespace}.{key}",
-            "field_type": "METAFIELD",
-            "data_type": data_type,
-            "source_type": "SHOPIFY_METAFIELD_DEFINITION",
-            "namespace": namespace,
-            "key": key,
-            "purpose_1": "",
-            "purpose_2": "",
-            "seq": 10000 + i,
-            "lookup_key": f"{entity_type}|{field_key}",
-            "join_key": "",
-            "unit": "",
-            "suffix_role": "",
-            "concept_id": "",
-            "group": "metafield",
-            "applies_big_type": "",
-            "applies_sub_type": "",
-            "notes": str(d.get("description", "") or "").strip(),
-        })
+        rows.append(
+            {
+                "field_handle": f"{entity_type}|{field_key}",
+                "field_id": f"{entity_type}|{field_key}",
+                "display_name": display_name,
+                "entity_type": entity_type,
+                "field_key": field_key,
+                "expr": f"metafield:{namespace}.{key}",
+                "field_type": "METAFIELD",
+                "data_type": data_type,
+                "source_type": "SHOPIFY_METAFIELD_DEFINITION",
+                "namespace": namespace,
+                "key": key,
+                "purpose_1": "",
+                "purpose_2": "",
+                "seq": 10000 + i,
+                "lookup_key": f"{entity_type}|{field_key}",
+                "join_key": "",
+                "unit": "",
+                "suffix_role": "",
+                "concept_id": "",
+                "group": "metafield",
+                "applies_big_type": "",
+                "applies_sub_type": "",
+                "notes": str(d.get("description", "") or "").strip(),
+            }
+        )
 
     return rows
 
@@ -798,12 +870,15 @@ def _metafield_rows(defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _sort_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     def sort_key(r: Dict[str, Any]):
         entity_type = str(r.get("entity_type", "")).strip().upper()
+
         seq_raw = r.get("seq", "")
         try:
             seq = int(float(seq_raw))
         except Exception:
             seq = 999999
+
         field_key = str(r.get("field_key", ""))
+
         return (
             ENTITY_ORDER.get(entity_type, 999),
             seq,
@@ -813,10 +888,15 @@ def _sort_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(rows, key=sort_key)
 
 
-def _normalize_rows_to_columns(rows: List[Dict[str, Any]], columns: List[str]) -> List[Dict[str, Any]]:
+def _normalize_rows_to_columns(
+    rows: List[Dict[str, Any]],
+    columns: List[str],
+) -> List[Dict[str, Any]]:
     out = []
+
     for r in rows:
         out.append({c: r.get(c, "") for c in columns})
+
     return out
 
 
@@ -891,18 +971,27 @@ def run(
     shopify_token = _read_secret(shopify_token_secret)
 
     print("Fetching Shopify metafield definitions...")
+
     defs = _fetch_metafield_definitions(
         shop_domain=account_cfg["SHOP_DOMAIN"],
         api_version=account_cfg["SHOPIFY_API_VERSION"],
         token=shopify_token,
     )
-    print(f"✅ Shopify metafield definitions loaded, after namespace=shopify filter: {len(defs)}")
 
-    rows = []
-    rows.extend(_core_rows(
-        admin_base_url=account_cfg["ADMIN_BASE_URL"],
-        storefront_base_url=account_cfg["STOREFRONT_BASE_URL"],
-    ))
+    print(
+        "✅ Shopify metafield definitions loaded, "
+        f"after namespace=shopify filter: {len(defs)}"
+    )
+
+    rows: List[Dict[str, Any]] = []
+
+    rows.extend(
+        _core_rows(
+            admin_base_url=account_cfg["ADMIN_BASE_URL"],
+            storefront_base_url=account_cfg["STOREFRONT_BASE_URL"],
+        )
+    )
+
     rows.extend(_metafield_rows(defs))
 
     rows = _sort_rows(rows)
@@ -933,9 +1022,15 @@ def run(
     fields_ws = _get_worksheet(config_ss, FIELDS_TAB)
 
     print(f"Writing {len(rows)} rows to {FIELDS_TAB} ...")
-    _clear_and_write(fields_ws, rows, CFG_FIELDS_COLUMNS)
+
+    _clear_and_write(
+        ws=fields_ws,
+        rows=rows,
+        columns=CFG_FIELDS_COLUMNS,
+    )
 
     print("✅ Done.")
+
     return {
         "status": "ok",
         "summary": summary,
