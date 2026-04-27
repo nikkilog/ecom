@@ -2,3 +2,4 @@ gspread
 pandas
 requests
 google-auth
+google-ads
