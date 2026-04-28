@@ -1126,77 +1126,58 @@ def _rows_as_dicts(ws) -> List[Dict[str, str]]:
     return rows
 
 
-# Cell — Replace function: _read_account_config
-
 def _read_account_config(console_sh, tab_name: str, site_code: str) -> Dict[str, str]:
     """
     Read Cfg__account_id.
 
-    Supported shapes:
-    1) Header table:
-       key | value
+    Supported Console Core shapes:
+    1) Header table: key | value
+    2) Header table: site_code | key | value
+    3) No-header two-column table: A=key, B=value
 
-    2) Header table:
-       site_code | key | value
-
-    3) No-header two-column table:
-       SHOP_DOMAIN              | 544104.myshopify.com
-       SHOPIFY_API_VERSION      | 2026-01
-       GSHEET_SA_B64_SECRET     | PBS_GSHEET
-       SHOPIFY_TOKEN_SECRET     | PBS_SHOPIFY_ACCESS_TOKEN
-
-    The user's current Console Core uses shape #3.
+    Current PBS Console Core uses shape #3.
     """
     ws = _require_worksheet(console_sh, tab_name)
     values = ws.get_all_values()
-
     if not values:
         raise ConfigFieldsError(f"{tab_name} is empty.")
 
     cfg: Dict[str, str] = {}
-
-    # ---------- Shape 1 / 2: header-based table ----------
     header = [str(x or "").strip() for x in values[0]]
     header_lc = [x.lower() for x in header]
 
+    # Shape 1 / 2: header-based table
     if "key" in header_lc and "value" in header_lc:
         key_idx = header_lc.index("key")
         value_idx = header_lc.index("value")
         site_idx = header_lc.index("site_code") if "site_code" in header_lc else None
 
-        for row in values[1:]:
-            if not any(str(x or "").strip() for x in row):
+        for raw in values[1:]:
+            if not any(str(x or "").strip() for x in raw):
                 continue
-
-            row_pad = row + [""] * max(0, len(header) - len(row))
+            row = raw + [""] * max(0, len(header) - len(raw))
 
             if site_idx is not None:
-                row_site = str(row_pad[site_idx] or "").strip()
-                if row_site and row_site.upper() != str(site_code or "").strip().upper():
+                row_site = str(row[site_idx] or "").strip()
+                if row_site and row_site.upper() != site_code.upper():
                     continue
 
-            k = str(row_pad[key_idx] or "").strip()
-            v = str(row_pad[value_idx] or "").strip()
-
+            k = str(row[key_idx] or "").strip()
+            v = str(row[value_idx] or "").strip()
             if k:
                 cfg[k] = v
 
-    # ---------- Shape 3: no-header A=key, B=value ----------
+    # Shape 3: no-header A=key, B=value
     else:
-        for row in values:
-            if len(row) < 2:
+        for raw in values:
+            if len(raw) < 2:
                 continue
-
-            k = str(row[0] or "").strip()
-            v = str(row[1] or "").strip()
-
+            k = str(raw[0] or "").strip()
+            v = str(raw[1] or "").strip()
             if not k:
                 continue
-
-            # Skip accidental header-like rows, if any.
             if k.lower() in {"key", "site_code"}:
                 continue
-
             cfg[k] = v
 
     required = [
@@ -1207,15 +1188,10 @@ def _read_account_config(console_sh, tab_name: str, site_code: str) -> Dict[str,
         "STOREFRONT_BASE_URL",
         "ADMIN_BASE_URL",
     ]
-
     missing = [k for k in required if not cfg.get(k)]
     if missing:
-        raise ConfigFieldsError(
-            f"{tab_name} missing required account config keys: {missing}"
-        )
-
+        raise ConfigFieldsError(f"{tab_name} missing required account config keys: {missing}")
     return cfg
-
 
 def _read_site_route(console_sh, tab_name: str, site_code: str, label: str) -> Dict[str, str]:
     ws = _require_worksheet(console_sh, tab_name)
@@ -1366,6 +1342,23 @@ def _col_letter(col_num_1_based: int) -> str:
 
 
 def _sync_cfg_fields(ws, mf_defs: List[Dict[str, Any]], mo_defs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Sync Cfg__Fields against the PBS gold standard.
+
+    Gold-standard behavior kept:
+    - CORE / METAFIELD / METAOBJECT_REF row shape follows PBS notebook.
+    - Metafield expr is MF_VALUE("namespace","key").
+    - Metafield field_type is RAW.
+    - Metafield source_type is METAFIELD.
+    - PK remains entity_type + field_key.
+    - Missing rows are appended.
+    - A/B formulas are rewritten.
+
+    Stability restore added:
+    - Existing generated rows whose ALLOWED_COLS differ from PBS gold standard are corrected in place.
+    - Existing generated metafield rows whose namespace contains "shopify" are deleted.
+    - Manual columns outside ALLOWED_COLS are not touched.
+    """
     header = _ensure_header(ws)
     col_idx = {h: i for i, h in enumerate(header)}
 
@@ -1377,30 +1370,51 @@ def _sync_cfg_fields(ws, mf_defs: List[Dict[str, Any]], mo_defs: List[Dict[str, 
 
     all_vals = ws.get_all_values()
     existing_pks = set()
+    existing_row_by_pk: Dict[str, int] = {}
+    rows_to_delete: List[int] = []
+
     if len(all_vals) >= 2:
-        for r in all_vals[1:]:
+        for row_num, r in enumerate(all_vals[1:], start=2):
             et = get_cell(r, "entity_type")
             fk = get_cell(r, "field_key")
+            ns = get_cell(r, "namespace")
+            source_type = get_cell(r, "source_type")
+
+            # Rows generated from Shopify metafield definitions with blocked namespace
+            # must not remain in Cfg__Fields under the confirmed rule.
+            if (
+                ns
+                and namespace_blocked(ns)
+                and (fk.startswith("mf.") or fk.startswith("v_mf."))
+                and source_type in {"METAFIELD", "SHOPIFY_METAFIELD_DEFINITION", ""}
+            ):
+                rows_to_delete.append(row_num)
+                continue
+
             if et and fk:
-                existing_pks.add(f"{et}||{fk}")
+                pk = f"{et}||{fk}"
+                existing_pks.add(pk)
+                # Keep the first occurrence as the canonical row; duplicate PKs are not created by this job.
+                existing_row_by_pk.setdefault(pk, row_num)
 
-    rows_to_append: List[List[str]] = []
-    new_pks_in_this_run = set()
+    desired_by_pk: Dict[str, Dict[str, Any]] = {}
+    desired_order: List[str] = []
 
-    def try_add_row(payload: Dict[str, Any]) -> None:
+    def add_desired(payload: Dict[str, Any]) -> None:
         et = str(payload.get("entity_type", "") or "").strip()
         fk = str(payload.get("field_key", "") or "").strip()
         if not et or not fk:
             return
         pk = f"{et}||{fk}"
-        if pk in existing_pks or pk in new_pks_in_this_run:
+        if pk in desired_by_pk:
             return
         slim = {k: payload.get(k, "") for k in ALLOWED_COLS}
-        rows_to_append.append(_make_append_row(slim, header, col_idx))
-        new_pks_in_this_run.add(pk)
+        desired_by_pk[pk] = slim
+        desired_order.append(pk)
 
+    # CORE_FIXED — PBS gold standard.
     for x in CORE_FIXED:
-        try_add_row({
+        add_desired({
             "display_name": x["display_name"],
             "entity_type": x["entity_type"],
             "field_key": x["field_key"],
@@ -1433,7 +1447,7 @@ def _sync_cfg_fields(ws, mf_defs: List[Dict[str, Any]], mo_defs: List[Dict[str, 
         shopify_t = ((m.get("type") or {}).get("name") or "").strip()
         internal = f"v_mf.{ns}.{k}" if entity == "VARIANT" else f"mf.{ns}.{k}"
 
-        try_add_row({
+        add_desired({
             "display_name": m.get("name") or internal,
             "entity_type": entity,
             "field_key": internal,
@@ -1460,7 +1474,7 @@ def _sync_cfg_fields(ws, mf_defs: List[Dict[str, Any]], mo_defs: List[Dict[str, 
             shopify_t = ((f.get("type") or {}).get("name") or "").strip()
             internal = f"mo.{mo_type}.{f_key}"
 
-            try_add_row({
+            add_desired({
                 "display_name": f"{mo_name} · {f_name}",
                 "entity_type": "METAOBJECT_ENTRY",
                 "field_key": internal,
@@ -1472,10 +1486,69 @@ def _sync_cfg_fields(ws, mf_defs: List[Dict[str, Any]], mo_defs: List[Dict[str, 
                 "key": f_key,
             })
 
+    # Delete blocked Shopify namespace rows first, bottom-up.
+    rows_deleted_blocked_namespace = 0
+    for row_num in sorted(rows_to_delete, reverse=True):
+        ws.delete_rows(row_num)
+        rows_deleted_blocked_namespace += 1
+
+    # Reload after deletes so row numbers are correct.
+    all_vals = ws.get_all_values()
+    existing_pks = set()
+    existing_row_by_pk = {}
+    if len(all_vals) >= 2:
+        for row_num, r in enumerate(all_vals[1:], start=2):
+            et = get_cell(r, "entity_type")
+            fk = get_cell(r, "field_key")
+            if et and fk:
+                pk = f"{et}||{fk}"
+                existing_pks.add(pk)
+                existing_row_by_pk.setdefault(pk, row_num)
+
+    rows_to_append: List[List[str]] = []
+    for pk in desired_order:
+        if pk not in existing_pks:
+            rows_to_append.append(_make_append_row(desired_by_pk[pk], header, col_idx))
+
+    # Restore existing managed rows to PBS gold shape.
+    # Only ALLOWED_COLS are touched; manual columns remain intact.
+    updates = []
+    rows_restored_gold_standard = 0
+    cells_restored_gold_standard = 0
+
+    for pk in desired_order:
+        row_num = existing_row_by_pk.get(pk)
+        if not row_num:
+            continue
+        desired = desired_by_pk[pk]
+        current = all_vals[row_num - 1] if row_num - 1 < len(all_vals) else []
+        row_changed = False
+        for col_name in ALLOWED_COLS:
+            if col_name not in col_idx:
+                continue
+            c_idx = col_idx[col_name]
+            cur = str(current[c_idx] if c_idx < len(current) else "")
+            want = "" if desired.get(col_name) is None else str(desired.get(col_name, ""))
+            if cur != want:
+                updates.append({
+                    "range": rowcol_to_a1(row_num, c_idx + 1),
+                    "values": [[want]],
+                })
+                cells_restored_gold_standard += 1
+                row_changed = True
+        if row_changed:
+            rows_restored_gold_standard += 1
+
     print(f"Existing PKs: {len(existing_pks)}")
     print(f"New rows to append: {len(rows_to_append)}")
+    print(f"Rows restored to PBS gold standard: {rows_restored_gold_standard}")
+    print(f"Cells restored to PBS gold standard: {cells_restored_gold_standard}")
+    print(f"Deleted existing rows due to namespace contains 'shopify': {rows_deleted_blocked_namespace}")
     print(f"Skipped metafieldDefinitions due to namespace contains 'shopify': {skipped_shopify_ns}")
     print(f"Skipped metaobjectDefinitions due to type contains 'shopify': {skipped_shopify_mo_type}")
+
+    if updates:
+        ws.batch_update(updates, value_input_option="RAW")
 
     if rows_to_append:
         ws.append_rows(rows_to_append, value_input_option="RAW", insert_data_option="INSERT_ROWS")
@@ -1510,11 +1583,13 @@ def _sync_cfg_fields(ws, mf_defs: List[Dict[str, Any]], mo_defs: List[Dict[str, 
     return {
         "existing_pks": len(existing_pks),
         "rows_appended": len(rows_to_append),
+        "rows_restored_gold_standard": rows_restored_gold_standard,
+        "cells_restored_gold_standard": cells_restored_gold_standard,
+        "rows_deleted_blocked_namespace": rows_deleted_blocked_namespace,
         "sheet_rows_now": last_row,
         "skipped_metafield_definitions_shopify_namespace": skipped_shopify_ns,
         "skipped_metaobject_definitions_shopify_type": skipped_shopify_mo_type,
     }
-
 
 def run(
     SITE_CODE: str,
