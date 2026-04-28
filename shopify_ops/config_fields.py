@@ -1126,35 +1126,78 @@ def _rows_as_dicts(ws) -> List[Dict[str, str]]:
     return rows
 
 
+# Cell — Replace function: _read_account_config
+
 def _read_account_config(console_sh, tab_name: str, site_code: str) -> Dict[str, str]:
+    """
+    Read Cfg__account_id.
+
+    Supported shapes:
+    1) Header table:
+       key | value
+
+    2) Header table:
+       site_code | key | value
+
+    3) No-header two-column table:
+       SHOP_DOMAIN              | 544104.myshopify.com
+       SHOPIFY_API_VERSION      | 2026-01
+       GSHEET_SA_B64_SECRET     | PBS_GSHEET
+       SHOPIFY_TOKEN_SECRET     | PBS_SHOPIFY_ACCESS_TOKEN
+
+    The user's current Console Core uses shape #3.
+    """
     ws = _require_worksheet(console_sh, tab_name)
-    rows = _rows_as_dicts(ws)
-    if not rows:
+    values = ws.get_all_values()
+
+    if not values:
         raise ConfigFieldsError(f"{tab_name} is empty.")
 
     cfg: Dict[str, str] = {}
 
-    # Standard single-site Console Core shape: key / value
-    if {"key", "value"}.issubset(set(rows[0].keys())):
-        for r in rows:
-            k = (r.get("key") or "").strip()
-            if not k:
-                continue
-            cfg[k] = (r.get("value") or "").strip()
+    # ---------- Shape 1 / 2: header-based table ----------
+    header = [str(x or "").strip() for x in values[0]]
+    header_lc = [x.lower() for x in header]
 
-    # Compatible multi-site shape: site_code / key / value
-    elif {"site_code", "key", "value"}.issubset(set(rows[0].keys())):
-        for r in rows:
-            if (r.get("site_code") or "").strip().upper() != site_code.upper():
+    if "key" in header_lc and "value" in header_lc:
+        key_idx = header_lc.index("key")
+        value_idx = header_lc.index("value")
+        site_idx = header_lc.index("site_code") if "site_code" in header_lc else None
+
+        for row in values[1:]:
+            if not any(str(x or "").strip() for x in row):
                 continue
-            k = (r.get("key") or "").strip()
+
+            row_pad = row + [""] * max(0, len(header) - len(row))
+
+            if site_idx is not None:
+                row_site = str(row_pad[site_idx] or "").strip()
+                if row_site and row_site.upper() != str(site_code or "").strip().upper():
+                    continue
+
+            k = str(row_pad[key_idx] or "").strip()
+            v = str(row_pad[value_idx] or "").strip()
+
+            if k:
+                cfg[k] = v
+
+    # ---------- Shape 3: no-header A=key, B=value ----------
+    else:
+        for row in values:
+            if len(row) < 2:
+                continue
+
+            k = str(row[0] or "").strip()
+            v = str(row[1] or "").strip()
+
             if not k:
                 continue
-            cfg[k] = (r.get("value") or "").strip()
-    else:
-        raise ConfigFieldsError(
-            f"{tab_name} must have columns key/value, or site_code/key/value."
-        )
+
+            # Skip accidental header-like rows, if any.
+            if k.lower() in {"key", "site_code"}:
+                continue
+
+            cfg[k] = v
 
     required = [
         "SHOP_DOMAIN",
@@ -1164,9 +1207,13 @@ def _read_account_config(console_sh, tab_name: str, site_code: str) -> Dict[str,
         "STOREFRONT_BASE_URL",
         "ADMIN_BASE_URL",
     ]
+
     missing = [k for k in required if not cfg.get(k)]
     if missing:
-        raise ConfigFieldsError(f"{tab_name} missing required keys: {missing}")
+        raise ConfigFieldsError(
+            f"{tab_name} missing required account config keys: {missing}"
+        )
+
     return cfg
 
 
