@@ -59,7 +59,7 @@ SUPPORTED_CORE_COMPARE_AT_ACTIONS = {"SET", "CLEAR"}
 ALLOWED_PREFIXES = ("mf.", "v_mf.", "core.")
 FORBIDDEN_SHOPIFY_PREFIXES = ("mf.shopify.", "v_mf.shopify.", "v.mf.shopify.")
 
-PRODUCT_CORE_KEYS = {"core.title", "core.product_type", "core.tags"}
+PRODUCT_CORE_KEYS = {"core.title", "core.product_type", "core.tags", "core.description_html"}
 VARIANT_CORE_KEYS = {"core.weight", "core.weight_unit", "core.price", "core.compare_at_price"}
 
 Q_PRODUCT_BY_HANDLE = """
@@ -104,7 +104,7 @@ mutation setMf($metafields: [MetafieldsSetInput!]!) {
 M_PRODUCT_UPDATE = """
 mutation productUpdate($input: ProductInput!) {
   productUpdate(input: $input) {
-    product { id title productType tags }
+    product { id title productType tags descriptionHtml }
     userErrors { field message }
   }
 }
@@ -614,7 +614,7 @@ def validate_row(entity_type: str, field_key: str, action: str) -> tuple[bool, s
         if act not in SUPPORTED_CORE_TAG_ACTIONS:
             return False, "action_not_supported"
 
-    elif fk in {"core.title", "core.product_type"}:
+    elif fk in {"core.title", "core.product_type", "core.description_html"}:
         if et != "PRODUCT":
             return False, "core_entity_mismatch"
         if act not in SUPPORTED_CORE_SCALAR_ACTIONS:
@@ -1214,6 +1214,7 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                 "id": owner_id,
                 "title": None,
                 "productType": None,
+                "descriptionHtml": None,
                 "tags_mode": None,
                 "tags_value": None,
                 "source_rows": [],
@@ -1271,6 +1272,20 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                     "action": action,
                     "plan_type": "product_core",
                     "value_preview": bucket["productType"],
+                })
+
+            elif fk == "core.description_html":
+                bucket = get_product_bucket(owner_id)
+                bucket["descriptionHtml"] = "" if action == "CLEAR" else desired
+                bucket["source_rows"].append(sheet_row)
+                preview_rows.append({
+                    "sheet_row": sheet_row,
+                    "entity_type": entity_type,
+                    "owner_id": owner_id,
+                    "field_key": fk,
+                    "action": action,
+                    "plan_type": "product_core",
+                    "value_preview": bucket["descriptionHtml"][:200],
                 })
 
             elif fk == "core.tags":
@@ -1378,6 +1393,9 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
             input_obj["title"] = bucket["title"]
         if bucket["productType"] is not None:
             input_obj["productType"] = bucket["productType"]
+        if bucket["descriptionHtml"] is not None:
+            input_obj["descriptionHtml"] = bucket["descriptionHtml"]
+
         if bucket["tags_mode"] in {"SET", "CLEAR"}:
             input_obj["tags"] = bucket["tags_value"]
 
