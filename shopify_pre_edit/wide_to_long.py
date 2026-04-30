@@ -50,16 +50,9 @@ RUNLOG_HEADER = [
     "rows_written", "rows_skipped", "message", "error_reason",
 ]
 
-REQUIRED_ACCOUNT_FIELDS = [
-    "SHOP_DOMAIN",
-    "SHOPIFY_API_VERSION",
-    "GSHEET_SA_B64_SECRET",
-    "SHOPIFY_TOKEN_SECRET",
-    "STOREFRONT_BASE_URL",
-    "ADMIN_BASE_URL",
-    "META_AD_ACCOUNT_ID",
-    "AWIN_ADVERTISER_ID",
-]
+# wide_to_long 只读写 Google Sheets，不访问 Shopify / Ads。
+# 本 job 不读取 Cfg__account_id，也不校验站点账号字段。
+REQUIRED_ACCOUNT_FIELDS: list[str] = []
 
 OWNER_ID_KEYS = {
     "PRODUCT": "product_id",
@@ -312,22 +305,13 @@ def build_runtime_context(
     bootstrap_gsheet_sa_b64_secret: str,
     cfg_account_tab: str = CFG_ACCOUNT_TAB_DEFAULT,
 ) -> tuple[gspread.Client, dict[str, str]]:
-    bootstrap_gc = build_gsheet_client(bootstrap_gsheet_sa_b64_secret)
-    account_cfg = read_cfg_account(
-        bootstrap_gc,
-        console_core_url,
-        site_code=site_code,
-        cfg_account_tab=cfg_account_tab,
-        required_fields=REQUIRED_ACCOUNT_FIELDS,
-    )
-    assert_bootstrap_secret_matches_account(
-        bootstrap_gsheet_sa_b64_secret=bootstrap_gsheet_sa_b64_secret,
-        account_cfg=account_cfg,
-    )
+    del site_code, console_core_url, cfg_account_tab  # kept for run() compatibility
 
-    # Same secret by contract. Rebuild explicitly to make the dependency clear.
-    runtime_gc = build_gsheet_client(account_cfg["GSHEET_SA_B64_SECRET"])
-    return runtime_gc, account_cfg
+    # wide_to_long 是 Google Sheets 内部整理 job：
+    # 只需要用 Cell 1 的 BOOTSTRAP_GSHEET_SA_B64_SECRET 读取 Console Core / Cfg__Sites / 业务表。
+    # 不读取 Cfg__account_id，不校验 Shopify / Ads / Storefront / Admin 字段。
+    runtime_gc = build_gsheet_client(bootstrap_gsheet_sa_b64_secret)
+    return runtime_gc, {}
 
 
 def get_sheet_url_by_label(
@@ -1135,7 +1119,7 @@ def run(
         print("✅ Runtime config ready")
         print("  site_code :", site_code_final)
         print("  job_name  :", job_name_final)
-        print("  shop      :", account_cfg.get("SHOP_DOMAIN", ""))
+        print("  config    : Cfg__account_id not used by this job")
         print("✅ Sheets ready")
         print("  wide      :", sh_wide.url, "|", ws_wide.title)
         print("  long      :", sh_long.url, "|", ws_long.title)
