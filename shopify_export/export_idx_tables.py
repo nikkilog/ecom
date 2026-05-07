@@ -25,6 +25,7 @@ shopify_export/export_idx_tables.py
 from __future__ import annotations
 
 import base64
+import html
 import json
 import os
 import re
@@ -416,7 +417,12 @@ def make_fetch_df(view_df: pd.DataFrame, deps: set[str]) -> pd.DataFrame:
 def strip_entity_prefix(expr: str, entity_type: str) -> str:
     """
     统一把 expr 转成 GraphQL 节点下路径。
-    并兼容旧版 variant weight / weightUnit 写法。
+
+    特殊规则：
+    - PRODUCT product.description 改拉 descriptionHtml。
+      后续在 node_to_row 里转成人类可读 text。
+      原因：Shopify product.description 会丢掉 HTML 结构，容易把段落粘在一起。
+    - VARIANT weight / weightUnit 兼容旧版写法。
     """
     pref = {
         "PRODUCT": "product.",
@@ -427,6 +433,11 @@ def strip_entity_prefix(expr: str, entity_type: str) -> str:
     if pref and s.startswith(pref):
         s = s[len(pref):]
 
+    if entity_type == "PRODUCT":
+        k = s.strip()
+        if k == "description":
+            return "descriptionHtml"
+
     # ---- 兼容旧版 weight 写法（与原 ipynb 一致：先去前缀，再 remap）----
     if entity_type == "VARIANT":
         k = s.strip()
@@ -436,7 +447,6 @@ def strip_entity_prefix(expr: str, entity_type: str) -> str:
             return "inventoryItem.measurement.weight.unit"
 
     return s
-
 
 _index_part_re = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\[(\d+)\]$")
 
@@ -549,6 +559,52 @@ def tags_to_human(v: Any) -> str:
             return ", ".join(parts)
         return v.strip()
     return str(v).strip()
+
+
+
+def html_to_readable_text(html_text: Any) -> str:
+    """
+    把 Shopify descriptionHtml 转成人类可读文本：
+    - <br>, </p>, </div>, </li>, </tr>, 标题标签 -> 换行
+    - 去掉剩余 HTML 标签
+    - 反解码 &amp; / &quot; / &#39; 等实体
+    - 压缩多余空格，但保留段落换行
+    """
+    s = "" if html_text is None else str(html_text)
+    if not s.strip():
+        return ""
+
+    # 去掉 script/style
+    s = re.sub(r"(?is)<\s*(script|style)[^>]*>.*?</\s*\1\s*>", "", s)
+
+    # 先把明显的结构标签转成换行
+    s = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", s)
+    s = re.sub(r"(?i)</\s*(p|div|section|article|li|tr|h1|h2|h3|h4|h5|h6)\s*>", "\n", s)
+    s = re.sub(r"(?i)<\s*li[^>]*>", "• ", s)
+
+    # 表格单元格之间给一点间隔
+    s = re.sub(r"(?i)</\s*(td|th)\s*>", " ", s)
+
+    # 块级起始标签也给轻微断开，避免前文直接粘到新块
+    s = re.sub(r"(?i)<\s*(p|div|section|article|tr|h1|h2|h3|h4|h5|h6)[^>]*>", "\n", s)
+
+    # 去掉剩余标签
+    s = re.sub(r"(?s)<[^>]+>", "", s)
+
+    # HTML entity 还原
+    s = html.unescape(s)
+
+    # 统一换行
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+
+    # 每一行内部压缩空格
+    lines = []
+    for line in s.split("\n"):
+        line = re.sub(r"[ \t\u00a0]+", " ", line).strip()
+        if line:
+            lines.append(line)
+
+    return "\n".join(lines).strip()
 
 
 def normalize_sheet_cell(v: Any) -> Any:
@@ -775,14 +831,22 @@ def node_to_row(node: dict, plan: Dict[str, Any]) -> Dict[str, Any]:
 
     for fid in list(row.keys()):
         fk = (FIELD_DEF.get(str(fid), {}) or {}).get("field_key", "")
-        if _clean_str(fk) == "core.tags":
+        fk = _clean_str(fk)
+
+        if fk == "core.tags":
             row[fid] = tags_to_human(row.get(fid, ""))
+
+        # Product Description (text)
+        # 配置里仍然可以是 product.description / core.description，
+        # 但 strip_entity_prefix 已经改成实际拉 descriptionHtml；
+        # 这里把 HTML 转成带换行的可读文本。
+        if fk == "core.description":
+            row[fid] = html_to_readable_text(row.get(fid, ""))
 
     for k in list(row.keys()):
         row[k] = normalize_sheet_cell(row[k])
 
     return row
-
 
 def find_synced_at_fids(view_df: pd.DataFrame) -> List[str]:
     out = []
