@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import html
 import json
 import random
 import re
@@ -59,7 +60,16 @@ SUPPORTED_CORE_COMPARE_AT_ACTIONS = {"SET", "CLEAR"}
 ALLOWED_PREFIXES = ("mf.", "v_mf.", "core.")
 FORBIDDEN_SHOPIFY_PREFIXES = ("mf.shopify.", "v_mf.shopify.", "v.mf.shopify.")
 
-PRODUCT_CORE_KEYS = {"core.title", "core.product_type", "core.tags", "core.description_html"}
+PRODUCT_CORE_KEYS = {
+    "core.title",
+    "core.product_type",
+    "core.tags",
+    "core.description_html",
+    "core.description",
+    "core.seo_title",
+    "core.seo_description",
+    "core.vendor",
+}
 VARIANT_CORE_KEYS = {"core.weight", "core.weight_unit", "core.price", "core.compare_at_price"}
 
 Q_PRODUCT_BY_HANDLE = """
@@ -104,8 +114,22 @@ mutation setMf($metafields: [MetafieldsSetInput!]!) {
 M_PRODUCT_UPDATE = """
 mutation productUpdate($input: ProductInput!) {
   productUpdate(input: $input) {
-    product { id title productType tags descriptionHtml }
-    userErrors { field message }
+    product {
+      id
+      title
+      productType
+      vendor
+      tags
+      descriptionHtml
+      seo {
+        title
+        description
+      }
+    }
+    userErrors {
+      field
+      message
+    }
   }
 }
 """
@@ -614,7 +638,15 @@ def validate_row(entity_type: str, field_key: str, action: str) -> tuple[bool, s
         if act not in SUPPORTED_CORE_TAG_ACTIONS:
             return False, "action_not_supported"
 
-    elif fk in {"core.title", "core.product_type", "core.description_html"}:
+    elif fk in {
+        "core.title",
+        "core.product_type",
+        "core.description_html",
+        "core.description",
+        "core.seo_title",
+        "core.seo_description",
+        "core.vendor",
+    }:
         if et != "PRODUCT":
             return False, "core_entity_mismatch"
         if act not in SUPPORTED_CORE_SCALAR_ACTIONS:
@@ -642,7 +674,6 @@ def validate_row(entity_type: str, field_key: str, action: str) -> tuple[bool, s
         return False, "field_key_not_recognized"
 
     return True, ""
-
 
 def recognize_rows(df_work: pd.DataFrame, mode_default: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     good_rows = []
@@ -1100,6 +1131,39 @@ def normalize_weight_unit(value: str) -> str:
     return s
 
 
+def plain_text_to_description_html(value: str) -> str:
+    """
+    Convert human-readable plain text into safe Shopify descriptionHtml.
+
+    Rules:
+    - Empty text -> ""
+    - Single line -> escaped plain text in one <p>
+    - Multiple paragraphs separated by blank lines -> multiple <p> blocks
+    - Single line breaks inside a paragraph -> <br>
+    """
+    s = "" if value is None else str(value)
+    s = s.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    if not s:
+        return ""
+
+    paragraphs = re.split(r"\n\s*\n+", s)
+    html_parts = []
+
+    for p in paragraphs:
+        p = p.strip()
+        if not p:
+            continue
+
+        lines = [html.escape(line.strip()) for line in p.split("\n") if line.strip()]
+        if not lines:
+            continue
+
+        html_parts.append("<p>" + "<br>".join(lines) + "</p>")
+
+    return "\n".join(html_parts)
+
+
 def normalize_tags_for_set_or_clear(action: str, desired_value: str) -> list[str]:
     act = _upper_strip(action)
     if act == "CLEAR":
@@ -1214,10 +1278,16 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                 "id": owner_id,
                 "title": None,
                 "productType": None,
+                "vendor": None,
                 "descriptionHtml": None,
+                "seo_title_present": False,
+                "seo_title": None,
+                "seo_description_present": False,
+                "seo_description": None,
                 "tags_mode": None,
                 "tags_value": None,
                 "source_rows": [],
+                "field_keys": [],
             }
         return product_updates[owner_id]
 
@@ -1250,6 +1320,7 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                 bucket = get_product_bucket(owner_id)
                 bucket["title"] = "" if action == "CLEAR" else desired
                 bucket["source_rows"].append(sheet_row)
+                bucket["field_keys"].append(fk)
                 preview_rows.append({
                     "sheet_row": sheet_row,
                     "entity_type": entity_type,
@@ -1264,6 +1335,7 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                 bucket = get_product_bucket(owner_id)
                 bucket["productType"] = "" if action == "CLEAR" else desired
                 bucket["source_rows"].append(sheet_row)
+                bucket["field_keys"].append(fk)
                 preview_rows.append({
                     "sheet_row": sheet_row,
                     "entity_type": entity_type,
@@ -1274,10 +1346,26 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                     "value_preview": bucket["productType"],
                 })
 
+            elif fk == "core.vendor":
+                bucket = get_product_bucket(owner_id)
+                bucket["vendor"] = "" if action == "CLEAR" else desired
+                bucket["source_rows"].append(sheet_row)
+                bucket["field_keys"].append(fk)
+                preview_rows.append({
+                    "sheet_row": sheet_row,
+                    "entity_type": entity_type,
+                    "owner_id": owner_id,
+                    "field_key": fk,
+                    "action": action,
+                    "plan_type": "product_core",
+                    "value_preview": bucket["vendor"],
+                })
+
             elif fk == "core.description_html":
                 bucket = get_product_bucket(owner_id)
                 bucket["descriptionHtml"] = "" if action == "CLEAR" else desired
                 bucket["source_rows"].append(sheet_row)
+                bucket["field_keys"].append(fk)
                 preview_rows.append({
                     "sheet_row": sheet_row,
                     "entity_type": entity_type,
@@ -1286,6 +1374,53 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                     "action": action,
                     "plan_type": "product_core",
                     "value_preview": bucket["descriptionHtml"][:200],
+                })
+
+            elif fk == "core.description":
+                bucket = get_product_bucket(owner_id)
+                bucket["descriptionHtml"] = "" if action == "CLEAR" else plain_text_to_description_html(desired)
+                bucket["source_rows"].append(sheet_row)
+                bucket["field_keys"].append(fk)
+                preview_rows.append({
+                    "sheet_row": sheet_row,
+                    "entity_type": entity_type,
+                    "owner_id": owner_id,
+                    "field_key": fk,
+                    "action": action,
+                    "plan_type": "product_core",
+                    "value_preview": bucket["descriptionHtml"][:200],
+                })
+
+            elif fk == "core.seo_title":
+                bucket = get_product_bucket(owner_id)
+                bucket["seo_title_present"] = True
+                bucket["seo_title"] = "" if action == "CLEAR" else desired
+                bucket["source_rows"].append(sheet_row)
+                bucket["field_keys"].append(fk)
+                preview_rows.append({
+                    "sheet_row": sheet_row,
+                    "entity_type": entity_type,
+                    "owner_id": owner_id,
+                    "field_key": fk,
+                    "action": action,
+                    "plan_type": "product_core",
+                    "value_preview": bucket["seo_title"],
+                })
+
+            elif fk == "core.seo_description":
+                bucket = get_product_bucket(owner_id)
+                bucket["seo_description_present"] = True
+                bucket["seo_description"] = "" if action == "CLEAR" else desired
+                bucket["source_rows"].append(sheet_row)
+                bucket["field_keys"].append(fk)
+                preview_rows.append({
+                    "sheet_row": sheet_row,
+                    "entity_type": entity_type,
+                    "owner_id": owner_id,
+                    "field_key": fk,
+                    "action": action,
+                    "plan_type": "product_core",
+                    "value_preview": bucket["seo_description"],
                 })
 
             elif fk == "core.tags":
@@ -1301,7 +1436,9 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                     if bucket["tags_mode"] != action:
                         raise ValueError("Cannot mix core.tags ADD/REMOVE/SET/CLEAR for the same owner in one run")
                     bucket["tags_value"].extend(items)
+
                 bucket["source_rows"].append(sheet_row)
+                bucket["field_keys"].append(fk)
                 preview_rows.append({
                     "sheet_row": sheet_row,
                     "entity_type": entity_type,
@@ -1387,14 +1524,29 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
 
     product_inputs = []
     product_meta_rows = []
+
     for owner_id, bucket in product_updates.items():
         input_obj = {"id": owner_id}
+
         if bucket["title"] is not None:
             input_obj["title"] = bucket["title"]
+
         if bucket["productType"] is not None:
             input_obj["productType"] = bucket["productType"]
+
+        if bucket["vendor"] is not None:
+            input_obj["vendor"] = bucket["vendor"]
+
         if bucket["descriptionHtml"] is not None:
             input_obj["descriptionHtml"] = bucket["descriptionHtml"]
+
+        seo_obj = {}
+        if bucket["seo_title_present"]:
+            seo_obj["title"] = bucket["seo_title"]
+        if bucket["seo_description_present"]:
+            seo_obj["description"] = bucket["seo_description"]
+        if seo_obj:
+            input_obj["seo"] = seo_obj
 
         if bucket["tags_mode"] in {"SET", "CLEAR"}:
             input_obj["tags"] = bucket["tags_value"]
@@ -1403,7 +1555,7 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
         product_meta_rows.append({
             "entity_type": "PRODUCT",
             "owner_id": owner_id,
-            "field_key": "core.product_bundle",
+            "field_key": ",".join(sorted(set(bucket["field_keys"]))) if bucket["field_keys"] else "core.product",
             "sheet_rows": bucket["source_rows"],
             "tags_mode": bucket["tags_mode"],
             "tags_value": bucket["tags_value"],
