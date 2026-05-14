@@ -851,14 +851,66 @@ ORDER BY day ASC
     # ---------------- Google Ads ----------------
     def build_google_ads_client(self):
         from google.ads.googleads.client import GoogleAdsClient
+        import pkgutil
+
         config = {
             "developer_token": self.state["GOOGLE_ADS_DEVELOPER_TOKEN"],
             "use_proto_plus": True,
             "json_key_file_path": self.state["ADS_JSON_PATH"],
         }
+
         if self.state.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID"):
             config["login_customer_id"] = str(self.state["GOOGLE_ADS_LOGIN_CUSTOMER_ID"]).replace("-", "").strip()
-        return GoogleAdsClient.load_from_dict(config, version="v20")
+
+        requested_version = str(self.cfg.get("GOOGLE_ADS_API_VERSION", "AUTO") or "AUTO").strip()
+
+        def _installed_google_ads_versions():
+            try:
+                import google.ads.googleads as googleads_pkg
+                versions = []
+                for m in pkgutil.iter_modules(googleads_pkg.__path__):
+                    name = str(m.name)
+                    if re.fullmatch(r"v\d+", name):
+                        versions.append(name)
+                return sorted(versions, key=lambda x: int(x[1:]), reverse=True)
+            except Exception:
+                return []
+
+        installed_versions = _installed_google_ads_versions()
+
+        if requested_version and requested_version.upper() != "AUTO":
+            requested_version = requested_version.lower()
+            if not re.fullmatch(r"v\d+", requested_version):
+                raise OverviewConfigError(
+                    f"GOOGLE_ADS_API_VERSION 配置错误：{requested_version}。"
+                    "应填写 AUTO 或类似 v20 / v21 / v22 / v23 / v24。"
+                )
+
+            if requested_version in installed_versions:
+                api_version = requested_version
+            else:
+                api_version = installed_versions[0] if installed_versions else ""
+                if not api_version:
+                    raise OverviewConfigError(
+                        "当前环境没有可用的 google.ads.googleads.vXX 模块。"
+                        "请先在 Colab 安装：!pip -q install -U google-ads"
+                    )
+                self.dbg(
+                    f"⚠️ 指定 GOOGLE_ADS_API_VERSION={requested_version}，"
+                    f"但当前 google-ads 包未安装该版本；自动改用已安装最高版本：{api_version}"
+                )
+        else:
+            api_version = installed_versions[0] if installed_versions else ""
+            if not api_version:
+                raise OverviewConfigError(
+                    "当前环境没有可用的 google.ads.googleads.vXX 模块。"
+                    "请先在 Colab 安装：!pip -q install -U google-ads"
+                )
+
+        self.state["GOOGLE_ADS_EFFECTIVE_API_VERSION"] = api_version
+        self.dbg(f"✅ Google Ads API client version: {api_version}")
+
+        return GoogleAdsClient.load_from_dict(config, version=api_version)
 
     def _run_gaql_to_rows(self, ga_service, customer_id: str, query: str, row_mapper):
         rows = []
