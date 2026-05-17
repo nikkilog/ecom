@@ -335,7 +335,7 @@ def preprocess_product_image(
 def normalize_sprite_canvas(
     img: Image.Image,
     canvas_size: int = 1000,
-    max_fill: float = 0.96,
+    max_fill: float = 0.82,
 ) -> Image.Image:
     """
     Normalize every source product image into a same-size transparent sprite.
@@ -449,7 +449,7 @@ def build_view_images(
         img = normalize_sprite_canvas(
             img,
             canvas_size=1000,
-            max_fill=0.96,
+            max_fill=0.82,
         )
 
         images[view] = img
@@ -599,50 +599,49 @@ def make_mixed_knob_grid_template() -> TemplateSpec:
     """
     Template: mixed_knob_grid
 
-    Product type: small connector / knob / fitting mixed pack.
-
-    Rendering rule:
-    - 1 pcs: one large centered item.
-    - 2 pcs: two balanced large visuals.
-    - 5 pcs: 4 small units + 1 larger angle hero.
-    - 10 pcs: 8 small units + 2 larger angle heroes.
-    - 20 pcs: 18 compact units + 2 heroes.
-    - 30 pcs: 28 compact units + 2 heroes.
-
-    This is grid+hero logic, not a loose coordinate demo.
+   方案 B：素材标准化保持 0.82，不整体压小；
+    通过模板用途控制 scale：
+    - 1pcs 主图略大但不顶边
+    - hero / 大图约 0.90
+    - grid 小图约 0.70
     """
     q: Dict[int, List[Placement]] = {}
 
+    SINGLE_SCALE = 0.96
+    HERO_SCALE = 0.90
+    SMALL_SCALE = 0.70
+    SMALL_SCALE_DENSE = 0.66
+
     q[1] = [
-        p("image", 0.50, 0.50, 0.88, 0.88, scale=1.00),
+        p("image", 0.50, 0.50, 0.86, 0.86, scale=SINGLE_SCALE),
     ]
 
     q[2] = [
-        p("front", 0.40, 0.52, 0.54, 0.54, scale=1.08),
-        p("angle", 0.64, 0.52, 0.54, 0.54, scale=1.08),
+        p("front", 0.38, 0.52, 0.54, 0.54, scale=HERO_SCALE),
+        p("angle", 0.64, 0.52, 0.54, 0.54, scale=HERO_SCALE),
     ]
 
     q[5] = [
-        *grid_area(4, 2, 2, 0.08, 0.16, 0.48, 0.84, "front", fill=1.08, scale=1.06),
-        p("angle", 0.73, 0.50, 0.54, 0.54, scale=1.12),
+        *grid_area(4, 2, 2, 0.08, 0.18, 0.48, 0.82, "front", fill=1.00, scale=SMALL_SCALE),
+        p("angle", 0.74, 0.52, 0.54, 0.54, scale=HERO_SCALE),
     ]
 
     q[10] = [
-        *grid_area(8, 2, 4, 0.07, 0.10, 0.45, 0.90, "front", fill=1.14, scale=1.08),
-        p("angle", 0.72, 0.34, 0.44, 0.44, scale=1.04),
-        p("angle", 0.76, 0.70, 0.44, 0.44, scale=1.04),
+        *grid_area(8, 2, 4, 0.07, 0.12, 0.46, 0.88, "front", fill=1.00, scale=SMALL_SCALE),
+        p("angle", 0.74, 0.34, 0.44, 0.44, scale=HERO_SCALE),
+        p("angle", 0.76, 0.70, 0.44, 0.44, scale=HERO_SCALE),
     ]
 
     q[20] = [
-        *grid_area(18, 3, 6, 0.06, 0.07, 0.58, 0.93, "front", fill=1.12, scale=1.03),
-        p("angle", 0.80, 0.34, 0.38, 0.38, scale=1.00),
-        p("angle", 0.80, 0.70, 0.38, 0.38, scale=1.00),
+        *grid_area(18, 3, 6, 0.06, 0.09, 0.58, 0.91, "front", fill=1.00, scale=SMALL_SCALE_DENSE),
+        p("angle", 0.80, 0.34, 0.38, 0.38, scale=0.86),
+        p("angle", 0.80, 0.70, 0.38, 0.38, scale=0.86),
     ]
 
     q[30] = [
-        *grid_area(28, 4, 7, 0.05, 0.06, 0.63, 0.94, "front", fill=1.10, scale=0.98),
-        p("angle", 0.81, 0.32, 0.36, 0.36, scale=0.98),
-        p("angle", 0.82, 0.70, 0.36, 0.36, scale=0.98),
+        *grid_area(28, 4, 7, 0.05, 0.07, 0.63, 0.93, "front", fill=1.00, scale=0.62),
+        p("angle", 0.81, 0.32, 0.36, 0.36, scale=0.84),
+        p("angle", 0.82, 0.70, 0.36, 0.36, scale=0.84),
     ]
 
     return spec("mixed_knob_grid", q)
@@ -670,30 +669,45 @@ def make_square_drain_grid_template() -> TemplateSpec:
     """
     Template: square_drain_grid
 
-    Product type: square / flat drain-like product.
-    Uses pure dense grids because this type usually has one strong top-view image.
+   方案 B：方形/平面类产品保留主图清晰度，
+    单张和 hero 不顶边，重复 grid 小图适度缩小。
     """
     q: Dict[int, List[Placement]] = {}
 
-    q[1] = [p("image", 0.50, 0.50, 0.86, 0.86, scale=1.00)]
+    SINGLE_SCALE = 0.96
+    HERO_SCALE = 0.90
+    SMALL_SCALE = 0.72
+    DENSE_SCALE = 0.66
+
+    q[1] = [p("image", 0.50, 0.50, 0.86, 0.86, scale=SINGLE_SCALE)]
 
     q[2] = [
-        p("image", 0.39, 0.50, 0.52, 0.52, scale=1.03),
-        p("image", 0.63, 0.50, 0.52, 0.52, scale=1.03),
+        p("image", 0.38, 0.50, 0.54, 0.54, scale=HERO_SCALE),
+        p("image", 0.64, 0.50, 0.54, 0.54, scale=HERO_SCALE),
     ]
 
     q[5] = [
-        p("image", 0.70, 0.52, 0.52, 0.52, scale=1.02),
-        *grid_area(4, 2, 2, 0.08, 0.20, 0.48, 0.82, "image", fill=1.04, scale=1.00),
+        *grid_area(4, 2, 2, 0.08, 0.20, 0.48, 0.82, "image", fill=1.00, scale=SMALL_SCALE),
+        p("image", 0.72, 0.52, 0.54, 0.54, scale=HERO_SCALE),
     ]
 
     q[10] = [
-        p("image", 0.76, 0.52, 0.42, 0.42, scale=0.98),
-        *grid_area(9, 3, 3, 0.06, 0.14, 0.58, 0.86, "image", fill=1.06, scale=1.00),
-    ][:10]
+        *grid_area(8, 2, 4, 0.07, 0.12, 0.45, 0.88, "image", fill=1.00, scale=SMALL_SCALE),
+        p("image", 0.75, 0.34, 0.42, 0.42, scale=0.86),
+        p("image", 0.76, 0.70, 0.42, 0.42, scale=0.86),
+    ]
 
-    q[20] = grid_area(20, 4, 5, 0.08, 0.10, 0.92, 0.90, "image", fill=1.04, scale=1.00)
-    q[30] = grid_area(30, 5, 6, 0.06, 0.08, 0.94, 0.92, "image", fill=1.02, scale=1.00)
+    q[20] = [
+        *grid_area(18, 3, 6, 0.07, 0.09, 0.59, 0.91, "image", fill=1.00, scale=DENSE_SCALE),
+        p("image", 0.80, 0.34, 0.38, 0.38, scale=0.84),
+        p("image", 0.80, 0.70, 0.38, 0.38, scale=0.84),
+    ]
+
+    q[30] = [
+        *grid_area(28, 4, 7, 0.06, 0.07, 0.64, 0.93, "image", fill=1.00, scale=0.62),
+        p("image", 0.82, 0.32, 0.36, 0.36, scale=0.82),
+        p("image", 0.82, 0.70, 0.36, 0.36, scale=0.82),
+    ]
 
     return spec("square_drain_grid", q)
 
