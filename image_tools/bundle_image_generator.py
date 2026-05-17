@@ -146,7 +146,7 @@ def parse_service_account_secret(secret_value: str) -> dict:
 
 
 def normalize_template_key(value: Any) -> str:
-    """Normalize template_no values from Sheets, including 1.0 -> 1."""
+    """Normalize template_no / Type values from Sheets, including 1.0 -> 1."""
     value = clean_cell(value)
     if not value:
         return ""
@@ -270,9 +270,7 @@ def remove_near_white_background(
 ) -> Image.Image:
     """
     Basic white-background removal for product images.
-
-    It keeps non-white pixels opaque and makes near-white background transparent.
-    This is intentionally conservative for product photos.
+    Conservative: makes near-white backgrounds transparent and keeps product pixels.
     """
     img = img.convert("RGBA")
     pixels = img.load()
@@ -307,7 +305,7 @@ def crop_to_content(
 ) -> Image.Image:
     img = img.convert("RGBA")
     alpha = img.getchannel("A")
-    bbox = alpha.point(lambda p: 255 if p > alpha_threshold else 0).getbbox()
+    bbox = alpha.point(lambda px: 255 if px > alpha_threshold else 0).getbbox()
 
     if not bbox:
         return img
@@ -391,9 +389,9 @@ def resolve_url_map(row: pd.Series) -> Dict[str, str]:
 
     resolved = {}
     for view, candidates in fallback_order.items():
-        for c in candidates:
-            if url_map.get(c):
-                resolved[view] = url_map[c]
+        for candidate in candidates:
+            if url_map.get(candidate):
+                resolved[view] = url_map[candidate]
                 break
 
     return resolved
@@ -423,39 +421,62 @@ def build_view_images(
 
 
 # =========================
-# Templates
+# Placement helpers
 # =========================
 
 def p(view: str, x: float, y: float, w: float, h: float) -> Placement:
     return Placement(view=view, x=x, y=y, w=w, h=h)
 
 
-def clone_template(template: TemplateSpec, new_name: str) -> TemplateSpec:
-    return TemplateSpec(
-        template_name=new_name,
-        quantity_to_placements=template.quantity_to_placements,
-    )
+def grid(
+    n: int,
+    cols: int,
+    rows: int,
+    x0: float,
+    x1: float,
+    y0: float,
+    y1: float,
+    view: str = "front",
+    cell_w: Optional[float] = None,
+    cell_h: Optional[float] = None,
+) -> List[Placement]:
+    if n <= 0:
+        return []
+    if cols <= 0 or rows <= 0:
+        raise ValueError("cols and rows must be positive")
 
+    xs = [(x0 + x1) / 2] if cols == 1 else [x0 + (x1 - x0) * i / (cols - 1) for i in range(cols)]
+    ys = [(y0 + y1) / 2] if rows == 1 else [y0 + (y1 - y0) * i / (rows - 1) for i in range(rows)]
+
+    if cell_w is None:
+        cell_w = min(0.90 / cols, 0.26)
+    if cell_h is None:
+        cell_h = min(0.90 / rows, 0.24)
+
+    out: List[Placement] = []
+    for yy in ys:
+        for xx in xs:
+            if len(out) >= n:
+                return out
+            out.append(p(view, xx, yy, cell_w, cell_h))
+    return out
+
+
+def spec(name: str, q: Dict[int, List[Placement]]) -> TemplateSpec:
+    missing = [x for x in SUPPORTED_QUANTITIES if x not in q]
+    if missing:
+        raise ValueError(f"Template {name} missing quantities: {missing}")
+    return TemplateSpec(template_name=name, quantity_to_placements=q)
+
+
+# =========================
+# Distinct templates
+# =========================
 
 def make_big_top_left_grid_template() -> TemplateSpec:
-    """
-    Template: big_top_left_grid
-
-    Intended visual:
-    - 1 pcs: single large image
-    - 2 pcs: two angle/image views, diagonal layout
-    - 5 pcs: front grid, 1 + 2 + 2 feeling
-    - 10 pcs: left grid + right two bigger angle/side
-    - 20 pcs: left small grid + right big vertical stack
-    - 30 pcs: top-left large hero + remaining grid
-
-    Coordinates are percentages of canvas.
-    """
     q: Dict[int, List[Placement]] = {}
 
-    q[1] = [
-        p("image", 0.50, 0.50, 0.76, 0.76),
-    ]
+    q[1] = [p("image", 0.50, 0.50, 0.76, 0.76)]
 
     q[2] = [
         p("angle", 0.38, 0.34, 0.58, 0.42),
@@ -470,74 +491,306 @@ def make_big_top_left_grid_template() -> TemplateSpec:
         p("front", 0.70, 0.75, 0.46, 0.22),
     ]
 
-    q[10] = []
-    xs = [0.24, 0.50]
-    ys = [0.17, 0.38, 0.59, 0.80]
-    for yy in ys:
-        for xx in xs:
-            q[10].append(p("front", xx, yy, 0.30, 0.16))
+    q[10] = grid(8, 2, 4, 0.24, 0.50, 0.17, 0.80, "front", 0.30, 0.16)
     q[10].extend([
         p("side", 0.80, 0.32, 0.34, 0.42),
         p("side", 0.80, 0.72, 0.34, 0.42),
     ])
 
-    q[20] = []
-    xs = [0.17, 0.37, 0.57]
-    ys = [0.12, 0.27, 0.42, 0.57, 0.72, 0.87]
-    for yy in ys:
-        for xx in xs:
-            q[20].append(p("front", xx, yy, 0.22, 0.12))
+    q[20] = grid(18, 3, 6, 0.17, 0.57, 0.12, 0.87, "front", 0.22, 0.12)
     q[20].extend([
         p("side", 0.83, 0.30, 0.34, 0.42),
         p("side", 0.83, 0.72, 0.34, 0.42),
     ])
 
-    q[30] = []
-    q[30].append(p("angle", 0.23, 0.18, 0.46, 0.30))
+    q[30] = [p("angle", 0.23, 0.18, 0.46, 0.30)]
+    q[30].extend(grid(4, 2, 2, 0.62, 0.82, 0.13, 0.29, "front", 0.19, 0.10))
+    q[30].extend(grid(25, 5, 5, 0.13, 0.89, 0.45, 0.93, "front", 0.19, 0.10))
 
-    coords: List[Tuple[float, float]] = []
-    for yy in [0.13, 0.29]:
-        for xx in [0.62, 0.82]:
-            coords.append((xx, yy))
+    return spec("big_top_left_grid", q)
 
-    for yy in [0.45, 0.57, 0.69, 0.81, 0.93]:
-        for xx in [0.13, 0.32, 0.51, 0.70, 0.89]:
-            coords.append((xx, yy))
 
-    for xx, yy in coords[:29]:
-        q[30].append(p("front", xx, yy, 0.19, 0.10))
+def make_mixed_knob_grid_template() -> TemplateSpec:
+    q: Dict[int, List[Placement]] = {}
 
-    return TemplateSpec(
-        template_name="big_top_left_grid",
-        quantity_to_placements=q,
-    )
+    q[1] = [p("image", 0.50, 0.50, 0.72, 0.72)]
+    q[2] = [
+        p("front", 0.36, 0.42, 0.48, 0.48),
+        p("angle", 0.66, 0.58, 0.46, 0.46),
+    ]
+    q[5] = [
+        p("angle", 0.68, 0.50, 0.44, 0.54),
+        *grid(4, 2, 2, 0.22, 0.45, 0.30, 0.72, "front", 0.26, 0.22),
+    ]
+    q[10] = [
+        p("angle", 0.72, 0.58, 0.42, 0.44),
+        p("side", 0.30, 0.32, 0.34, 0.34),
+        p("side", 0.44, 0.65, 0.30, 0.30),
+        *grid(7, 3, 3, 0.17, 0.55, 0.16, 0.86, "front", 0.20, 0.16),
+    ][:10]
+    q[20] = [
+        p("angle", 0.74, 0.58, 0.38, 0.42),
+        p("side", 0.77, 0.22, 0.28, 0.26),
+        *grid(18, 3, 6, 0.16, 0.56, 0.12, 0.88, "front", 0.20, 0.12),
+    ][:20]
+    q[30] = [
+        p("angle", 0.76, 0.64, 0.34, 0.38),
+        p("side", 0.78, 0.24, 0.28, 0.26),
+        *grid(28, 4, 7, 0.14, 0.61, 0.10, 0.90, "front", 0.15, 0.10),
+    ][:30]
+
+    return spec("mixed_knob_grid", q)
+
+
+def make_round_drain_grid_template() -> TemplateSpec:
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.74, 0.74)]
+    q[2] = [
+        p("image", 0.50, 0.35, 0.56, 0.36),
+        p("image", 0.50, 0.65, 0.56, 0.36),
+    ]
+    q[5] = [
+        p("image", 0.50, 0.20, 0.42, 0.28),
+        *grid(4, 2, 2, 0.32, 0.68, 0.50, 0.78, "image", 0.30, 0.22),
+    ]
+    q[10] = grid(10, 3, 4, 0.22, 0.78, 0.14, 0.86, "image", 0.25, 0.18)
+    q[20] = grid(20, 4, 5, 0.16, 0.84, 0.12, 0.88, "image", 0.19, 0.14)
+    q[30] = grid(30, 5, 6, 0.12, 0.88, 0.10, 0.90, "image", 0.16, 0.11)
+
+    return spec("round_drain_grid", q)
+
+
+def make_square_drain_grid_template() -> TemplateSpec:
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.76, 0.76)]
+    q[2] = [
+        p("image", 0.35, 0.42, 0.42, 0.42),
+        p("image", 0.65, 0.58, 0.42, 0.42),
+    ]
+    q[5] = [
+        p("image", 0.70, 0.50, 0.40, 0.40),
+        *grid(4, 2, 2, 0.25, 0.48, 0.30, 0.70, "image", 0.24, 0.22),
+    ]
+    q[10] = [
+        p("image", 0.74, 0.58, 0.34, 0.34),
+        *grid(9, 3, 3, 0.18, 0.58, 0.18, 0.82, "image", 0.19, 0.17),
+    ][:10]
+    q[20] = grid(20, 4, 5, 0.16, 0.84, 0.12, 0.88, "image", 0.18, 0.14)
+    q[30] = grid(30, 5, 6, 0.12, 0.88, 0.10, 0.90, "image", 0.15, 0.11)
+
+    return spec("square_drain_grid", q)
+
+
+def make_elbow_mixed_grid_template() -> TemplateSpec:
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("angle", 0.50, 0.50, 0.74, 0.74)]
+    q[2] = [
+        p("angle", 0.36, 0.40, 0.50, 0.42),
+        p("side", 0.66, 0.60, 0.50, 0.42),
+    ]
+    q[5] = [
+        p("angle", 0.70, 0.42, 0.42, 0.40),
+        p("side", 0.70, 0.72, 0.34, 0.28),
+        *grid(3, 1, 3, 0.28, 0.28, 0.26, 0.74, "front", 0.32, 0.22),
+    ]
+    q[10] = [
+        p("angle", 0.76, 0.35, 0.36, 0.32),
+        p("side", 0.76, 0.72, 0.36, 0.32),
+        *grid(8, 2, 4, 0.24, 0.52, 0.14, 0.86, "front", 0.25, 0.15),
+    ]
+    q[20] = [
+        p("angle", 0.77, 0.33, 0.32, 0.28),
+        p("side", 0.77, 0.72, 0.32, 0.28),
+        *grid(18, 3, 6, 0.15, 0.58, 0.11, 0.89, "front", 0.19, 0.11),
+    ]
+    q[30] = [
+        p("angle", 0.80, 0.24, 0.30, 0.24),
+        p("side", 0.80, 0.54, 0.30, 0.24),
+        p("angle", 0.80, 0.82, 0.28, 0.22),
+        *grid(27, 3, 9, 0.15, 0.60, 0.08, 0.92, "front", 0.17, 0.085),
+    ]
+
+    return spec("elbow_mixed_grid", q)
+
+
+def make_round_strainer_mix_template() -> TemplateSpec:
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.76, 0.76)]
+    q[2] = [
+        p("image", 0.40, 0.42, 0.46, 0.42),
+        p("angle", 0.62, 0.62, 0.42, 0.38),
+    ]
+    q[5] = [
+        p("image", 0.32, 0.50, 0.42, 0.46),
+        *grid(4, 2, 2, 0.62, 0.82, 0.30, 0.72, "angle", 0.22, 0.20),
+    ]
+    q[10] = [
+        p("image", 0.28, 0.50, 0.42, 0.48),
+        p("angle", 0.77, 0.28, 0.28, 0.26),
+        p("angle", 0.77, 0.74, 0.28, 0.26),
+        *grid(7, 2, 4, 0.55, 0.68, 0.15, 0.86, "front", 0.16, 0.13),
+    ][:10]
+    q[20] = [
+        p("image", 0.76, 0.48, 0.34, 0.42),
+        *grid(19, 4, 5, 0.14, 0.56, 0.12, 0.88, "front", 0.16, 0.12),
+    ][:20]
+    q[30] = [
+        p("image", 0.80, 0.50, 0.30, 0.38),
+        *grid(29, 5, 6, 0.10, 0.63, 0.10, 0.90, "front", 0.13, 0.10),
+    ][:30]
+
+    return spec("round_strainer_mix", q)
+
+
+def make_big_bottom_center_grid_template() -> TemplateSpec:
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.76, 0.76)]
+    q[2] = [
+        p("image", 0.50, 0.34, 0.58, 0.34),
+        p("front", 0.50, 0.68, 0.58, 0.34),
+    ]
+    q[5] = [
+        *grid(4, 4, 1, 0.20, 0.80, 0.20, 0.20, "front", 0.22, 0.18),
+        p("angle", 0.50, 0.66, 0.58, 0.44),
+    ]
+    q[10] = [
+        *grid(8, 4, 2, 0.17, 0.83, 0.16, 0.42, "front", 0.20, 0.15),
+        p("angle", 0.40, 0.74, 0.38, 0.34),
+        p("side", 0.68, 0.74, 0.32, 0.30),
+    ]
+    q[20] = [
+        *grid(18, 6, 3, 0.10, 0.90, 0.12, 0.45, "front", 0.14, 0.10),
+        p("angle", 0.38, 0.76, 0.36, 0.30),
+        p("side", 0.68, 0.76, 0.32, 0.28),
+    ]
+    q[30] = [
+        *grid(28, 7, 4, 0.08, 0.92, 0.09, 0.55, "front", 0.12, 0.085),
+        p("angle", 0.38, 0.80, 0.34, 0.28),
+        p("side", 0.68, 0.80, 0.30, 0.26),
+    ]
+
+    return spec("big_bottom_center_grid", q)
+
+
+def make_coil_grid_template() -> TemplateSpec:
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.78, 0.78)]
+    q[2] = [
+        p("image", 0.38, 0.50, 0.46, 0.46),
+        p("image", 0.62, 0.50, 0.46, 0.46),
+    ]
+    q[5] = [
+        p("image", 0.50, 0.50, 0.42, 0.42),
+        p("image", 0.28, 0.28, 0.28, 0.28),
+        p("image", 0.72, 0.28, 0.28, 0.28),
+        p("image", 0.28, 0.72, 0.28, 0.28),
+        p("image", 0.72, 0.72, 0.28, 0.28),
+    ]
+    q[10] = grid(10, 5, 2, 0.14, 0.86, 0.35, 0.65, "image", 0.16, 0.22)
+    q[20] = grid(20, 5, 4, 0.12, 0.88, 0.18, 0.82, "image", 0.16, 0.16)
+    q[30] = grid(30, 6, 5, 0.10, 0.90, 0.14, 0.86, "image", 0.13, 0.13)
+
+    return spec("coil_grid", q)
+
+
+def make_horizontal_plus_small_grid_template() -> TemplateSpec:
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.86, 0.58)]
+    q[2] = [
+        p("image", 0.50, 0.36, 0.78, 0.32),
+        p("front", 0.50, 0.66, 0.78, 0.32),
+    ]
+    q[5] = [
+        p("image", 0.50, 0.34, 0.78, 0.30),
+        *grid(4, 4, 1, 0.20, 0.80, 0.72, 0.72, "front", 0.18, 0.18),
+    ]
+    q[10] = [
+        p("image", 0.50, 0.24, 0.82, 0.26),
+        *grid(9, 3, 3, 0.22, 0.78, 0.50, 0.86, "front", 0.20, 0.12),
+    ][:10]
+    q[20] = [
+        p("image", 0.50, 0.18, 0.82, 0.20),
+        *grid(19, 5, 4, 0.12, 0.88, 0.40, 0.88, "front", 0.16, 0.11),
+    ][:20]
+    q[30] = [
+        p("image", 0.50, 0.15, 0.82, 0.18),
+        *grid(29, 6, 5, 0.10, 0.90, 0.34, 0.90, "front", 0.13, 0.09),
+    ][:30]
+
+    return spec("horizontal_plus_small_grid", q)
+
+
+def make_horizontal_dense_grid_template() -> TemplateSpec:
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.86, 0.58)]
+    q[2] = grid(2, 1, 2, 0.50, 0.50, 0.36, 0.64, "image", 0.76, 0.28)
+    q[5] = grid(5, 1, 5, 0.50, 0.50, 0.18, 0.82, "image", 0.78, 0.12)
+    q[10] = grid(10, 2, 5, 0.30, 0.70, 0.16, 0.84, "image", 0.40, 0.11)
+    q[20] = grid(20, 4, 5, 0.14, 0.86, 0.16, 0.84, "image", 0.22, 0.11)
+    q[30] = grid(30, 5, 6, 0.10, 0.90, 0.12, 0.88, "image", 0.18, 0.09)
+
+    return spec("horizontal_dense_grid", q)
+
+
+def make_vertical_big_bottom_grid_template() -> TemplateSpec:
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.58, 0.86)]
+    q[2] = [
+        p("image", 0.38, 0.52, 0.40, 0.72),
+        p("front", 0.62, 0.52, 0.40, 0.72),
+    ]
+    q[5] = [
+        *grid(4, 4, 1, 0.18, 0.82, 0.18, 0.18, "front", 0.18, 0.20),
+        p("image", 0.50, 0.66, 0.42, 0.54),
+    ]
+    q[10] = [
+        *grid(8, 4, 2, 0.18, 0.82, 0.15, 0.38, "front", 0.18, 0.16),
+        p("image", 0.38, 0.72, 0.34, 0.42),
+        p("image", 0.64, 0.72, 0.34, 0.42),
+    ]
+    q[20] = [
+        *grid(18, 6, 3, 0.10, 0.90, 0.10, 0.42, "front", 0.13, 0.10),
+        p("image", 0.38, 0.74, 0.34, 0.38),
+        p("image", 0.66, 0.74, 0.34, 0.38),
+    ]
+    q[30] = [
+        *grid(27, 9, 3, 0.08, 0.92, 0.09, 0.42, "front", 0.09, 0.09),
+        p("image", 0.30, 0.76, 0.28, 0.34),
+        p("image", 0.52, 0.76, 0.28, 0.34),
+        p("image", 0.74, 0.76, 0.28, 0.34),
+    ]
+
+    return spec("vertical_big_bottom_grid", q)
 
 
 def get_builtin_templates() -> Dict[str, TemplateSpec]:
-    big_top_left_grid = make_big_top_left_grid_template()
-
-    # All template_name values used in Ref__BundleTemplates / Input__BundleImageURLs
-    # must be registered here.
-    # Current version: all registered names reuse big_top_left_grid placements.
-    # Later, any template can be replaced with a dedicated make_xxx_template() layout.
     templates = [
-        big_top_left_grid,
-        clone_template(big_top_left_grid, "mixed_knob_grid"),
-        clone_template(big_top_left_grid, "round_drain_grid"),
-        clone_template(big_top_left_grid, "square_drain_grid"),
-        clone_template(big_top_left_grid, "elbow_mixed_grid"),
-        clone_template(big_top_left_grid, "round_strainer_mix"),
-        clone_template(big_top_left_grid, "big_bottom_center_grid"),
-        clone_template(big_top_left_grid, "coil_grid"),
-        clone_template(big_top_left_grid, "horizontal_plus_small_grid"),
-        clone_template(big_top_left_grid, "horizontal_dense_grid"),
-        clone_template(big_top_left_grid, "vertical_big_bottom_grid"),
-
-        # Backward-compatible alias kept for earlier tests / old sheet rows.
-        clone_template(big_top_left_grid, "angle_l_grid"),
+        make_big_top_left_grid_template(),
+        make_mixed_knob_grid_template(),
+        make_round_drain_grid_template(),
+        make_square_drain_grid_template(),
+        make_elbow_mixed_grid_template(),
+        make_round_strainer_mix_template(),
+        make_big_bottom_center_grid_template(),
+        make_coil_grid_template(),
+        make_horizontal_plus_small_grid_template(),
+        make_horizontal_dense_grid_template(),
+        make_vertical_big_bottom_grid_template(),
     ]
 
-    return {t.template_name: t for t in templates}
+    out = {t.template_name: t for t in templates}
+    if len(out) != len(templates):
+        raise ValueError("Duplicate template_name in built-in templates")
+    return out
 
 
 # =========================
@@ -581,7 +834,7 @@ def resolve_template_name(
 
     resolution_note = ""
 
-    # Defensive support for accidental mis-entry: template_name column contains 1 / 1.0.
+    # Defensive support: user accidentally entered 1 / 1.0 under template_name.
     if raw_template_name and raw_template_name not in template_names_in_ref and is_numeric_like(raw_template_name):
         if not raw_template_no:
             raw_template_no = normalize_template_key(raw_template_name)
@@ -680,7 +933,6 @@ def normalize_input_df(input_df: pd.DataFrame) -> pd.DataFrame:
     df["Type"] = df["Type"].apply(normalize_template_key)
     df["template_no"] = df["template_no"].apply(normalize_template_key)
 
-    # optional enabled support
     if "enabled" in df.columns:
         df["enabled"] = df["enabled"].apply(lambda x: clean_cell(x).lower())
         df = df[df["enabled"].isin(["", "true", "yes", "y", "1"])].copy()
@@ -724,8 +976,8 @@ def generate_from_dataframes(
     output_dir = ensure_dir(output_dir)
     cache_dir = ensure_dir(cache_dir)
 
-    # New default: row-level Type controls quantities.
-    # Optional quantities remains as a hard global override for temporary testing only.
+    # Default: row-level Type controls quantities.
+    # quantities remains as a hard global override for temporary testing only.
     quantity_override = None
     if quantities:
         quantity_override = [int(q) for q in quantities]
@@ -736,7 +988,7 @@ def generate_from_dataframes(
 
     template_names_in_ref, template_no_to_name = build_template_ref_maps(template_df)
 
-    for idx, row in input_df.iterrows():
+    for _, row in input_df.iterrows():
         sku = clean_cell(row.get("sku", ""))
         output_name = clean_cell(row.get("output_name", "")) or f"{sku}-SPU"
         type_value = clean_cell(row.get("Type", ""))
