@@ -51,6 +51,117 @@ def _safe_json_loads(x):
         return {}
 
 
+
+def _safe_json_list_loads(x) -> List[Any]:
+    """
+    Parse a cell that may contain:
+    - JSON list: ["url1", "url2"]
+    - old pipe list: url1 | url2
+    - plain single value
+    """
+    if isinstance(x, list):
+        return x
+
+    s = _safe_str(x)
+    if not s:
+        return []
+
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            obj = json.loads(s)
+            return obj if isinstance(obj, list) else []
+        except Exception:
+            pass
+
+    if " | " in s:
+        return [p.strip() for p in s.split(" | ") if p.strip()]
+
+    return [s]
+
+
+def _is_image_list_field_row(fr: Dict[str, Any]) -> bool:
+    field_key = _safe_str(fr.get("field_key")).lower()
+    alias = _safe_str(fr.get("alias")).lower()
+    field_id = _safe_str(fr.get("field_id")).lower()
+    data_type = _safe_str(fr.get("data_type")).lower()
+
+    if field_key.endswith("images_urls") or field_key.endswith("images_json"):
+        return True
+
+    # Compatible with aliases from Cfg__ExportTabFields.
+    if alias in ("product images urls", "product images json", "variant product images urls", "variant product images json"):
+        return True
+
+    if field_id.endswith("product.images_urls") or field_id.endswith("product.images_json"):
+        return True
+    if field_id.endswith("variant.product_images_urls") or field_id.endswith("variant.product_images_json"):
+        return True
+
+    return False
+
+
+def _expand_image_field_rows_for_output(
+    field_rows: List[Dict[str, Any]],
+    base_df: pd.DataFrame,
+    max_images: int = 50,
+) -> List[Dict[str, Any]]:
+    """
+    Build final output field rows.
+
+    IDX may keep image list as one raw JSON/list column.
+    This function expands it only in the final product view output:
+    Product Images URLs -> Product Image 01, Product Image 02, ...
+
+    This keeps IDX clean and machine-readable while final tabs stay human-readable.
+    """
+    out: List[Dict[str, Any]] = []
+    output_seen: Dict[str, int] = {}
+
+    def unique_output_key(base_key: str) -> str:
+        base_key = _safe_str(base_key) or "Product Image"
+        output_seen[base_key] = output_seen.get(base_key, 0) + 1
+        if output_seen[base_key] == 1:
+            return base_key
+        return f"{base_key}__{output_seen[base_key]}"
+
+    for fr in field_rows:
+        fid = _safe_str(fr.get("field_id"))
+
+        if not _is_image_list_field_row(fr):
+            fr2 = dict(fr)
+            fr2["output_key"] = unique_output_key(_safe_str(fr2.get("output_key")) or _safe_str(fr2.get("alias")) or fid)
+            out.append(fr2)
+            continue
+
+        if not fid or base_df is None or base_df.empty or fid not in base_df.columns:
+            # Keep a single blank column if the configured field does not exist yet.
+            fr2 = dict(fr)
+            fr2["alias"] = "Product Image 01"
+            fr2["output_key"] = unique_output_key("Product Image 01")
+            fr2["__image_source_field_id"] = fid
+            fr2["__image_index"] = 0
+            out.append(fr2)
+            continue
+
+        lists = base_df[fid].apply(_safe_json_list_loads)
+        real_max = min(max_images, max([len(x) for x in lists.tolist()] + [0]))
+
+        if real_max <= 0:
+            real_max = 1
+
+        for i in range(real_max):
+            fr2 = dict(fr)
+            fr2["alias"] = f"Product Image {i + 1:02d}"
+            fr2["output_key"] = unique_output_key(fr2["alias"])
+            fr2["field_type"] = "RAW"
+            fr2["expr"] = ""
+            fr2["__image_source_field_id"] = fid
+            fr2["__image_index"] = i
+            out.append(fr2)
+
+    return out
+
+
 def _norm_bool(x) -> bool:
     s = _safe_str(x).upper()
     return s in ("TRUE", "1", "YES", "Y", "ON")
@@ -1101,7 +1212,14 @@ def build_and_write_view(
     if base_key_field_id and base_key_field_id not in base_df.columns:
         raise ValueError(f"view_id={view_id} 的 base_key_field_id 在 base_df 中不存在：{base_key_field_id}")
 
-    field_rows = _prepare_field_rows(vf)
+    field_rows_raw = _prepare_field_rows(vf)
+
+    # Keep IDX as raw JSON/list columns. Expand image lists only in this final view builder.
+    field_rows = _expand_image_field_rows_for_output(
+        field_rows_raw,
+        base_df,
+        max_images=50,
+    )
 
     output_keys = [fr["output_key"] for fr in field_rows]
     display_headers_raw = [fr["alias"] or fr["field_id"] or fr["output_key"] for fr in field_rows]
@@ -1117,7 +1235,12 @@ def build_and_write_view(
             output_key = fr["output_key"]
             fid = _safe_str(fr.get("field_id"))
 
-            if field_type == "CALC" and _safe_str(fr["expr"]).startswith("="):
+            if "__image_source_field_id" in fr:
+                src_fid = _safe_str(fr.get("__image_source_field_id"))
+                img_idx = int(fr.get("__image_index") or 0)
+                arr = _safe_json_list_loads(base_row.get(src_fid, ""))
+                one[output_key] = arr[img_idx] if img_idx < len(arr) else ""
+            elif field_type == "CALC" and _safe_str(fr["expr"]).startswith("="):
                 one[output_key] = ""
             else:
                 one[output_key] = _as_scalar(base_row.get(fid, "")) if fid else ""
@@ -1161,6 +1284,8 @@ def build_and_write_view(
 
     formula_cols = []
     for i, fr in enumerate(field_rows, start=1):
+        if "__image_source_field_id" in fr:
+            continue
         expr = _safe_str(fr["expr"])
         field_type = _safe_str(fr["field_type"]).upper()
         if field_type == "CALC" and expr.startswith("="):
