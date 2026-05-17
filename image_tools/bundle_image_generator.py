@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import base64
@@ -40,10 +41,10 @@ REQUIRED_INPUT_COLUMNS = [
 REQUIRED_TEMPLATE_COLUMNS = [
     "template_no",
     "template_name",
-    "template_display_name",
 ]
 
 OPTIONAL_TEMPLATE_COLUMNS = [
+    "template_display_name",
     "template_desc",
     "视觉特征",
     "qty_1_desc",
@@ -67,7 +68,7 @@ TYPE_TO_QUANTITIES = {
     "30": [1, 2, 5, 10, 20, 30],
 }
 
-REGISTERED_TEMPLATE_NAMES = [
+BUILTIN_TEMPLATE_NAMES = [
     "big_top_left_grid",
     "mixed_knob_grid",
     "round_drain_grid",
@@ -83,19 +84,7 @@ REGISTERED_TEMPLATE_NAMES = [
 
 VIEW_KEYS = ["image", "front", "angle", "side"]
 
-# =========================
-# Scale defaults
-# =========================
-#
-# 这块是为 Colab 调试设计的。
-# Colab 可以传入 scale_config 覆盖这些值，无需每次改 py。
-#
-# 层级：
-# 1. global.sprite_max_fill：素材进入模板前，在 1000x1000 透明画布里最多占多少
-# 2. global.render_scale：所有模板最终整体放大/缩小
-# 3. templates.<template_name>.template_scale：某个模板整体放大/缩小
-# 4. templates.<template_name>.single/hero/small/dense：某模板里不同用途的图大小
-#
+
 DEFAULT_SCALE_CONFIG: Dict[str, Any] = {
     "global": {
         "sprite_canvas_size": 1000,
@@ -114,78 +103,78 @@ DEFAULT_SCALE_CONFIG: Dict[str, Any] = {
             "template_scale": 1.00,
             "single": 0.98,
             "hero": 0.92,
-            "small": 0.88,
-            "dense": 0.86,
+            "small": 0.90,
+            "dense": 0.88,
         },
         "mixed_knob_grid": {
             "template_scale": 1.00,
             "single": 0.96,
             "hero": 0.90,
-            "small": 0.94,
-            "dense": 0.94,
+            "small": 1.00,
+            "dense": 1.00,
         },
         "round_drain_grid": {
             "template_scale": 1.00,
             "single": 0.96,
             "hero": 0.90,
-            "small": 0.90,
-            "dense": 0.88,
+            "small": 0.92,
+            "dense": 0.90,
         },
         "square_drain_grid": {
             "template_scale": 1.00,
             "single": 0.96,
             "hero": 0.90,
-            "small": 0.88,
-            "dense": 0.86,
+            "small": 0.92,
+            "dense": 0.90,
         },
         "elbow_mixed_grid": {
             "template_scale": 1.00,
             "single": 0.98,
             "hero": 0.92,
-            "small": 0.90,
-            "dense": 0.88,
+            "small": 0.92,
+            "dense": 0.90,
         },
         "round_strainer_mix": {
             "template_scale": 1.00,
             "single": 0.96,
             "hero": 0.90,
-            "small": 0.88,
-            "dense": 0.86,
+            "small": 0.90,
+            "dense": 0.88,
         },
         "big_bottom_center_grid": {
             "template_scale": 1.00,
             "single": 0.98,
             "hero": 0.94,
-            "small": 0.88,
-            "dense": 0.86,
+            "small": 0.90,
+            "dense": 0.88,
         },
         "coil_grid": {
             "template_scale": 1.00,
             "single": 0.95,
             "hero": 0.88,
-            "small": 0.86,
-            "dense": 0.84,
+            "small": 0.88,
+            "dense": 0.86,
         },
         "horizontal_plus_small_grid": {
             "template_scale": 1.00,
             "single": 0.96,
             "hero": 0.90,
-            "small": 0.88,
-            "dense": 0.86,
+            "small": 0.90,
+            "dense": 0.88,
         },
         "horizontal_dense_grid": {
             "template_scale": 1.00,
             "single": 0.96,
             "hero": 0.88,
-            "small": 0.90,
-            "dense": 0.90,
+            "small": 0.92,
+            "dense": 0.92,
         },
         "vertical_big_bottom_grid": {
             "template_scale": 1.00,
             "single": 0.98,
             "hero": 0.94,
-            "small": 0.88,
-            "dense": 0.86,
+            "small": 0.90,
+            "dense": 0.88,
         },
     },
 }
@@ -202,9 +191,8 @@ class Placement:
     y: float
     w: float
     h: float
-    role: str = "small"  # single / hero / small / dense
     anchor: str = "center"
-    scale: Optional[float] = None  # optional local override
+    scale: float = 1.0
 
 
 @dataclass
@@ -217,16 +205,47 @@ class TemplateSpec:
 # Utility
 # =========================
 
-def deep_merge(base: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if not override:
-        return json.loads(json.dumps(base))
+def deep_merge_dict(base: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     result = json.loads(json.dumps(base))
-    for k, v in override.items():
-        if isinstance(v, dict) and isinstance(result.get(k), dict):
-            result[k] = deep_merge(result[k], v)
-        else:
-            result[k] = v
-    return result
+    if not override:
+        return result
+
+    def merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+        for k, v in b.items():
+            if isinstance(v, dict) and isinstance(a.get(k), dict):
+                merge(a[k], v)
+            else:
+                a[k] = v
+        return a
+
+    return merge(result, override)
+
+
+def get_scale_config(scale_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return deep_merge_dict(DEFAULT_SCALE_CONFIG, scale_config)
+
+
+def get_global_scale_value(scale_config: Optional[Dict[str, Any]], key: str, default: Any) -> Any:
+    cfg = get_scale_config(scale_config)
+    return cfg.get("global", {}).get(key, default)
+
+
+def get_template_scales(template_name: str, scale_config: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
+    cfg = get_scale_config(scale_config)
+    defaults = cfg.get("template_defaults", {})
+    tmpl = cfg.get("templates", {}).get(template_name, {})
+
+    template_scale = float(tmpl.get("template_scale", defaults.get("template_scale", 1.0)))
+
+    def value(role: str, fallback: float) -> float:
+        return float(tmpl.get(role, defaults.get(role, fallback))) * template_scale
+
+    return {
+        "single": value("single", 0.96),
+        "hero": value("hero", 0.90),
+        "small": value("small", 0.90),
+        "dense": value("dense", 0.90),
+    }
 
 
 def normalize_header(value: Any) -> str:
@@ -266,14 +285,22 @@ def hash_url(url: str) -> str:
 
 
 def parse_service_account_secret(secret_value: str) -> dict:
+    """
+    Supports:
+    1. Raw JSON string
+    2. Base64 encoded JSON string
+    """
     secret_value = secret_value.strip()
+
     if secret_value.startswith("{"):
         return json.loads(secret_value)
+
     decoded = base64.b64decode(secret_value).decode("utf-8")
     return json.loads(decoded)
 
 
 def normalize_template_key(value: Any) -> str:
+    """Normalize template_no / Type values from Sheets, including 1.0 -> 1."""
     value = clean_cell(value)
     if not value:
         return ""
@@ -285,21 +312,6 @@ def normalize_template_key(value: Any) -> str:
 def is_numeric_like(value: str) -> bool:
     value = clean_cell(value)
     return bool(re.fullmatch(r"\d+(?:\.0+)?", value))
-
-
-def get_template_scale_cfg(scale_cfg: Dict[str, Any], template_name: str) -> Dict[str, float]:
-    defaults = scale_cfg.get("template_defaults", {})
-    tmpl = scale_cfg.get("templates", {}).get(template_name, {})
-    merged = {**defaults, **tmpl}
-    # template_scale multiplies all role scales.
-    ts = float(merged.get("template_scale", 1.0))
-    return {
-        "template_scale": ts,
-        "single": float(merged.get("single", 1.0)) * ts,
-        "hero": float(merged.get("hero", 1.0)) * ts,
-        "small": float(merged.get("small", 1.0)) * ts,
-        "dense": float(merged.get("dense", 1.0)) * ts,
-    }
 
 
 # =========================
@@ -330,8 +342,11 @@ def read_google_sheet_tabs(
     input_ws = sh.worksheet(input_tab)
     template_ws = sh.worksheet(template_tab)
 
-    input_df = values_to_df(input_ws.get_all_values(), input_tab)
-    template_df = values_to_df(template_ws.get_all_values(), template_tab)
+    input_values = input_ws.get_all_values()
+    template_values = template_ws.get_all_values()
+
+    input_df = values_to_df(input_values, input_tab)
+    template_df = values_to_df(template_values, template_tab)
 
     return input_df, template_df
 
@@ -437,7 +452,7 @@ def crop_to_content(
 ) -> Image.Image:
     img = img.convert("RGBA")
     alpha = img.getchannel("A")
-    bbox = alpha.point(lambda p: 255 if p > alpha_threshold else 0).getbbox()
+    bbox = alpha.point(lambda px: 255 if px > alpha_threshold else 0).getbbox()
 
     if not bbox:
         return img
@@ -468,6 +483,10 @@ def normalize_sprite_canvas(
     canvas_size: int = 1000,
     max_fill: float = 0.82,
 ) -> Image.Image:
+    """
+    Normalize every product source into the same transparent canvas.
+    Size tuning should mostly happen through SCALE_CONFIG, not by changing template code.
+    """
     img = img.convert("RGBA")
 
     if img.width <= 0 or img.height <= 0:
@@ -562,14 +581,11 @@ def build_view_images(
     white_threshold: int = 246,
     scale_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Image.Image], Dict[str, str]]:
-    cfg = deep_merge(DEFAULT_SCALE_CONFIG, scale_config)
-    global_cfg = cfg.get("global", {})
-
-    sprite_canvas_size = int(global_cfg.get("sprite_canvas_size", 1000))
-    sprite_max_fill = float(global_cfg.get("sprite_max_fill", 0.82))
-
     images: Dict[str, Image.Image] = {}
     source_paths: Dict[str, str] = {}
+
+    sprite_canvas_size = int(get_global_scale_value(scale_config, "sprite_canvas_size", 1000))
+    sprite_max_fill = float(get_global_scale_value(scale_config, "sprite_max_fill", 0.82))
 
     for view, url in url_map.items():
         path = download_image(url, cache_dir=cache_dir)
@@ -579,7 +595,6 @@ def build_view_images(
             remove_bg=remove_bg,
             white_threshold=white_threshold,
         )
-
         img = normalize_sprite_canvas(
             img,
             canvas_size=sprite_canvas_size,
@@ -602,301 +617,478 @@ def p(
     y: float,
     w: float,
     h: float,
-    role: str = "small",
-    scale: Optional[float] = None,
+    scale: float = 1.0,
 ) -> Placement:
-    return Placement(view=view, x=x, y=y, w=w, h=h, role=role, scale=scale)
+    return Placement(view=view, x=x, y=y, w=w, h=h, scale=scale)
 
 
-def spec(name: str, q: Dict[int, List[Placement]]) -> TemplateSpec:
-    return TemplateSpec(template_name=name, quantity_to_placements=q)
+def spec(template_name: str, q: Dict[int, List[Placement]]) -> TemplateSpec:
+    return TemplateSpec(template_name=template_name, quantity_to_placements=q)
 
 
 def grid_area(
     count: int,
     cols: int,
     rows: int,
-    x0: float,
-    y0: float,
-    x1: float,
-    y1: float,
+    left: float,
+    top: float,
+    right: float,
+    bottom: float,
     view: str,
-    role: str = "small",
-    fill: float = 0.95,
+    fill: float = 0.92,
+    scale: float = 1.0,
 ) -> List[Placement]:
+    """
+    Build a regular grid in percentage coordinates.
+    count can be less than rows*cols.
+    """
+    if count <= 0:
+        return []
+
     if cols <= 0 or rows <= 0:
         raise ValueError("cols and rows must be positive")
 
-    placements: List[Placement] = []
-    cell_w = (x1 - x0) / cols
-    cell_h = (y1 - y0) / rows
+    width = max(0.001, right - left)
+    height = max(0.001, bottom - top)
+    cell_w = width / cols
+    cell_h = height / rows
 
+    placements: List[Placement] = []
     for i in range(count):
-        if i >= cols * rows:
-            break
         r = i // cols
         c = i % cols
-        cx = x0 + cell_w * (c + 0.5)
-        cy = y0 + cell_h * (r + 0.5)
+        if r >= rows:
+            break
+
+        x = left + cell_w * (c + 0.5)
+        y = top + cell_h * (r + 0.5)
         placements.append(
             p(
                 view=view,
-                x=cx,
-                y=cy,
+                x=x,
+                y=y,
                 w=cell_w * fill,
                 h=cell_h * fill,
-                role=role,
+                scale=scale,
             )
         )
 
     return placements
 
 
-def diagonal_pair(view_a: str = "front", view_b: str = "angle") -> List[Placement]:
-    return [
-        p(view_a, 0.38, 0.50, 0.54, 0.54, role="hero"),
-        p(view_b, 0.62, 0.50, 0.54, 0.54, role="hero"),
-    ]
-
-
-def standard_grid_hero_template(
-    name: str,
-    small_view: str = "front",
-    hero_view: str = "angle",
-    hero_side: str = "right",
-) -> TemplateSpec:
-    """
-    通用 grid + hero 模板。
-    适合大部分 SPU 图：
-    - 1pcs：单个大图
-    - 2pcs：两个大图
-    - 5pcs：4小 + 1大
-    - 10pcs：8小 + 2大
-    - 20pcs：18小 + 2大
-    - 30pcs：28小 + 2大
-
-    具体大小不在模板坐标里调，而在 Colab scale_config 里调。
-    """
-    q: Dict[int, List[Placement]] = {}
-
-    q[1] = [p("image", 0.50, 0.50, 0.86, 0.86, role="single")]
-    q[2] = diagonal_pair(small_view, hero_view)
-
-    if hero_side == "right":
-        q[5] = [
-            *grid_area(4, 2, 2, 0.08, 0.18, 0.48, 0.82, small_view, role="small", fill=1.00),
-            p(hero_view, 0.74, 0.52, 0.54, 0.54, role="hero"),
-        ]
-
-        q[10] = [
-            *grid_area(8, 2, 4, 0.07, 0.12, 0.46, 0.88, small_view, role="small", fill=1.00),
-            p(hero_view, 0.74, 0.34, 0.44, 0.44, role="hero"),
-            p(hero_view, 0.76, 0.70, 0.44, 0.44, role="hero"),
-        ]
-
-        q[20] = [
-            *grid_area(18, 4, 5, 0.05, 0.10, 0.66, 0.90, small_view, role="dense", fill=1.00),
-            p(hero_view, 0.82, 0.34, 0.36, 0.36, role="hero"),
-            p(hero_view, 0.82, 0.70, 0.36, 0.36, role="hero"),
-        ]
-
-        q[30] = [
-            *grid_area(28, 5, 6, 0.04, 0.08, 0.70, 0.92, small_view, role="dense", fill=1.00),
-            p(hero_view, 0.84, 0.34, 0.32, 0.32, role="hero"),
-            p(hero_view, 0.84, 0.70, 0.32, 0.32, role="hero"),
-        ]
-
-    elif hero_side == "bottom":
-        q[5] = [
-            *grid_area(4, 4, 1, 0.14, 0.12, 0.86, 0.38, small_view, role="small", fill=1.00),
-            p(hero_view, 0.50, 0.70, 0.58, 0.42, role="hero"),
-        ]
-
-        q[10] = [
-            *grid_area(8, 4, 2, 0.10, 0.08, 0.90, 0.48, small_view, role="small", fill=1.00),
-            p(hero_view, 0.37, 0.75, 0.42, 0.34, role="hero"),
-            p(hero_view, 0.64, 0.75, 0.42, 0.34, role="hero"),
-        ]
-
-        q[20] = [
-            *grid_area(18, 6, 3, 0.08, 0.06, 0.92, 0.62, small_view, role="dense", fill=1.00),
-            p(hero_view, 0.36, 0.82, 0.34, 0.26, role="hero"),
-            p(hero_view, 0.64, 0.82, 0.34, 0.26, role="hero"),
-        ]
-
-        q[30] = [
-            *grid_area(28, 7, 4, 0.06, 0.05, 0.94, 0.70, small_view, role="dense", fill=1.00),
-            p(hero_view, 0.36, 0.86, 0.30, 0.22, role="hero"),
-            p(hero_view, 0.64, 0.86, 0.30, 0.22, role="hero"),
-        ]
-
-    else:
-        raise ValueError(f"Unsupported hero_side: {hero_side}")
-
-    return spec(name, q)
-
-
-def horizontal_dense_template(name: str, small_view: str = "front") -> TemplateSpec:
-    q: Dict[int, List[Placement]] = {}
-    q[1] = [p("image", 0.50, 0.50, 0.86, 0.86, role="single")]
-    q[2] = [
-        p(small_view, 0.35, 0.50, 0.48, 0.48, role="hero"),
-        p(small_view, 0.65, 0.50, 0.48, 0.48, role="hero"),
-    ]
-    q[5] = grid_area(5, 5, 1, 0.08, 0.30, 0.92, 0.70, small_view, role="small", fill=1.00)
-    q[10] = grid_area(10, 5, 2, 0.07, 0.20, 0.93, 0.80, small_view, role="small", fill=1.00)
-    q[20] = grid_area(20, 5, 4, 0.06, 0.10, 0.94, 0.90, small_view, role="dense", fill=1.00)
-    q[30] = grid_area(30, 6, 5, 0.05, 0.08, 0.95, 0.92, small_view, role="dense", fill=1.00)
-    return spec(name, q)
-
-
-def vertical_big_bottom_template(name: str, small_view: str = "front", hero_view: str = "angle") -> TemplateSpec:
-    return standard_grid_hero_template(
-        name=name,
-        small_view=small_view,
-        hero_view=hero_view,
-        hero_side="bottom",
-    )
+def role_scales(template_name: str, scale_config: Optional[Dict[str, Any]] = None) -> Tuple[float, float, float, float]:
+    s = get_template_scales(template_name, scale_config)
+    return s["single"], s["hero"], s["small"], s["dense"]
 
 
 # =========================
 # Templates
 # =========================
 
-def make_big_top_left_grid_template() -> TemplateSpec:
+def make_big_top_left_grid_template(scale_config: Optional[Dict[str, Any]] = None) -> TemplateSpec:
+    name = "big_top_left_grid"
+    SINGLE, HERO, SMALL, DENSE = role_scales(name, scale_config)
     q: Dict[int, List[Placement]] = {}
 
-    q[1] = [p("image", 0.50, 0.50, 0.86, 0.86, role="single")]
+    q[1] = [p("image", 0.50, 0.50, 0.86, 0.86, scale=SINGLE)]
 
     q[2] = [
-        p("angle", 0.38, 0.35, 0.54, 0.42, role="hero"),
-        p("angle", 0.62, 0.66, 0.54, 0.42, role="hero"),
+        p("angle", 0.38, 0.50, 0.54, 0.54, scale=HERO),
+        p("angle", 0.63, 0.50, 0.54, 0.54, scale=HERO),
     ]
 
     q[5] = [
-        p("front", 0.50, 0.18, 0.72, 0.25, role="hero"),
-        *grid_area(4, 2, 2, 0.18, 0.36, 0.82, 0.90, "front", role="small", fill=1.00),
+        p("angle", 0.34, 0.34, 0.48, 0.48, scale=HERO),
+        *grid_area(4, 2, 2, 0.52, 0.20, 0.92, 0.82, "front", fill=1.0, scale=SMALL),
     ]
 
     q[10] = [
-        *grid_area(8, 2, 4, 0.10, 0.10, 0.60, 0.90, "front", role="small", fill=1.00),
-        p("side", 0.82, 0.34, 0.34, 0.38, role="hero"),
-        p("side", 0.82, 0.70, 0.34, 0.38, role="hero"),
+        p("angle", 0.28, 0.30, 0.44, 0.44, scale=HERO),
+        p("side", 0.28, 0.70, 0.44, 0.44, scale=HERO),
+        *grid_area(8, 2, 4, 0.50, 0.10, 0.92, 0.90, "front", fill=1.0, scale=SMALL),
     ]
 
     q[20] = [
-        *grid_area(18, 3, 6, 0.08, 0.07, 0.62, 0.93, "front", role="dense", fill=1.00),
-        p("side", 0.82, 0.32, 0.34, 0.36, role="hero"),
-        p("side", 0.82, 0.70, 0.34, 0.36, role="hero"),
+        p("side", 0.82, 0.34, 0.36, 0.36, scale=HERO),
+        p("side", 0.82, 0.70, 0.36, 0.36, scale=HERO),
+        *grid_area(18, 4, 5, 0.05, 0.08, 0.66, 0.92, "front", fill=1.0, scale=DENSE),
     ]
 
     q[30] = [
-        p("angle", 0.25, 0.18, 0.38, 0.28, role="hero"),
-        *grid_area(29, 5, 6, 0.08, 0.34, 0.92, 0.94, "front", role="dense", fill=1.00),
+        p("angle", 0.20, 0.20, 0.38, 0.38, scale=HERO),
+        p("side", 0.82, 0.34, 0.32, 0.32, scale=HERO),
+        p("side", 0.82, 0.70, 0.32, 0.32, scale=HERO),
+        *grid_area(27, 5, 6, 0.05, 0.38, 0.70, 0.94, "front", fill=1.0, scale=DENSE),
+    ]
+    q[30] = q[30][:30]
+
+    return spec(name, q)
+
+
+def make_mixed_knob_grid_template(scale_config: Optional[Dict[str, Any]] = None) -> TemplateSpec:
+    name = "mixed_knob_grid"
+    SINGLE, HERO, SMALL, DENSE = role_scales(name, scale_config)
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.86, 0.86, scale=SINGLE)]
+
+    q[2] = [
+        p("front", 0.38, 0.52, 0.54, 0.54, scale=HERO),
+        p("angle", 0.64, 0.52, 0.54, 0.54, scale=HERO),
     ]
 
-    return spec("big_top_left_grid", q)
+    q[5] = [
+        *grid_area(4, 2, 2, 0.08, 0.18, 0.48, 0.82, "front", fill=1.0, scale=SMALL),
+        p("angle", 0.74, 0.52, 0.54, 0.54, scale=HERO),
+    ]
+
+    q[10] = [
+        *grid_area(8, 2, 4, 0.07, 0.12, 0.46, 0.88, "front", fill=1.0, scale=SMALL),
+        p("angle", 0.74, 0.34, 0.44, 0.44, scale=HERO),
+        p("angle", 0.76, 0.70, 0.44, 0.44, scale=HERO),
+    ]
+
+    q[20] = [
+        *grid_area(18, 4, 5, 0.05, 0.10, 0.66, 0.90, "front", fill=1.0, scale=DENSE),
+        p("angle", 0.82, 0.34, 0.36, 0.36, scale=HERO),
+        p("angle", 0.82, 0.70, 0.36, 0.36, scale=HERO),
+    ]
+
+    q[30] = [
+        *grid_area(28, 5, 6, 0.04, 0.08, 0.70, 0.92, "front", fill=1.0, scale=DENSE),
+        p("angle", 0.84, 0.34, 0.32, 0.32, scale=HERO),
+        p("angle", 0.84, 0.70, 0.32, 0.32, scale=HERO),
+    ]
+
+    return spec(name, q)
 
 
-def make_mixed_knob_grid_template() -> TemplateSpec:
-    return standard_grid_hero_template(
-        name="mixed_knob_grid",
-        small_view="front",
-        hero_view="angle",
-        hero_side="right",
-    )
+def make_square_drain_grid_template(scale_config: Optional[Dict[str, Any]] = None) -> TemplateSpec:
+    name = "square_drain_grid"
+    SINGLE, HERO, SMALL, DENSE = role_scales(name, scale_config)
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.86, 0.86, scale=SINGLE)]
+
+    q[2] = [
+        p("image", 0.36, 0.50, 0.52, 0.52, scale=HERO),
+        p("image", 0.64, 0.50, 0.52, 0.52, scale=HERO),
+    ]
+
+    q[5] = [
+        p("image", 0.50, 0.25, 0.52, 0.36, scale=HERO),
+        *grid_area(4, 4, 1, 0.12, 0.55, 0.88, 0.86, "image", fill=1.0, scale=SMALL),
+    ]
+
+    q[10] = [
+        p("image", 0.50, 0.22, 0.54, 0.32, scale=HERO),
+        *grid_area(9, 3, 3, 0.16, 0.43, 0.84, 0.90, "image", fill=1.0, scale=SMALL),
+    ]
+
+    q[20] = [
+        p("image", 0.50, 0.18, 0.46, 0.25, scale=HERO),
+        *grid_area(19, 5, 4, 0.08, 0.34, 0.92, 0.92, "image", fill=1.0, scale=DENSE),
+    ]
+    q[20] = q[20][:20]
+
+    q[30] = [
+        p("image", 0.50, 0.14, 0.42, 0.22, scale=HERO),
+        *grid_area(29, 6, 5, 0.06, 0.28, 0.94, 0.94, "image", fill=1.0, scale=DENSE),
+    ]
+    q[30] = q[30][:30]
+
+    return spec(name, q)
 
 
-def make_round_drain_grid_template() -> TemplateSpec:
-    return standard_grid_hero_template(
-        name="round_drain_grid",
-        small_view="front",
-        hero_view="image",
-        hero_side="right",
-    )
+def make_round_drain_grid_template(scale_config: Optional[Dict[str, Any]] = None) -> TemplateSpec:
+    name = "round_drain_grid"
+    SINGLE, HERO, SMALL, DENSE = role_scales(name, scale_config)
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.84, 0.84, scale=SINGLE)]
+
+    q[2] = [
+        p("image", 0.38, 0.50, 0.52, 0.52, scale=HERO),
+        p("image", 0.62, 0.50, 0.52, 0.52, scale=HERO),
+    ]
+
+    q[5] = [
+        p("image", 0.72, 0.50, 0.52, 0.52, scale=HERO),
+        *grid_area(4, 2, 2, 0.08, 0.20, 0.48, 0.82, "image", fill=1.0, scale=SMALL),
+    ]
+
+    q[10] = [
+        *grid_area(10, 5, 2, 0.08, 0.20, 0.92, 0.80, "image", fill=1.0, scale=SMALL),
+    ]
+
+    q[20] = [
+        *grid_area(20, 5, 4, 0.06, 0.12, 0.94, 0.88, "image", fill=1.0, scale=DENSE),
+    ]
+
+    q[30] = [
+        *grid_area(30, 6, 5, 0.05, 0.10, 0.95, 0.90, "image", fill=1.0, scale=DENSE),
+    ]
+
+    return spec(name, q)
 
 
-def make_square_drain_grid_template() -> TemplateSpec:
-    return standard_grid_hero_template(
-        name="square_drain_grid",
-        small_view="front",
-        hero_view="image",
-        hero_side="right",
-    )
+def make_elbow_mixed_grid_template(scale_config: Optional[Dict[str, Any]] = None) -> TemplateSpec:
+    name = "elbow_mixed_grid"
+    SINGLE, HERO, SMALL, DENSE = role_scales(name, scale_config)
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("angle", 0.50, 0.50, 0.86, 0.86, scale=SINGLE)]
+
+    q[2] = [
+        p("angle", 0.38, 0.46, 0.54, 0.54, scale=HERO),
+        p("side", 0.64, 0.58, 0.54, 0.54, scale=HERO),
+    ]
+
+    q[5] = [
+        p("angle", 0.30, 0.50, 0.58, 0.58, scale=HERO),
+        *grid_area(4, 2, 2, 0.52, 0.20, 0.92, 0.82, "front", fill=1.0, scale=SMALL),
+    ]
+
+    q[10] = [
+        p("angle", 0.78, 0.50, 0.46, 0.46, scale=HERO),
+        *grid_area(9, 3, 3, 0.06, 0.14, 0.58, 0.86, "front", fill=1.0, scale=SMALL),
+    ]
+
+    q[20] = [
+        p("angle", 0.82, 0.34, 0.36, 0.36, scale=HERO),
+        p("side", 0.82, 0.70, 0.36, 0.36, scale=HERO),
+        *grid_area(18, 4, 5, 0.05, 0.09, 0.66, 0.91, "front", fill=1.0, scale=DENSE),
+    ]
+
+    q[30] = [
+        p("angle", 0.83, 0.32, 0.32, 0.32, scale=HERO),
+        p("side", 0.83, 0.70, 0.32, 0.32, scale=HERO),
+        *grid_area(28, 5, 6, 0.04, 0.08, 0.70, 0.92, "front", fill=1.0, scale=DENSE),
+    ]
+
+    return spec(name, q)
 
 
-def make_elbow_mixed_grid_template() -> TemplateSpec:
-    return standard_grid_hero_template(
-        name="elbow_mixed_grid",
-        small_view="angle",
-        hero_view="side",
-        hero_side="right",
-    )
+def make_round_strainer_mix_template(scale_config: Optional[Dict[str, Any]] = None) -> TemplateSpec:
+    name = "round_strainer_mix"
+    SINGLE, HERO, SMALL, DENSE = role_scales(name, scale_config)
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.86, 0.86, scale=SINGLE)]
+
+    q[2] = [
+        p("front", 0.40, 0.50, 0.54, 0.54, scale=HERO),
+        p("angle", 0.62, 0.50, 0.54, 0.54, scale=HERO),
+    ]
+
+    q[5] = [
+        p("angle", 0.50, 0.32, 0.52, 0.38, scale=HERO),
+        *grid_area(4, 4, 1, 0.12, 0.58, 0.88, 0.86, "front", fill=1.0, scale=SMALL),
+    ]
+
+    q[10] = [
+        p("angle", 0.76, 0.50, 0.42, 0.42, scale=HERO),
+        *grid_area(9, 3, 3, 0.08, 0.15, 0.58, 0.85, "front", fill=1.0, scale=SMALL),
+    ]
+
+    q[20] = [
+        *grid_area(20, 5, 4, 0.06, 0.12, 0.94, 0.88, "front", fill=1.0, scale=DENSE),
+    ]
+
+    q[30] = [
+        *grid_area(30, 6, 5, 0.05, 0.10, 0.95, 0.90, "front", fill=1.0, scale=DENSE),
+    ]
+
+    return spec(name, q)
 
 
-def make_round_strainer_mix_template() -> TemplateSpec:
-    return standard_grid_hero_template(
-        name="round_strainer_mix",
-        small_view="front",
-        hero_view="angle",
-        hero_side="right",
-    )
+def make_big_bottom_center_grid_template(scale_config: Optional[Dict[str, Any]] = None) -> TemplateSpec:
+    name = "big_bottom_center_grid"
+    SINGLE, HERO, SMALL, DENSE = role_scales(name, scale_config)
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.86, 0.86, scale=SINGLE)]
+
+    q[2] = [
+        p("image", 0.38, 0.48, 0.54, 0.54, scale=HERO),
+        p("image", 0.62, 0.56, 0.54, 0.54, scale=HERO),
+    ]
+
+    q[5] = [
+        *grid_area(4, 4, 1, 0.12, 0.12, 0.88, 0.38, "front", fill=1.0, scale=SMALL),
+        p("angle", 0.50, 0.66, 0.62, 0.52, scale=HERO),
+    ]
+
+    q[10] = [
+        *grid_area(8, 4, 2, 0.10, 0.10, 0.90, 0.48, "front", fill=1.0, scale=SMALL),
+        p("angle", 0.38, 0.74, 0.42, 0.36, scale=HERO),
+        p("side", 0.66, 0.74, 0.42, 0.36, scale=HERO),
+    ]
+
+    q[20] = [
+        *grid_area(18, 6, 3, 0.06, 0.08, 0.94, 0.56, "front", fill=1.0, scale=DENSE),
+        p("angle", 0.38, 0.78, 0.36, 0.30, scale=HERO),
+        p("side", 0.66, 0.78, 0.36, 0.30, scale=HERO),
+    ]
+
+    q[30] = [
+        *grid_area(28, 7, 4, 0.05, 0.06, 0.95, 0.66, "front", fill=1.0, scale=DENSE),
+        p("angle", 0.38, 0.84, 0.32, 0.26, scale=HERO),
+        p("side", 0.66, 0.84, 0.32, 0.26, scale=HERO),
+    ]
+
+    return spec(name, q)
 
 
-def make_big_bottom_center_grid_template() -> TemplateSpec:
-    return standard_grid_hero_template(
-        name="big_bottom_center_grid",
-        small_view="front",
-        hero_view="image",
-        hero_side="bottom",
-    )
+def make_coil_grid_template(scale_config: Optional[Dict[str, Any]] = None) -> TemplateSpec:
+    name = "coil_grid"
+    SINGLE, HERO, SMALL, DENSE = role_scales(name, scale_config)
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.84, 0.84, scale=SINGLE)]
+
+    q[2] = [
+        p("image", 0.36, 0.50, 0.54, 0.54, scale=HERO),
+        p("image", 0.64, 0.50, 0.54, 0.54, scale=HERO),
+    ]
+
+    q[5] = [
+        p("image", 0.50, 0.50, 0.56, 0.56, scale=HERO),
+        *grid_area(4, 2, 2, 0.08, 0.12, 0.92, 0.88, "image", fill=0.80, scale=SMALL),
+    ]
+
+    q[10] = [
+        *grid_area(10, 5, 2, 0.08, 0.18, 0.92, 0.82, "image", fill=0.95, scale=SMALL),
+    ]
+
+    q[20] = [
+        *grid_area(20, 5, 4, 0.06, 0.10, 0.94, 0.90, "image", fill=0.95, scale=DENSE),
+    ]
+
+    q[30] = [
+        *grid_area(30, 6, 5, 0.05, 0.08, 0.95, 0.92, "image", fill=0.95, scale=DENSE),
+    ]
+
+    return spec(name, q)
 
 
-def make_coil_grid_template() -> TemplateSpec:
-    return horizontal_dense_template(
-        name="coil_grid",
-        small_view="image",
-    )
+def make_horizontal_plus_small_grid_template(scale_config: Optional[Dict[str, Any]] = None) -> TemplateSpec:
+    name = "horizontal_plus_small_grid"
+    SINGLE, HERO, SMALL, DENSE = role_scales(name, scale_config)
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.88, 0.62, scale=SINGLE)]
+
+    q[2] = [
+        p("image", 0.50, 0.36, 0.80, 0.40, scale=HERO),
+        p("image", 0.50, 0.66, 0.80, 0.40, scale=HERO),
+    ]
+
+    q[5] = [
+        p("image", 0.50, 0.28, 0.82, 0.36, scale=HERO),
+        *grid_area(4, 4, 1, 0.12, 0.56, 0.88, 0.86, "image", fill=1.0, scale=SMALL),
+    ]
+
+    q[10] = [
+        p("image", 0.50, 0.20, 0.78, 0.28, scale=HERO),
+        *grid_area(9, 3, 3, 0.14, 0.38, 0.86, 0.90, "image", fill=1.0, scale=SMALL),
+    ]
+
+    q[20] = [
+        p("image", 0.50, 0.16, 0.72, 0.22, scale=HERO),
+        *grid_area(19, 5, 4, 0.06, 0.32, 0.94, 0.92, "image", fill=1.0, scale=DENSE),
+    ]
+    q[20] = q[20][:20]
+
+    q[30] = [
+        p("image", 0.50, 0.12, 0.70, 0.20, scale=HERO),
+        *grid_area(29, 6, 5, 0.05, 0.26, 0.95, 0.94, "image", fill=1.0, scale=DENSE),
+    ]
+    q[30] = q[30][:30]
+
+    return spec(name, q)
 
 
-def make_horizontal_plus_small_grid_template() -> TemplateSpec:
-    return standard_grid_hero_template(
-        name="horizontal_plus_small_grid",
-        small_view="front",
-        hero_view="image",
-        hero_side="bottom",
-    )
+def make_horizontal_dense_grid_template(scale_config: Optional[Dict[str, Any]] = None) -> TemplateSpec:
+    name = "horizontal_dense_grid"
+    SINGLE, HERO, SMALL, DENSE = role_scales(name, scale_config)
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.88, 0.62, scale=SINGLE)]
+
+    q[2] = [
+        p("image", 0.32, 0.50, 0.54, 0.48, scale=HERO),
+        p("image", 0.68, 0.50, 0.54, 0.48, scale=HERO),
+    ]
+
+    q[5] = [*grid_area(5, 5, 1, 0.06, 0.28, 0.94, 0.72, "image", fill=1.0, scale=SMALL)]
+    q[10] = [*grid_area(10, 5, 2, 0.06, 0.18, 0.94, 0.82, "image", fill=1.0, scale=SMALL)]
+    q[20] = [*grid_area(20, 5, 4, 0.06, 0.10, 0.94, 0.90, "image", fill=1.0, scale=DENSE)]
+    q[30] = [*grid_area(30, 6, 5, 0.05, 0.08, 0.95, 0.92, "image", fill=1.0, scale=DENSE)]
+
+    return spec(name, q)
 
 
-def make_horizontal_dense_grid_template() -> TemplateSpec:
-    return horizontal_dense_template(
-        name="horizontal_dense_grid",
-        small_view="front",
-    )
+def make_vertical_big_bottom_grid_template(scale_config: Optional[Dict[str, Any]] = None) -> TemplateSpec:
+    name = "vertical_big_bottom_grid"
+    SINGLE, HERO, SMALL, DENSE = role_scales(name, scale_config)
+    q: Dict[int, List[Placement]] = {}
+
+    q[1] = [p("image", 0.50, 0.50, 0.72, 0.88, scale=SINGLE)]
+
+    q[2] = [
+        p("image", 0.38, 0.50, 0.44, 0.72, scale=HERO),
+        p("image", 0.62, 0.50, 0.44, 0.72, scale=HERO),
+    ]
+
+    q[5] = [
+        *grid_area(4, 4, 1, 0.12, 0.10, 0.88, 0.36, "image", fill=1.0, scale=SMALL),
+        p("image", 0.50, 0.66, 0.52, 0.58, scale=HERO),
+    ]
+
+    q[10] = [
+        *grid_area(8, 4, 2, 0.10, 0.10, 0.90, 0.48, "image", fill=1.0, scale=SMALL),
+        p("image", 0.38, 0.74, 0.34, 0.42, scale=HERO),
+        p("image", 0.66, 0.74, 0.34, 0.42, scale=HERO),
+    ]
+
+    q[20] = [
+        *grid_area(18, 6, 3, 0.06, 0.08, 0.94, 0.54, "image", fill=1.0, scale=DENSE),
+        p("image", 0.38, 0.78, 0.30, 0.36, scale=HERO),
+        p("image", 0.66, 0.78, 0.30, 0.36, scale=HERO),
+    ]
+
+    q[30] = [
+        *grid_area(28, 7, 4, 0.05, 0.06, 0.95, 0.64, "image", fill=1.0, scale=DENSE),
+        p("image", 0.38, 0.84, 0.28, 0.30, scale=HERO),
+        p("image", 0.66, 0.84, 0.28, 0.30, scale=HERO),
+    ]
+
+    return spec(name, q)
 
 
-def make_vertical_big_bottom_grid_template() -> TemplateSpec:
-    return vertical_big_bottom_template(
-        name="vertical_big_bottom_grid",
-        small_view="front",
-        hero_view="image",
-    )
+def get_builtin_templates(scale_config: Optional[Dict[str, Any]] = None) -> Dict[str, TemplateSpec]:
+    """
+    Register real template layouts.
 
-
-def get_builtin_templates() -> Dict[str, TemplateSpec]:
+    Critical:
+    Do NOT clone every template name into one layout here.
+    Each template_name must map to its own make_xxx_template().
+    """
     templates = [
-        make_big_top_left_grid_template(),
-        make_mixed_knob_grid_template(),
-        make_round_drain_grid_template(),
-        make_square_drain_grid_template(),
-        make_elbow_mixed_grid_template(),
-        make_round_strainer_mix_template(),
-        make_big_bottom_center_grid_template(),
-        make_coil_grid_template(),
-        make_horizontal_plus_small_grid_template(),
-        make_horizontal_dense_grid_template(),
-        make_vertical_big_bottom_grid_template(),
+        make_big_top_left_grid_template(scale_config=scale_config),
+        make_mixed_knob_grid_template(scale_config=scale_config),
+        make_round_drain_grid_template(scale_config=scale_config),
+        make_square_drain_grid_template(scale_config=scale_config),
+        make_elbow_mixed_grid_template(scale_config=scale_config),
+        make_round_strainer_mix_template(scale_config=scale_config),
+        make_big_bottom_center_grid_template(scale_config=scale_config),
+        make_coil_grid_template(scale_config=scale_config),
+        make_horizontal_plus_small_grid_template(scale_config=scale_config),
+        make_horizontal_dense_grid_template(scale_config=scale_config),
+        make_vertical_big_bottom_grid_template(scale_config=scale_config),
     ]
+
     return {t.template_name: t for t in templates}
 
 
@@ -928,6 +1120,13 @@ def resolve_template_name(
     template_names_in_ref: set[str],
     template_no_to_name: Dict[str, str],
 ) -> Tuple[str, str, str]:
+    """
+    Rule:
+    - template_name and template_no can fill either one.
+    - If both are filled and conflict, template_name wins.
+    - If template_name is numeric-like and not a real template_name, treat it as template_no.
+    Returns: resolved_template_name, template_no, resolution_note
+    """
     sku = clean_cell(row.get("sku", ""))
     raw_template_no = normalize_template_key(row.get("template_no", ""))
     raw_template_name = clean_cell(row.get("template_name", ""))
@@ -992,15 +1191,13 @@ def render_quantity_image(
     background_rgb: Tuple[int, int, int] = (255, 255, 255),
     scale_config: Optional[Dict[str, Any]] = None,
 ) -> Image.Image:
-    cfg = deep_merge(DEFAULT_SCALE_CONFIG, scale_config)
-    global_render_scale = float(cfg.get("global", {}).get("render_scale", 1.0))
-    role_scales = get_template_scale_cfg(cfg, template.template_name)
-
     if quantity not in template.quantity_to_placements:
         raise ValueError(f"Template {template.template_name} does not support quantity={quantity}")
 
     canvas = Image.new("RGBA", (canvas_size, canvas_size), background_rgb + (255,))
+
     placements = template.quantity_to_placements[quantity]
+    render_scale = float(get_global_scale_value(scale_config, "render_scale", 1.0))
 
     for item in placements:
         view = item.view
@@ -1009,12 +1206,8 @@ def render_quantity_image(
 
         src = view_images[view]
 
-        role_scale = role_scales.get(item.role, 1.0)
-        local_scale = item.scale if item.scale is not None else 1.0
-        final_scale = role_scale * local_scale * global_render_scale
-
-        target_w = int(canvas_size * item.w * final_scale)
-        target_h = int(canvas_size * item.h * final_scale)
+        target_w = int(canvas_size * item.w * item.scale * render_scale)
+        target_h = int(canvas_size * item.h * item.scale * render_scale)
 
         fitted = fit_image(src, target_w, target_h)
 
@@ -1088,7 +1281,8 @@ def generate_from_dataframes(
     if quantities:
         quantity_override = [int(q) for q in quantities]
 
-    builtin_templates = get_builtin_templates()
+    builtin_templates = get_builtin_templates(scale_config=scale_config)
+
     runlog: List[Dict[str, Any]] = []
     template_names_in_ref, template_no_to_name = build_template_ref_maps(template_df)
 
@@ -1170,7 +1364,6 @@ def generate_from_dataframes(
                     "front_url": url_map.get("front", ""),
                     "angle_url": url_map.get("angle", ""),
                     "side_url": url_map.get("side", ""),
-                    "scale_config_json": json.dumps(scale_config or {}, ensure_ascii=False),
                     "message": "",
                     "elapsed_sec": round(time.time() - started, 2),
                 })
@@ -1193,7 +1386,6 @@ def generate_from_dataframes(
                 "front_url": clean_cell(row.get("front_url", "")),
                 "angle_url": clean_cell(row.get("angle_url", "")),
                 "side_url": clean_cell(row.get("side_url", "")),
-                "scale_config_json": json.dumps(scale_config or {}, ensure_ascii=False),
                 "message": str(e),
                 "elapsed_sec": round(time.time() - started, 2),
             })
