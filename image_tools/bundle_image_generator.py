@@ -82,6 +82,7 @@ class Placement:
     w: float
     h: float
     anchor: str = "center"
+    scale: float = 1.0
 
 
 @dataclass
@@ -331,6 +332,34 @@ def preprocess_product_image(
     return img
 
 
+def normalize_sprite_canvas(
+    img: Image.Image,
+    canvas_size: int = 1000,
+    max_fill: float = 0.82,
+) -> Image.Image:
+    """
+    Normalize every source product image into a same-size transparent sprite.
+
+    This prevents close-up product photos from becoming huge and far-shot
+    photos from becoming tiny when the layout repeats the same item many times.
+    """
+    img = img.convert("RGBA")
+    if img.width <= 0 or img.height <= 0:
+        raise ValueError("Invalid image size")
+
+    max_side = int(canvas_size * max_fill)
+    scale = min(max_side / img.width, max_side / img.height)
+    new_w = max(1, int(img.width * scale))
+    new_h = max(1, int(img.height * scale))
+
+    resized = img.resize((new_w, new_h), RESAMPLE_LANCZOS)
+    canvas = Image.new("RGBA", (canvas_size, canvas_size), (255, 255, 255, 0))
+    x = int((canvas_size - new_w) / 2)
+    y = int((canvas_size - new_h) / 2)
+    canvas.alpha_composite(resized, (x, y))
+    return canvas
+
+
 def fit_image(
     img: Image.Image,
     target_w: int,
@@ -414,6 +443,15 @@ def build_view_images(
             remove_bg=remove_bg,
             white_threshold=white_threshold,
         )
+
+        # Key fix: normalize every source into the same visual sprite canvas
+        # before rendering repeated SPU layouts.
+        img = normalize_sprite_canvas(
+            img,
+            canvas_size=1000,
+            max_fill=0.82,
+        )
+
         images[view] = img
         source_paths[view] = str(path)
 
@@ -424,8 +462,15 @@ def build_view_images(
 # Placement helpers
 # =========================
 
-def p(view: str, x: float, y: float, w: float, h: float) -> Placement:
-    return Placement(view=view, x=x, y=y, w=w, h=h)
+def p(
+    view: str,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    scale: float = 1.0,
+) -> Placement:
+    return Placement(view=view, x=x, y=y, w=w, h=h, scale=scale)
 
 
 def grid(
@@ -511,33 +556,58 @@ def make_big_top_left_grid_template() -> TemplateSpec:
 
 
 def make_mixed_knob_grid_template() -> TemplateSpec:
+    """
+    Template: mixed_knob_grid
+
+    Designed for mixed small knob / connector products.
+    Uses normalized sprites and controlled scale so repeated units stay stable.
+    """
     q: Dict[int, List[Placement]] = {}
 
-    q[1] = [p("image", 0.50, 0.50, 0.72, 0.72)]
+    q[1] = [
+        p("image", 0.50, 0.50, 0.72, 0.72, scale=1.00),
+    ]
+
     q[2] = [
-        p("front", 0.36, 0.42, 0.48, 0.48),
-        p("angle", 0.66, 0.58, 0.46, 0.46),
+        p("front", 0.38, 0.50, 0.46, 0.46, scale=0.95),
+        p("angle", 0.62, 0.50, 0.46, 0.46, scale=0.95),
     ]
+
     q[5] = [
-        p("angle", 0.68, 0.50, 0.44, 0.54),
-        *grid(4, 2, 2, 0.22, 0.45, 0.30, 0.72, "front", 0.26, 0.22),
+        p("front", 0.25, 0.28, 0.30, 0.30, scale=0.82),
+        p("front", 0.25, 0.72, 0.30, 0.30, scale=0.82),
+        p("front", 0.50, 0.28, 0.30, 0.30, scale=0.82),
+        p("front", 0.50, 0.72, 0.30, 0.30, scale=0.82),
+        p("angle", 0.76, 0.50, 0.42, 0.42, scale=0.98),
     ]
-    q[10] = [
-        p("angle", 0.72, 0.58, 0.42, 0.44),
-        p("side", 0.30, 0.32, 0.34, 0.34),
-        p("side", 0.44, 0.65, 0.30, 0.30),
-        *grid(7, 3, 3, 0.17, 0.55, 0.16, 0.86, "front", 0.20, 0.16),
-    ][:10]
-    q[20] = [
-        p("angle", 0.74, 0.58, 0.38, 0.42),
-        p("side", 0.77, 0.22, 0.28, 0.26),
-        *grid(18, 3, 6, 0.16, 0.56, 0.12, 0.88, "front", 0.20, 0.12),
-    ][:20]
-    q[30] = [
-        p("angle", 0.76, 0.64, 0.34, 0.38),
-        p("side", 0.78, 0.24, 0.28, 0.26),
-        *grid(28, 4, 7, 0.14, 0.61, 0.10, 0.90, "front", 0.15, 0.10),
-    ][:30]
+
+    q[10] = []
+    for yy in [0.23, 0.50, 0.77]:
+        for xx in [0.18, 0.36, 0.54]:
+            q[10].append(p("front", xx, yy, 0.20, 0.20, scale=0.72))
+    q[10].append(p("angle", 0.80, 0.50, 0.36, 0.36, scale=0.95))
+
+    q[20] = []
+    for yy in [0.16, 0.32, 0.48, 0.64, 0.80]:
+        for xx in [0.16, 0.31, 0.46, 0.61]:
+            q[20].append(p("front", xx, yy, 0.15, 0.15, scale=0.68))
+    # 20 pcs = 18 small + 2 larger angle visuals
+    q[20] = q[20][:18]
+    q[20].extend([
+        p("angle", 0.82, 0.36, 0.30, 0.30, scale=0.85),
+        p("angle", 0.82, 0.68, 0.30, 0.30, scale=0.85),
+    ])
+
+    q[30] = []
+    for yy in [0.12, 0.25, 0.38, 0.51, 0.64, 0.77, 0.90]:
+        for xx in [0.13, 0.26, 0.39, 0.52]:
+            q[30].append(p("front", xx, yy, 0.13, 0.13, scale=0.62))
+    # 30 pcs = 28 small + 2 larger angle visuals
+    q[30] = q[30][:28]
+    q[30].extend([
+        p("angle", 0.76, 0.28, 0.28, 0.28, scale=0.80),
+        p("angle", 0.86, 0.58, 0.28, 0.28, scale=0.80),
+    ])
 
     return spec("mixed_knob_grid", q)
 
@@ -907,8 +977,8 @@ def render_quantity_image(
             view = "image"
 
         src = view_images[view]
-        target_w = int(canvas_size * item.w)
-        target_h = int(canvas_size * item.h)
+        target_w = int(canvas_size * item.w * item.scale)
+        target_h = int(canvas_size * item.h * item.scale)
         fitted = fit_image(src, target_w, target_h)
 
         cx = int(canvas_size * item.x)
