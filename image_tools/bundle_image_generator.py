@@ -335,7 +335,7 @@ def preprocess_product_image(
 def normalize_sprite_canvas(
     img: Image.Image,
     canvas_size: int = 1000,
-    max_fill: float = 0.82,
+    max_fill: float = 0.96,
 ) -> Image.Image:
     """
     Normalize every source product image into a same-size transparent sprite.
@@ -449,7 +449,7 @@ def build_view_images(
         img = normalize_sprite_canvas(
             img,
             canvas_size=1000,
-            max_fill=0.82,
+            max_fill=0.96,
         )
 
         images[view] = img
@@ -507,6 +507,46 @@ def grid(
     return out
 
 
+def grid_area(
+    n: int,
+    cols: int,
+    rows: int,
+    left: float,
+    top: float,
+    right: float,
+    bottom: float,
+    view: str = "front",
+    fill: float = 0.94,
+    scale: float = 1.0,
+) -> List[Placement]:
+    """
+    Create a dense grid inside a rectangular area.
+
+    Unlike grid(), left/top/right/bottom are real area bounds.
+    Centers are placed in cells, not on the area edge.
+    This gives stable dense bundle layouts.
+    """
+    if n <= 0:
+        return []
+    if cols <= 0 or rows <= 0:
+        raise ValueError("cols and rows must be positive")
+    if right <= left or bottom <= top:
+        raise ValueError("Invalid grid area bounds")
+
+    cell_w = (right - left) / cols
+    cell_h = (bottom - top) / rows
+
+    out: List[Placement] = []
+    for r in range(rows):
+        cy = top + cell_h * (r + 0.5)
+        for c in range(cols):
+            if len(out) >= n:
+                return out
+            cx = left + cell_w * (c + 0.5)
+            out.append(p(view, cx, cy, cell_w * fill, cell_h * fill, scale=scale))
+    return out
+
+
 def spec(name: str, q: Dict[int, List[Placement]]) -> TemplateSpec:
     missing = [x for x in SUPPORTED_QUANTITIES if x not in q]
     if missing:
@@ -559,58 +599,53 @@ def make_mixed_knob_grid_template() -> TemplateSpec:
     """
     Template: mixed_knob_grid
 
-    Designed for mixed small knob / connector products.
-    Uses normalized sprites and controlled scale so repeated units stay stable.
+    Product type: small connector / knob / fitting mixed pack.
+
+    Rendering rule:
+    - 1 pcs: one large centered item.
+    - 2 pcs: two balanced large visuals.
+    - 5 pcs: 4 small units + 1 larger angle hero.
+    - 10 pcs: 8 small units + 2 larger angle heroes.
+    - 20 pcs: 18 compact units + 2 heroes.
+    - 30 pcs: 28 compact units + 2 heroes.
+
+    This is grid+hero logic, not a loose coordinate demo.
     """
     q: Dict[int, List[Placement]] = {}
 
     q[1] = [
-        p("image", 0.50, 0.50, 0.72, 0.72, scale=1.00),
+        p("image", 0.50, 0.50, 0.88, 0.88, scale=1.00),
     ]
 
     q[2] = [
-        p("front", 0.38, 0.50, 0.46, 0.46, scale=0.95),
-        p("angle", 0.62, 0.50, 0.46, 0.46, scale=0.95),
+        p("front", 0.40, 0.52, 0.54, 0.54, scale=1.08),
+        p("angle", 0.64, 0.52, 0.54, 0.54, scale=1.08),
     ]
 
     q[5] = [
-        p("front", 0.25, 0.28, 0.30, 0.30, scale=0.82),
-        p("front", 0.25, 0.72, 0.30, 0.30, scale=0.82),
-        p("front", 0.50, 0.28, 0.30, 0.30, scale=0.82),
-        p("front", 0.50, 0.72, 0.30, 0.30, scale=0.82),
-        p("angle", 0.76, 0.50, 0.42, 0.42, scale=0.98),
+        *grid_area(4, 2, 2, 0.08, 0.16, 0.48, 0.84, "front", fill=1.08, scale=1.06),
+        p("angle", 0.73, 0.50, 0.54, 0.54, scale=1.12),
     ]
 
-    q[10] = []
-    for yy in [0.23, 0.50, 0.77]:
-        for xx in [0.18, 0.36, 0.54]:
-            q[10].append(p("front", xx, yy, 0.20, 0.20, scale=0.72))
-    q[10].append(p("angle", 0.80, 0.50, 0.36, 0.36, scale=0.95))
+    q[10] = [
+        *grid_area(8, 2, 4, 0.07, 0.10, 0.45, 0.90, "front", fill=1.14, scale=1.08),
+        p("angle", 0.72, 0.34, 0.44, 0.44, scale=1.04),
+        p("angle", 0.76, 0.70, 0.44, 0.44, scale=1.04),
+    ]
 
-    q[20] = []
-    for yy in [0.16, 0.32, 0.48, 0.64, 0.80]:
-        for xx in [0.16, 0.31, 0.46, 0.61]:
-            q[20].append(p("front", xx, yy, 0.15, 0.15, scale=0.68))
-    # 20 pcs = 18 small + 2 larger angle visuals
-    q[20] = q[20][:18]
-    q[20].extend([
-        p("angle", 0.82, 0.36, 0.30, 0.30, scale=0.85),
-        p("angle", 0.82, 0.68, 0.30, 0.30, scale=0.85),
-    ])
+    q[20] = [
+        *grid_area(18, 3, 6, 0.06, 0.07, 0.58, 0.93, "front", fill=1.12, scale=1.03),
+        p("angle", 0.80, 0.34, 0.38, 0.38, scale=1.00),
+        p("angle", 0.80, 0.70, 0.38, 0.38, scale=1.00),
+    ]
 
-    q[30] = []
-    for yy in [0.12, 0.25, 0.38, 0.51, 0.64, 0.77, 0.90]:
-        for xx in [0.13, 0.26, 0.39, 0.52]:
-            q[30].append(p("front", xx, yy, 0.13, 0.13, scale=0.62))
-    # 30 pcs = 28 small + 2 larger angle visuals
-    q[30] = q[30][:28]
-    q[30].extend([
-        p("angle", 0.76, 0.28, 0.28, 0.28, scale=0.80),
-        p("angle", 0.86, 0.58, 0.28, 0.28, scale=0.80),
-    ])
+    q[30] = [
+        *grid_area(28, 4, 7, 0.05, 0.06, 0.63, 0.94, "front", fill=1.10, scale=0.98),
+        p("angle", 0.81, 0.32, 0.36, 0.36, scale=0.98),
+        p("angle", 0.82, 0.70, 0.36, 0.36, scale=0.98),
+    ]
 
     return spec("mixed_knob_grid", q)
-
 
 def make_round_drain_grid_template() -> TemplateSpec:
     q: Dict[int, List[Placement]] = {}
@@ -632,26 +667,35 @@ def make_round_drain_grid_template() -> TemplateSpec:
 
 
 def make_square_drain_grid_template() -> TemplateSpec:
+    """
+    Template: square_drain_grid
+
+    Product type: square / flat drain-like product.
+    Uses pure dense grids because this type usually has one strong top-view image.
+    """
     q: Dict[int, List[Placement]] = {}
 
-    q[1] = [p("image", 0.50, 0.50, 0.76, 0.76)]
+    q[1] = [p("image", 0.50, 0.50, 0.86, 0.86, scale=1.00)]
+
     q[2] = [
-        p("image", 0.35, 0.42, 0.42, 0.42),
-        p("image", 0.65, 0.58, 0.42, 0.42),
+        p("image", 0.39, 0.50, 0.52, 0.52, scale=1.03),
+        p("image", 0.63, 0.50, 0.52, 0.52, scale=1.03),
     ]
+
     q[5] = [
-        p("image", 0.70, 0.50, 0.40, 0.40),
-        *grid(4, 2, 2, 0.25, 0.48, 0.30, 0.70, "image", 0.24, 0.22),
+        p("image", 0.70, 0.52, 0.52, 0.52, scale=1.02),
+        *grid_area(4, 2, 2, 0.08, 0.20, 0.48, 0.82, "image", fill=1.04, scale=1.00),
     ]
+
     q[10] = [
-        p("image", 0.74, 0.58, 0.34, 0.34),
-        *grid(9, 3, 3, 0.18, 0.58, 0.18, 0.82, "image", 0.19, 0.17),
+        p("image", 0.76, 0.52, 0.42, 0.42, scale=0.98),
+        *grid_area(9, 3, 3, 0.06, 0.14, 0.58, 0.86, "image", fill=1.06, scale=1.00),
     ][:10]
-    q[20] = grid(20, 4, 5, 0.16, 0.84, 0.12, 0.88, "image", 0.18, 0.14)
-    q[30] = grid(30, 5, 6, 0.12, 0.88, 0.10, 0.90, "image", 0.15, 0.11)
+
+    q[20] = grid_area(20, 4, 5, 0.08, 0.10, 0.92, 0.90, "image", fill=1.04, scale=1.00)
+    q[30] = grid_area(30, 5, 6, 0.06, 0.08, 0.94, 0.92, "image", fill=1.02, scale=1.00)
 
     return spec("square_drain_grid", q)
-
 
 def make_elbow_mixed_grid_template() -> TemplateSpec:
     q: Dict[int, List[Placement]] = {}
