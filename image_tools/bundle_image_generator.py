@@ -1,11 +1,7 @@
-# ecom/image_tools/bundle_image_generator.py
-
 from __future__ import annotations
 
 import base64
-import io
 import json
-import os
 import re
 import time
 import hashlib
@@ -29,7 +25,9 @@ except AttributeError:
 # =========================
 
 REQUIRED_INPUT_COLUMNS = [
+    "Type",
     "sku",
+    "template_no",
     "template_name",
     "image_url",
     "front_url",
@@ -40,9 +38,14 @@ REQUIRED_INPUT_COLUMNS = [
 ]
 
 REQUIRED_TEMPLATE_COLUMNS = [
+    "template_no",
     "template_name",
     "template_display_name",
+]
+
+OPTIONAL_TEMPLATE_COLUMNS = [
     "template_desc",
+    "视觉特征",
     "qty_1_desc",
     "qty_2_desc",
     "qty_5_desc",
@@ -58,6 +61,11 @@ REQUIRED_TEMPLATE_COLUMNS = [
 ]
 
 SUPPORTED_QUANTITIES = [1, 2, 5, 10, 20, 30]
+
+TYPE_TO_QUANTITIES = {
+    "10": [1, 2, 5, 10],
+    "30": [1, 2, 5, 10, 20, 30],
+}
 
 VIEW_KEYS = ["image", "front", "angle", "side"]
 
@@ -135,6 +143,21 @@ def parse_service_account_secret(secret_value: str) -> dict:
 
     decoded = base64.b64decode(secret_value).decode("utf-8")
     return json.loads(decoded)
+
+
+def normalize_template_key(value: Any) -> str:
+    """Normalize template_no values from Sheets, including 1.0 -> 1."""
+    value = clean_cell(value)
+    if not value:
+        return ""
+    if re.fullmatch(r"\d+\.0+", value):
+        return value.split(".")[0]
+    return value
+
+
+def is_numeric_like(value: str) -> bool:
+    value = clean_cell(value)
+    return bool(re.fullmatch(r"\d+(?:\.0+)?", value))
 
 
 # =========================
@@ -261,13 +284,15 @@ def remove_near_white_background(
             if a == 0:
                 continue
 
-            # distance from white by channel
             min_channel = min(r, g, b)
 
             if r >= white_threshold and g >= white_threshold and b >= white_threshold:
                 pixels[x, y] = (r, g, b, 0)
-            elif r >= white_threshold - alpha_softness and g >= white_threshold - alpha_softness and b >= white_threshold - alpha_softness:
-                # soft fade for edge anti-aliasing
+            elif (
+                r >= white_threshold - alpha_softness
+                and g >= white_threshold - alpha_softness
+                and b >= white_threshold - alpha_softness
+            ):
                 diff = 255 - min_channel
                 new_alpha = max(0, min(a, diff * 18))
                 pixels[x, y] = (r, g, b, new_alpha)
@@ -357,8 +382,6 @@ def resolve_url_map(row: pd.Series) -> Dict[str, str]:
     if not available:
         raise ValueError(f"No image URL found for sku={clean_cell(row.get('sku', ''))}")
 
-    # Fallback chain.
-    # image = generic fallback.
     fallback_order = {
         "angle": ["angle", "front", "side", "image"],
         "front": ["front", "angle", "side", "image"],
@@ -407,6 +430,13 @@ def p(view: str, x: float, y: float, w: float, h: float) -> Placement:
     return Placement(view=view, x=x, y=y, w=w, h=h)
 
 
+def clone_template(template: TemplateSpec, new_name: str) -> TemplateSpec:
+    return TemplateSpec(
+        template_name=new_name,
+        quantity_to_placements=template.quantity_to_placements,
+    )
+
+
 def make_big_top_left_grid_template() -> TemplateSpec:
     """
     Template: big_top_left_grid
@@ -441,44 +471,35 @@ def make_big_top_left_grid_template() -> TemplateSpec:
     ]
 
     q[10] = []
-    # 8 small fronts, left area 2 columns x 4 rows
     xs = [0.24, 0.50]
     ys = [0.17, 0.38, 0.59, 0.80]
     for yy in ys:
         for xx in xs:
             q[10].append(p("front", xx, yy, 0.30, 0.16))
-    # 2 larger right-side images
     q[10].extend([
         p("side", 0.80, 0.32, 0.34, 0.42),
         p("side", 0.80, 0.72, 0.34, 0.42),
     ])
 
     q[20] = []
-    # 18 small images on left, 3 columns x 6 rows
     xs = [0.17, 0.37, 0.57]
     ys = [0.12, 0.27, 0.42, 0.57, 0.72, 0.87]
     for yy in ys:
         for xx in xs:
             q[20].append(p("front", xx, yy, 0.22, 0.12))
-    # 2 right big side images
     q[20].extend([
         p("side", 0.83, 0.30, 0.34, 0.42),
         p("side", 0.83, 0.72, 0.34, 0.42),
     ])
 
     q[30] = []
-    # 1 large hero top-left
     q[30].append(p("angle", 0.23, 0.18, 0.46, 0.30))
 
-    # 29 grid images
     coords: List[Tuple[float, float]] = []
-
-    # right top area: 2 cols x 2 rows = 4
     for yy in [0.13, 0.29]:
         for xx in [0.62, 0.82]:
             coords.append((xx, yy))
 
-    # main grid lower: 5 cols x 5 rows = 25
     for yy in [0.45, 0.57, 0.69, 0.81, 0.93]:
         for xx in [0.13, 0.32, 0.51, 0.70, 0.89]:
             coords.append((xx, yy))
@@ -493,10 +514,105 @@ def make_big_top_left_grid_template() -> TemplateSpec:
 
 
 def get_builtin_templates() -> Dict[str, TemplateSpec]:
+    big_top_left_grid = make_big_top_left_grid_template()
+
     templates = [
-        make_big_top_left_grid_template(),
+        big_top_left_grid,
+        # Alias: current Ref__BundleTemplates example uses angle_l_grid.
+        # It uses the same placement as big_top_left_grid unless later replaced by a new layout function.
+        clone_template(big_top_left_grid, "angle_l_grid"),
     ]
     return {t.template_name: t for t in templates}
+
+
+# =========================
+# Template / Type resolution
+# =========================
+
+def build_template_ref_maps(template_df: pd.DataFrame) -> Tuple[set[str], Dict[str, str]]:
+    names = set(template_df["template_name"].apply(clean_cell).tolist())
+
+    no_to_name: Dict[str, str] = {}
+    for _, row in template_df.iterrows():
+        template_no = normalize_template_key(row.get("template_no", ""))
+        template_name = clean_cell(row.get("template_name", ""))
+        if not template_no or not template_name:
+            continue
+        if template_no in no_to_name and no_to_name[template_no] != template_name:
+            raise ValueError(
+                f"Duplicate template_no with different template_name in Ref__BundleTemplates: "
+                f"template_no={template_no}, names={no_to_name[template_no]} / {template_name}"
+            )
+        no_to_name[template_no] = template_name
+
+    return names, no_to_name
+
+
+def resolve_template_name(
+    row: pd.Series,
+    template_names_in_ref: set[str],
+    template_no_to_name: Dict[str, str],
+) -> Tuple[str, str, str]:
+    """
+    Rule:
+    - template_name and template_no can fill either one.
+    - If both are filled and conflict, template_name wins.
+    - If template_name is numeric-like and not a real template_name, treat it as template_no.
+    Returns: resolved_template_name, template_no, resolution_note
+    """
+    sku = clean_cell(row.get("sku", ""))
+    raw_template_no = normalize_template_key(row.get("template_no", ""))
+    raw_template_name = clean_cell(row.get("template_name", ""))
+
+    resolution_note = ""
+
+    # Defensive support for accidental mis-entry: template_name column contains 1 / 1.0.
+    if raw_template_name and raw_template_name not in template_names_in_ref and is_numeric_like(raw_template_name):
+        if not raw_template_no:
+            raw_template_no = normalize_template_key(raw_template_name)
+            raw_template_name = ""
+            resolution_note = "template_name_numeric_treated_as_template_no"
+
+    # Name wins when it exists.
+    if raw_template_name:
+        if raw_template_name not in template_names_in_ref:
+            raise ValueError(f"template_name not found in Ref__BundleTemplates: {raw_template_name}")
+
+        if raw_template_no:
+            mapped_name = template_no_to_name.get(raw_template_no, "")
+            if mapped_name and mapped_name != raw_template_name:
+                resolution_note = (
+                    f"template_no_conflict_ignored: template_no={raw_template_no} "
+                    f"maps_to={mapped_name}, used_template_name={raw_template_name}"
+                )
+            elif mapped_name == raw_template_name:
+                resolution_note = "template_no_and_template_name_matched"
+            else:
+                resolution_note = f"template_no_not_found_ignored: template_no={raw_template_no}"
+        else:
+            resolution_note = resolution_note or "template_name_only"
+
+        return raw_template_name, raw_template_no, resolution_note
+
+    # No name: use template_no.
+    if raw_template_no:
+        mapped_name = template_no_to_name.get(raw_template_no, "")
+        if not mapped_name:
+            raise ValueError(f"template_no not found in Ref__BundleTemplates: {raw_template_no}")
+        return mapped_name, raw_template_no, "template_no_only"
+
+    raise ValueError(f"Both template_no and template_name are empty for sku={sku}")
+
+
+def resolve_quantities_by_type(type_value: Any) -> List[int]:
+    type_key = normalize_template_key(type_value)
+    if not type_key:
+        raise ValueError("Type is empty")
+    if type_key not in TYPE_TO_QUANTITIES:
+        raise ValueError(
+            f"Unsupported Type={type_key}. Supported Type values: {sorted(TYPE_TO_QUANTITIES.keys())}"
+        )
+    return TYPE_TO_QUANTITIES[type_key]
 
 
 # =========================
@@ -546,6 +662,9 @@ def normalize_input_df(input_df: pd.DataFrame) -> pd.DataFrame:
     for c in REQUIRED_INPUT_COLUMNS:
         df[c] = df[c].apply(clean_cell)
 
+    df["Type"] = df["Type"].apply(normalize_template_key)
+    df["template_no"] = df["template_no"].apply(normalize_template_key)
+
     # optional enabled support
     if "enabled" in df.columns:
         df["enabled"] = df["enabled"].apply(lambda x: clean_cell(x).lower())
@@ -562,6 +681,12 @@ def normalize_template_df(template_df: pd.DataFrame) -> pd.DataFrame:
 
     for c in REQUIRED_TEMPLATE_COLUMNS:
         df[c] = df[c].apply(clean_cell)
+
+    df["template_no"] = df["template_no"].apply(normalize_template_key)
+
+    for c in OPTIONAL_TEMPLATE_COLUMNS:
+        if c in df.columns:
+            df[c] = df[c].apply(clean_cell)
 
     return df
 
@@ -584,35 +709,45 @@ def generate_from_dataframes(
     output_dir = ensure_dir(output_dir)
     cache_dir = ensure_dir(cache_dir)
 
-    quantities = quantities or SUPPORTED_QUANTITIES
-    quantities = [int(q) for q in quantities]
+    # New default: row-level Type controls quantities.
+    # Optional quantities remains as a hard global override for temporary testing only.
+    quantity_override = None
+    if quantities:
+        quantity_override = [int(q) for q in quantities]
 
     builtin_templates = get_builtin_templates()
 
     runlog: List[Dict[str, Any]] = []
 
-    template_names_in_ref = set(template_df["template_name"].tolist())
+    template_names_in_ref, template_no_to_name = build_template_ref_maps(template_df)
 
     for idx, row in input_df.iterrows():
         sku = clean_cell(row.get("sku", ""))
         output_name = clean_cell(row.get("output_name", "")) or sku
-        template_name = clean_cell(row.get("template_name", ""))
+        type_value = clean_cell(row.get("Type", ""))
+        raw_template_no = clean_cell(row.get("template_no", ""))
+        raw_template_name = clean_cell(row.get("template_name", ""))
+
+        resolved_template_name = raw_template_name
+        template_resolution_note = ""
+        row_quantities: List[int] = []
 
         started = time.time()
 
         try:
-            if not template_name:
-                raise ValueError(f"template_name is empty for sku={sku}")
+            resolved_template_name, resolved_template_no, template_resolution_note = resolve_template_name(
+                row=row,
+                template_names_in_ref=template_names_in_ref,
+                template_no_to_name=template_no_to_name,
+            )
 
-            if template_name not in template_names_in_ref:
-                raise ValueError(f"template_name not found in Ref__BundleTemplates: {template_name}")
-
-            if template_name not in builtin_templates:
+            if resolved_template_name not in builtin_templates:
                 raise ValueError(
-                    f"template_name exists in sheet but not implemented in py: {template_name}"
+                    f"template_name exists in Ref__BundleTemplates but not implemented in py: {resolved_template_name}"
                 )
 
-            template = builtin_templates[template_name]
+            template = builtin_templates[resolved_template_name]
+            row_quantities = quantity_override or resolve_quantities_by_type(type_value)
 
             url_map = resolve_url_map(row)
             view_images, source_paths = build_view_images(
@@ -625,7 +760,7 @@ def generate_from_dataframes(
             unique_source_urls = set(url_map.values())
             source_count = len(unique_source_urls)
 
-            for qty in quantities:
+            for qty in row_quantities:
                 out_ext = "jpg" if output_format.lower() in ["jpg", "jpeg"] else "png"
                 filename = f"{safe_filename(output_name)}_{qty}pcs.{out_ext}"
                 out_path = output_dir / filename
@@ -648,8 +783,12 @@ def generate_from_dataframes(
                 runlog.append({
                     "ts": pd.Timestamp.utcnow().isoformat(),
                     "sku": sku,
+                    "Type": type_value,
                     "output_name": output_name,
-                    "template_name": template_name,
+                    "template_no_input": raw_template_no,
+                    "template_name_input": raw_template_name,
+                    "template_name": resolved_template_name,
+                    "template_resolution_note": template_resolution_note,
                     "quantity": qty,
                     "status": status,
                     "output_path": str(out_path),
@@ -666,9 +805,13 @@ def generate_from_dataframes(
             runlog.append({
                 "ts": pd.Timestamp.utcnow().isoformat(),
                 "sku": sku,
+                "Type": type_value,
                 "output_name": output_name,
-                "template_name": template_name,
-                "quantity": "",
+                "template_no_input": raw_template_no,
+                "template_name_input": raw_template_name,
+                "template_name": resolved_template_name,
+                "template_resolution_note": template_resolution_note,
+                "quantity": ",".join(str(x) for x in row_quantities) if row_quantities else "",
                 "status": "error",
                 "output_path": "",
                 "source_count": "",
