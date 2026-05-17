@@ -47,6 +47,15 @@ from gspread_dataframe import set_with_dataframe
 
 TailStep = Union[str, int]
 
+# Used by paths like:
+# - product.media.nodes[].preview.image.url
+# - variant.product.media.nodes[].preview.image.url
+ALL_LIST_STEP = "__ALL__"
+
+# Shopify product media gallery limit per exported row.
+# Raise this if a product may have more than 50 media images.
+DEFAULT_CONNECTION_LIST_FIRST = 50
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -449,6 +458,7 @@ def strip_entity_prefix(expr: str, entity_type: str) -> str:
     return s
 
 _index_part_re = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\[(\d+)\]$")
+_all_nodes_part_re = re.compile(r"^nodes\[\]$")
 
 
 def build_nested_fields(parts: List[str]) -> str:
@@ -470,8 +480,31 @@ def build_selected_options_selection(alias: str) -> str:
 
 
 def extract_leaf(val: Any, tail: List[TailStep]) -> Any:
+    """
+    Extract nested values from GraphQL alias result.
+
+    Supports:
+    - normal object path: ["product", "id"]
+    - indexed list path: ["nodes", 0, "preview", "image", "url"]
+    - full list path: ["nodes", ALL_LIST_STEP, "preview", "image", "url"]
+    """
     cur = val
-    for step in tail:
+
+    i = 0
+    while i < len(tail):
+        step = tail[i]
+
+        if step == ALL_LIST_STEP:
+            if not isinstance(cur, list):
+                return []
+            rest = tail[i + 1:]
+            out = []
+            for item in cur:
+                v = extract_leaf(item, rest)
+                if v not in ("", None, [], {}):
+                    out.append(v)
+            return out
+
         if isinstance(step, int):
             if not isinstance(cur, list) or step < 0 or step >= len(cur):
                 return ""
@@ -480,6 +513,9 @@ def extract_leaf(val: Any, tail: List[TailStep]) -> Any:
             if not isinstance(cur, dict):
                 return ""
             cur = cur.get(step, "")
+
+        i += 1
+
     return "" if cur is None else cur
 
 
@@ -561,6 +597,24 @@ def tags_to_human(v: Any) -> str:
     return str(v).strip()
 
 
+def list_to_pipe(v: Any, sep: str = " | ") -> str:
+    if v is None:
+        return ""
+
+    if isinstance(v, list):
+        parts = [str(x).strip() for x in v if str(x).strip() not in ("", "None", "nan")]
+        return sep.join(parts)
+
+    if isinstance(v, str):
+        parsed = _try_parse_json_list(v)
+        if parsed is not None:
+            parts = [str(x).strip() for x in parsed if str(x).strip() not in ("", "None", "nan")]
+            return sep.join(parts)
+        return v.strip()
+
+    return str(v).strip()
+
+
 
 def html_to_readable_text(html_text: Any) -> str:
     """
@@ -632,6 +686,12 @@ def build_plan(fetch_df: pd.DataFrame, entity_type: str) -> Dict[str, Any]:
                 return i, m.group(1), int(m.group(2))
         return None
 
+    def find_all_nodes_seg(parts: List[str]):
+        for i, seg in enumerate(parts):
+            if _all_nodes_part_re.match(seg):
+                return i
+        return None
+
     for _, r in fetch_df.iterrows():
         ft = _clean_str(r.get("field_type")).upper()
         fid = _clean_str(r.get("field_id"))
@@ -668,6 +728,52 @@ def build_plan(fetch_df: pd.DataFrame, entity_type: str) -> Dict[str, Any]:
         if not parts:
             continue
 
+        # =====================================================
+        # Full connection list:
+        # - media.nodes[].preview.image.url
+        # - product.media.nodes[].preview.image.url
+        # =====================================================
+        all_hit = find_all_nodes_seg(parts)
+        if all_hit is not None:
+            k = all_hit
+            if k <= 0:
+                raise ValueError(f"Invalid nodes[] path for field_id={fid}: {ex}")
+
+            conn = parts[k - 1]
+            after = parts[k + 1:]
+            node_fields = build_nested_fields(after)
+            first_n = DEFAULT_CONNECTION_LIST_FIRST
+            conn_sel = f"{conn}(first:{first_n}) {{ nodes {{ {node_fields} }} }}"
+
+            # Case A:
+            # PRODUCT expr after strip:
+            # media.nodes[].preview.image.url
+            if k - 1 == 0:
+                gql_lines.append(f"{a}: {conn_sel}")
+                leaf_tail[fid] = ["nodes", ALL_LIST_STEP] + after
+                raw_rows.append((fid, ex))
+                continue
+
+            # Case B:
+            # VARIANT expr after strip:
+            # product.media.nodes[].preview.image.url
+            head = parts[0]
+            mid = parts[1:k - 1]
+
+            inner = conn_sel
+            for p in reversed(mid):
+                inner = f"{p} {{ {inner} }}"
+
+            gql_lines.append(f"{a}: {head} {{ {inner} }}")
+            leaf_tail[fid] = mid + [conn, "nodes", ALL_LIST_STEP] + after
+            raw_rows.append((fid, ex))
+            continue
+
+        # =====================================================
+        # Existing indexed connection logic:
+        # - media[0].preview.image.url
+        # - media.nodes[0].preview.image.url
+        # =====================================================
         idx_hit = find_index_seg(parts)
         if idx_hit:
             k, name, idx = idx_hit
@@ -723,8 +829,6 @@ def build_plan(fetch_df: pd.DataFrame, entity_type: str) -> Dict[str, Any]:
             head = parts[0]
             tail = build_nested_fields(parts[1:])
             gql_lines.append(f"{a}: {head} {{ {tail} }}")
-            # 与原 ipynb 一致：普通嵌套对象字段必须记录 leaf_tail，
-            # 否则 node_to_row 会把整个对象直接 json 化写进表里。
             leaf_tail[fid] = parts[1:]
 
         raw_rows.append((fid, ex))
@@ -830,8 +934,9 @@ def node_to_row(node: dict, plan: Dict[str, Any]) -> Dict[str, Any]:
         row[fid] = eval_calc(ex, row)
 
     for fid in list(row.keys()):
-        fk = (FIELD_DEF.get(str(fid), {}) or {}).get("field_key", "")
-        fk = _clean_str(fk)
+        fdef = FIELD_DEF.get(str(fid), {}) or {}
+        fk = _clean_str(fdef.get("field_key", ""))
+        dt = _clean_str(fdef.get("data_type", "")).lower()
 
         if fk == "core.tags":
             row[fid] = tags_to_human(row.get(fid, ""))
@@ -843,10 +948,29 @@ def node_to_row(node: dict, plan: Dict[str, Any]) -> Dict[str, Any]:
         if fk == "core.description":
             row[fid] = html_to_readable_text(row.get(fid, ""))
 
+        # Human-readable image URL list:
+        # - PRODUCT|core.product.images_urls
+        # - VARIANT|core.variant.product_images_urls
+        if fk.endswith("images_urls"):
+            row[fid] = list_to_pipe(row.get(fid, ""))
+
+        # JSON image URL list:
+        # - PRODUCT|core.product.images_json
+        # - VARIANT|core.variant.product_images_json
+        # Keep as list here. normalize_sheet_cell() will serialize list -> JSON.
+        if fk.endswith("images_json"):
+            v = row.get(fid, "")
+            if isinstance(v, str):
+                parsed = _try_parse_json_list(v)
+                row[fid] = parsed if parsed is not None else ([v] if v else [])
+            elif v is None:
+                row[fid] = []
+
     for k in list(row.keys()):
         row[k] = normalize_sheet_cell(row[k])
 
     return row
+
 
 def find_synced_at_fids(view_df: pd.DataFrame) -> List[str]:
     out = []
