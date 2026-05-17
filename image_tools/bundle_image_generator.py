@@ -109,7 +109,7 @@ SUPPORTED_PATTERNS = {
 DEFAULT_SCALE_CONFIG: Dict[str, Any] = {
     "global": {
         "sprite_canvas_size": 1000,
-        "sprite_max_fill": 0.82,
+        "sprite_max_fill": 0.86,
         "render_scale": 1.00,
     },
     "templates": {},
@@ -576,22 +576,47 @@ def resolve_url_map(row: pd.Series) -> Dict[str, str]:
     return resolved
 
 
+def sprite_cache_path(
+    sku: str,
+    view: str,
+    url: str,
+    sprite_dir: Path,
+) -> Path:
+    """Stable sprite filename for debug/reuse."""
+    ensure_dir(sprite_dir)
+    sku_part = safe_filename(sku) or "sku"
+    view_part = safe_filename(view) or "view"
+    return sprite_dir / f"{sku_part}_{view_part}_{hash_url(url)}_sprite.png"
+
+
 def build_view_images(
     url_map: Dict[str, str],
     cache_dir: Path,
     remove_bg: bool = True,
     white_threshold: int = 246,
     scale_config: Optional[Dict[str, Any]] = None,
-) -> Tuple[Dict[str, Image.Image], Dict[str, str]]:
+    sku: str = "",
+    sprite_dir: Optional[Path] = None,
+    save_sprite_images: bool = False,
+) -> Tuple[Dict[str, Image.Image], Dict[str, str], Dict[str, str]]:
+    """
+    Build normalized sprites for every view.
+
+    Important:
+    - cache_dir stores raw downloaded images.
+    - sprite_dir stores processed product sprites.
+    - Bundle rendering should use these normalized sprites, not raw images.
+    """
     images: Dict[str, Image.Image] = {}
     source_paths: Dict[str, str] = {}
+    sprite_paths: Dict[str, str] = {}
 
     sprite_canvas_size = int(get_global_scale_value(scale_config, "sprite_canvas_size", 1000))
-    sprite_max_fill = float(get_global_scale_value(scale_config, "sprite_max_fill", 0.82))
+    sprite_max_fill = float(get_global_scale_value(scale_config, "sprite_max_fill", 0.86))
 
     for view, url in url_map.items():
-        path = download_image(url, cache_dir=cache_dir)
-        img = load_image_as_rgba(path)
+        raw_path = download_image(url, cache_dir=cache_dir)
+        img = load_image_as_rgba(raw_path)
         img = preprocess_product_image(
             img,
             remove_bg=remove_bg,
@@ -604,10 +629,14 @@ def build_view_images(
         )
 
         images[view] = img
-        source_paths[view] = str(path)
+        source_paths[view] = str(raw_path)
 
-    return images, source_paths
+        if save_sprite_images and sprite_dir is not None:
+            spath = sprite_cache_path(sku=sku, view=view, url=url, sprite_dir=sprite_dir)
+            img.save(spath)
+            sprite_paths[view] = str(spath)
 
+    return images, source_paths, sprite_paths
 
 # =========================
 # Layout normalization
@@ -1047,6 +1076,8 @@ def generate_from_dataframes(
     layout_df: pd.DataFrame,
     output_dir: str | Path,
     cache_dir: str | Path,
+    sprite_dir: Optional[str | Path] = None,
+    save_sprite_images: bool = False,
     quantities: Optional[List[int]] = None,
     canvas_size: int = 1500,
     output_format: str = "jpg",
@@ -1060,6 +1091,7 @@ def generate_from_dataframes(
 
     output_dir = ensure_dir(output_dir)
     cache_dir = ensure_dir(cache_dir)
+    sprite_dir_path = ensure_dir(sprite_dir) if sprite_dir else None
 
     layout_map = build_layout_map(layout_df)
     template_names_in_ref, template_no_to_name = build_template_ref_maps(template_df)
@@ -1103,12 +1135,15 @@ def generate_from_dataframes(
                 )
 
             url_map = resolve_url_map(row)
-            view_images, source_paths = build_view_images(
+            view_images, source_paths, sprite_paths = build_view_images(
                 url_map=url_map,
                 cache_dir=cache_dir,
                 remove_bg=remove_bg,
                 white_threshold=white_threshold,
                 scale_config=scale_config,
+                sku=sku,
+                sprite_dir=sprite_dir_path,
+                save_sprite_images=save_sprite_images,
             )
 
             unique_source_urls = set(url_map.values())
@@ -1133,6 +1168,10 @@ def generate_from_dataframes(
                     "front_url": url_map.get("front", ""),
                     "angle_url": url_map.get("angle", ""),
                     "side_url": url_map.get("side", ""),
+                    "sprite_image_path": sprite_paths.get("image", ""),
+                    "sprite_front_path": sprite_paths.get("front", ""),
+                    "sprite_angle_path": sprite_paths.get("angle", ""),
+                    "sprite_side_path": sprite_paths.get("side", ""),
                     "message": f"No layout for template={resolved_template_name}, quantity={qty}",
                     "elapsed_sec": round(time.time() - started, 2),
                 })
@@ -1175,6 +1214,10 @@ def generate_from_dataframes(
                     "front_url": url_map.get("front", ""),
                     "angle_url": url_map.get("angle", ""),
                     "side_url": url_map.get("side", ""),
+                    "sprite_image_path": sprite_paths.get("image", ""),
+                    "sprite_front_path": sprite_paths.get("front", ""),
+                    "sprite_angle_path": sprite_paths.get("angle", ""),
+                    "sprite_side_path": sprite_paths.get("side", ""),
                     "message": "",
                     "elapsed_sec": round(time.time() - started, 2),
                 })
@@ -1197,6 +1240,10 @@ def generate_from_dataframes(
                 "front_url": clean_cell(row.get("front_url", "")),
                 "angle_url": clean_cell(row.get("angle_url", "")),
                 "side_url": clean_cell(row.get("side_url", "")),
+                "sprite_image_path": "",
+                "sprite_front_path": "",
+                "sprite_angle_path": "",
+                "sprite_side_path": "",
                 "message": str(e),
                 "elapsed_sec": round(time.time() - started, 2),
             })
@@ -1216,6 +1263,8 @@ def generate_from_google_sheet(
     layout_tab: str,
     output_dir: str | Path,
     cache_dir: str | Path,
+    sprite_dir: Optional[str | Path] = None,
+    save_sprite_images: bool = False,
     quantities: Optional[List[int]] = None,
     canvas_size: int = 1500,
     output_format: str = "jpg",
@@ -1238,6 +1287,8 @@ def generate_from_google_sheet(
         layout_df=layout_df,
         output_dir=output_dir,
         cache_dir=cache_dir,
+        sprite_dir=sprite_dir,
+        save_sprite_images=save_sprite_images,
         quantities=quantities,
         canvas_size=canvas_size,
         output_format=output_format,
