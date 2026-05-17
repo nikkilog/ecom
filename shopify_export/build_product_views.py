@@ -103,7 +103,7 @@ def _is_image_list_field_row(fr: Dict[str, Any]) -> bool:
 def _expand_image_field_rows_for_output(
     field_rows: List[Dict[str, Any]],
     base_df: pd.DataFrame,
-    max_images: int = 50,
+    max_images: int = 15,
 ) -> List[Dict[str, Any]]:
     """
     Build final output field rows.
@@ -1218,7 +1218,7 @@ def build_and_write_view(
     field_rows = _expand_image_field_rows_for_output(
         field_rows_raw,
         base_df,
-        max_images=50,
+        max_images=15,
     )
 
     output_keys = [fr["output_key"] for fr in field_rows]
