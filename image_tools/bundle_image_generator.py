@@ -516,12 +516,27 @@ def make_big_top_left_grid_template() -> TemplateSpec:
 def get_builtin_templates() -> Dict[str, TemplateSpec]:
     big_top_left_grid = make_big_top_left_grid_template()
 
+    # All template_name values used in Ref__BundleTemplates / Input__BundleImageURLs
+    # must be registered here.
+    # Current version: all registered names reuse big_top_left_grid placements.
+    # Later, any template can be replaced with a dedicated make_xxx_template() layout.
     templates = [
         big_top_left_grid,
-        # Alias: current Ref__BundleTemplates example uses angle_l_grid.
-        # It uses the same placement as big_top_left_grid unless later replaced by a new layout function.
+        clone_template(big_top_left_grid, "mixed_knob_grid"),
+        clone_template(big_top_left_grid, "round_drain_grid"),
+        clone_template(big_top_left_grid, "square_drain_grid"),
+        clone_template(big_top_left_grid, "elbow_mixed_grid"),
+        clone_template(big_top_left_grid, "round_strainer_mix"),
+        clone_template(big_top_left_grid, "big_bottom_center_grid"),
+        clone_template(big_top_left_grid, "coil_grid"),
+        clone_template(big_top_left_grid, "horizontal_plus_small_grid"),
+        clone_template(big_top_left_grid, "horizontal_dense_grid"),
+        clone_template(big_top_left_grid, "vertical_big_bottom_grid"),
+
+        # Backward-compatible alias kept for earlier tests / old sheet rows.
         clone_template(big_top_left_grid, "angle_l_grid"),
     ]
+
     return {t.template_name: t for t in templates}
 
 
@@ -723,7 +738,7 @@ def generate_from_dataframes(
 
     for idx, row in input_df.iterrows():
         sku = clean_cell(row.get("sku", ""))
-        output_name = clean_cell(row.get("output_name", "")) or sku
+        output_name = clean_cell(row.get("output_name", "")) or f"{sku}-SPU"
         type_value = clean_cell(row.get("Type", ""))
         raw_template_no = clean_cell(row.get("template_no", ""))
         raw_template_name = clean_cell(row.get("template_name", ""))
