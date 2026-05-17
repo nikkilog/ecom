@@ -599,18 +599,17 @@ def make_mixed_knob_grid_template() -> TemplateSpec:
     """
     Template: mixed_knob_grid
 
-   方案 B：素材标准化保持 0.82，不整体压小；
-    通过模板用途控制 scale：
-    - 1pcs 主图略大但不顶边
-    - hero / 大图约 0.90
-    - grid 小图约 0.70
+    方案 B 修正版：
+    - 素材标准化保持 0.82
+    - 1/2/5pcs 保持主图清晰
+    - 10/20/30pcs 小图放大，并改成更横向的 grid，避免竖条感
     """
     q: Dict[int, List[Placement]] = {}
 
     SINGLE_SCALE = 0.96
     HERO_SCALE = 0.90
-    SMALL_SCALE = 0.90
-    SMALL_SCALE_DENSE = 0.90
+    SMALL_SCALE = 0.92
+    DENSE_SCALE = 0.92
 
     q[1] = [
         p("image", 0.50, 0.50, 0.86, 0.86, scale=SINGLE_SCALE),
@@ -622,26 +621,74 @@ def make_mixed_knob_grid_template() -> TemplateSpec:
     ]
 
     q[5] = [
-        *grid_area(4, 2, 2, 0.08, 0.18, 0.48, 0.82, "front", fill=1.00, scale=SMALL_SCALE),
+        *grid_area(
+            4,
+            2,
+            2,
+            0.08,
+            0.18,
+            0.48,
+            0.82,
+            "front",
+            fill=1.00,
+            scale=SMALL_SCALE,
+        ),
         p("angle", 0.74, 0.52, 0.54, 0.54, scale=HERO_SCALE),
     ]
 
     q[10] = [
-        *grid_area(8, 2, 4, 0.07, 0.12, 0.46, 0.88, "front", fill=1.00, scale=SMALL_SCALE),
+        *grid_area(
+            8,
+            2,
+            4,
+            0.07,
+            0.12,
+            0.46,
+            0.88,
+            "front",
+            fill=1.00,
+            scale=SMALL_SCALE,
+        ),
         p("angle", 0.74, 0.34, 0.44, 0.44, scale=HERO_SCALE),
         p("angle", 0.76, 0.70, 0.44, 0.44, scale=HERO_SCALE),
     ]
 
+    # 20pcs：从 3列×6行 改成 4列×5行
+    # 小图会明显变大，不再像竖条。
     q[20] = [
-        *grid_area(18, 3, 6, 0.06, 0.09, 0.58, 0.91, "front", fill=1.00, scale=SMALL_SCALE_DENSE),
-        p("angle", 0.80, 0.34, 0.38, 0.38, scale=0.86),
-        p("angle", 0.80, 0.70, 0.38, 0.38, scale=0.86),
+        *grid_area(
+            18,
+            4,
+            5,
+            0.05,
+            0.10,
+            0.66,
+            0.90,
+            "front",
+            fill=1.00,
+            scale=DENSE_SCALE,
+        ),
+        p("angle", 0.82, 0.34, 0.36, 0.36, scale=0.88),
+        p("angle", 0.82, 0.70, 0.36, 0.36, scale=0.88),
     ]
 
+    # 30pcs：从 4列×7行 改成 5列×6行
+    # 并且修掉原来写死的 scale=0.62。
     q[30] = [
-        *grid_area(28, 4, 7, 0.05, 0.07, 0.63, 0.93, "front", fill=1.00, scale=0.62),
-        p("angle", 0.81, 0.32, 0.36, 0.36, scale=0.84),
-        p("angle", 0.82, 0.70, 0.36, 0.36, scale=0.84),
+        *grid_area(
+            28,
+            5,
+            6,
+            0.04,
+            0.08,
+            0.70,
+            0.92,
+            "front",
+            fill=1.00,
+            scale=DENSE_SCALE,
+        ),
+        p("angle", 0.84, 0.34, 0.32, 0.32, scale=0.86),
+        p("angle", 0.84, 0.70, 0.32, 0.32, scale=0.86),
     ]
 
     return spec("mixed_knob_grid", q)
