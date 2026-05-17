@@ -609,8 +609,8 @@ def make_mixed_knob_grid_template() -> TemplateSpec:
 
     SINGLE_SCALE = 0.96
     HERO_SCALE = 0.90
-    SMALL_SCALE = 0.70
-    SMALL_SCALE_DENSE = 0.66
+    SMALL_SCALE = 0.80
+    SMALL_SCALE_DENSE = 0.86
 
     q[1] = [
         p("image", 0.50, 0.50, 0.86, 0.86, scale=SINGLE_SCALE),
