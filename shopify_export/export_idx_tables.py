@@ -54,7 +54,7 @@ ALL_LIST_STEP = "__ALL__"
 
 # Shopify product media gallery limit per exported row.
 # Raise this if a product may have more than 50 media images.
-DEFAULT_CONNECTION_LIST_FIRST = 50
+DEFAULT_CONNECTION_LIST_FIRST = 15
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
