@@ -291,7 +291,7 @@ CORE_FIXED = [{'display_name': 'Collection GID',
  {'display_name': 'P_Admin URL',
   'entity_type': 'PRODUCT',
   'field_key': 'core.product.admin_url',
-  'expr': '=IF(LEN({PRODUCT|core.legacy_id}&"")=0,"","https://admin.shopify.com/store/544104/products/"&{PRODUCT|core.legacy_id})',
+  'expr': '=IF(LEN({PRODUCT|core.legacy_id}&"")=0,"","{ADMIN_PRODUCT_BASE_URL}"&{PRODUCT|core.legacy_id})',
   'field_type': 'CALC',
   'data_type': 'string',
   'source_type': 'CORE',
@@ -363,7 +363,7 @@ CORE_FIXED = [{'display_name': 'Collection GID',
  {'display_name': 'Storefront URL',
   'entity_type': 'PRODUCT',
   'field_key': 'core.product.storefront_url',
-  'expr': '=IF(LEN({PRODUCT|core.handle}&"")=0,"","https://plumbingsell.com/products/"&{PRODUCT|core.handle})',
+  'expr': '=IF(LEN({PRODUCT|core.handle}&"")=0,"","{STOREFRONT_PRODUCT_BASE_URL}"&{PRODUCT|core.handle})',
   'field_type': 'CALC',
   'data_type': 'string',
   'source_type': 'CORE',
@@ -525,7 +525,7 @@ CORE_FIXED = [{'display_name': 'Collection GID',
  {'display_name': 'V_Admin URL',
   'entity_type': 'VARIANT',
   'field_key': 'core.variant.admin_url',
-  'expr': '=IF(LEN({VARIANT|core.legacy_id}&"")=0,"","https://admin.shopify.com/store/544104/products/"&{PRODUCT|core.legacy_id}&"/variants/"&{VARIANT|core.legacy_id})',
+  'expr': '=IF(LEN({VARIANT|core.legacy_id}&"")=0,"","{ADMIN_PRODUCT_BASE_URL}"&{PRODUCT|core.legacy_id}&"/variants/"&{VARIANT|core.legacy_id})',
   'field_type': 'CALC',
   'data_type': 'string',
   'source_type': 'CORE',
@@ -606,7 +606,7 @@ CORE_FIXED = [{'display_name': 'Collection GID',
  {'display_name': 'Storefront URL',
   'entity_type': 'VARIANT',
   'field_key': 'core.variant.storefront_url',
-  'expr': '=IF(LEN({PRODUCT|core.handle}&"")=0,"","https://plumbingsell.com/products/"&{PRODUCT|core.handle})',
+  'expr': '=IF(LEN({PRODUCT|core.handle}&"")=0,"","{STOREFRONT_PRODUCT_BASE_URL}"&{PRODUCT|core.handle})',
   'field_type': 'CALC',
   'data_type': 'string',
   'source_type': 'CORE',
@@ -1520,6 +1520,8 @@ def _read_account_config(console_sh, tab_name: str, site_code: str) -> Dict[str,
         "SHOPIFY_TOKEN_SECRET",
         "STOREFRONT_BASE_URL",
         "ADMIN_BASE_URL",
+        "STOREFRONT_PRODUCT_BASE_URL",
+        "ADMIN_PRODUCT_BASE_URL",
     ]
     missing = [k for k in required if not cfg.get(k)]
     if missing:
@@ -1674,7 +1676,52 @@ def _col_letter(col_num_1_based: int) -> str:
     return rowcol_to_a1(1, col_num_1_based).replace("1", "")
 
 
-def _sync_cfg_fields(ws, mf_defs: List[Dict[str, Any]], mo_defs: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _normalize_product_base_url(value: str, key_name: str) -> str:
+    """
+    Normalize product base URLs read from Cfg__account_id.
+
+    Expected examples:
+    - ADMIN_PRODUCT_BASE_URL: https://admin.shopify.com/store/apollolift-us/products/
+    - STOREFRONT_PRODUCT_BASE_URL: https://www.apolloliftus.com/products/
+    """
+    v = str(value or "").strip()
+    if not v:
+        raise ConfigFieldsError(f"Cfg__account_id missing required account config key: {key_name}")
+    return v.rstrip("/") + "/"
+
+
+def _build_core_fixed_rows(account_cfg: Dict[str, str]) -> List[Dict[str, Any]]:
+    """
+    Build CORE_FIXED rows with site-specific URLs from Cfg__account_id.
+
+    No storefront/admin product URL is hardcoded here.
+    """
+    admin_product_base_url = _normalize_product_base_url(
+        account_cfg.get("ADMIN_PRODUCT_BASE_URL", ""),
+        "ADMIN_PRODUCT_BASE_URL",
+    )
+    storefront_product_base_url = _normalize_product_base_url(
+        account_cfg.get("STOREFRONT_PRODUCT_BASE_URL", ""),
+        "STOREFRONT_PRODUCT_BASE_URL",
+    )
+
+    replacements = {
+        "{ADMIN_PRODUCT_BASE_URL}": admin_product_base_url,
+        "{STOREFRONT_PRODUCT_BASE_URL}": storefront_product_base_url,
+    }
+
+    out: List[Dict[str, Any]] = []
+    for row in CORE_FIXED:
+        new_row = dict(row)
+        expr = str(new_row.get("expr", "") or "")
+        for token, value in replacements.items():
+            expr = expr.replace(token, value)
+        new_row["expr"] = expr
+        out.append(new_row)
+    return out
+
+
+def _sync_cfg_fields(ws, mf_defs: List[Dict[str, Any]], mo_defs: List[Dict[str, Any]], account_cfg: Dict[str, str]) -> Dict[str, Any]:
     """
     Sync Cfg__Fields against the PBS gold standard.
 
@@ -1745,8 +1792,8 @@ def _sync_cfg_fields(ws, mf_defs: List[Dict[str, Any]], mo_defs: List[Dict[str, 
         desired_by_pk[pk] = slim
         desired_order.append(pk)
 
-    # CORE_FIXED — PBS gold standard.
-    for x in CORE_FIXED:
+    # CORE_FIXED — PBS gold standard, with site-specific URLs from Cfg__account_id.
+    for x in _build_core_fixed_rows(account_cfg):
         add_desired({
             "display_name": x["display_name"],
             "entity_type": x["entity_type"],
@@ -2000,7 +2047,7 @@ def run(
     print(f"metafieldDefinitions total: {len(mf_defs)}")
     print(f"metaobjectDefinitions: {len(mo_defs)}")
 
-    sync_summary = _sync_cfg_fields(cfg_ws, mf_defs, mo_defs)
+    sync_summary = _sync_cfg_fields(cfg_ws, mf_defs, mo_defs, account_cfg)
 
     result = {
         "ok": True,
