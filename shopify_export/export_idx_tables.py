@@ -533,6 +533,11 @@ def eval_calc(expr: str, row: Dict[str, Any]) -> Any:
     if not s:
         return ""
 
+    # Compatible with Google Sheets-style config expressions:
+    # allow both GET(...) / JSON(...) and =GET(...) / =JSON(...).
+    if s.startswith("="):
+        s = s[1:].strip()
+
     m = _json_re.match(s)
     if m:
         fid = m.group(1)[1:-1].strip()
