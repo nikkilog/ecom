@@ -63,6 +63,8 @@ SCOPES = [
 
 FIELD_DEF: Dict[str, Dict[str, Any]] = {}
 
+EXPORT_IDX_TABLES_PATCH_VERSION = "2026-05-24-calc-fields-in-fetch-v2"
+
 
 def _now_iso_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -369,26 +371,33 @@ def expand_calc_dependencies(view_df: pd.DataFrame) -> set[str]:
 
 def make_fetch_df(view_df: pd.DataFrame, deps: set[str]) -> pd.DataFrame:
     """
-    规则：
-    - 当前 view 中非 CALC 行要取
-    - CALC 自身不取，但其依赖 field_id 要补进 fetch
-    - 依赖若不在当前 view，必须回到 FIELD_DEF（Cfg__Fields）取完整定义
-    这就是本次修复点；否则像 core.product_gid 这类“被间接依赖但不在当前 view 的字段”会被漏抓。
+    Build the field plan used by both GraphQL fetching and row calculation.
+
+    Important rule:
+    - Keep ALL fields in the current view, including CALC rows.
+      CALC rows do not generate GraphQL selections, but build_plan() needs them
+      so node_to_row() can calculate them and build_export_df_filtered() can output them.
+    - Also add dependency field_ids used by CALC expressions.
+      If a dependency is not in the current view, read its definition from FIELD_DEF.
+
+    This fixes cases like selectedOptions:
+    - view contains CALC fields such as Option1 Name / Option1 Value
+    - CALC depends on VARIANT|raw.variant.selected_options
+    - final IDX__Variants must include both calculated option columns and fetched dependency data
     """
     rows: List[Dict[str, Any]] = []
     fid_map_view = {_clean_str(r.get("field_id")): dict(r) for _, r in view_df.iterrows()}
     seen = set()
 
+    # Keep every field in the output view, including CALC.
     for _, r in view_df.iterrows():
         fid = _clean_str(r.get("field_id"))
-        ft = _clean_str(r.get("field_type")).upper()
-        if not fid:
+        if not fid or fid in seen:
             continue
+        rows.append(dict(r))
+        seen.add(fid)
 
-        if ft != "CALC" and fid not in seen:
-            rows.append(dict(r))
-            seen.add(fid)
-
+    # Add fields needed only as CALC dependencies.
     for dep in deps:
         if dep in seen:
             continue
@@ -398,10 +407,12 @@ def make_fetch_df(view_df: pd.DataFrame, deps: set[str]) -> pd.DataFrame:
             dep_row = dict(FIELD_DEF.get(dep) or {})
 
         if not dep_row:
+            print(f"⚠️ CALC dependency not found in Cfg__Fields / view, skipped: {dep}")
             continue
 
         dep_row.setdefault("view_id", "__FETCH_DEPS__")
         dep_row.setdefault("join key", "")
+        dep_row.setdefault("join_key", "")
         dep_row.setdefault("seq", "999999")
         dep_row.setdefault("alias", "")
         dep_row.setdefault("required", "")
@@ -1210,5 +1221,5 @@ def run(
         result["variants_filtered_archived"] = removed_v
         print(f"✅ IDX__Variants exported: rows={len(df_v)} cols={len(df_v.columns)} mode={mode_v} filtered_archived={removed_v}")
 
-    print("✅ export_idx_tables done.")
+    print(f"✅ export_idx_tables done. patch_version={EXPORT_IDX_TABLES_PATCH_VERSION}")
     return result
