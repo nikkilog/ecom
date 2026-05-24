@@ -108,11 +108,18 @@ def _expand_image_field_rows_for_output(
     """
     Build final output field rows.
 
-    IDX may keep image list as one raw JSON/list column.
-    This function expands it only in the final product view output:
-    Product Images URLs -> Product Image 01, Product Image 02, ...
+    IDX keeps image lists as one raw JSON/list column.
+    Final product/variant views expand an image list into two column groups:
 
-    This keeps IDX clean and machine-readable while final tabs stay human-readable.
+    1) Image 01, Image 02, ...
+       Preview columns using Google Sheets IMAGE() formulas.
+       Formula pattern:
+       =IF(LEN({Product Image 01}&"")=0,"",IMAGE({Product Image 01}))
+
+    2) Product Image 01, Product Image 02, ...
+       Raw CDN URL text columns.
+
+    The preview columns are intentionally placed before the URL columns.
     """
     out: List[Dict[str, Any]] = []
     output_seen: Dict[str, int] = {}
@@ -133,34 +140,44 @@ def _expand_image_field_rows_for_output(
             out.append(fr2)
             continue
 
+        # Decide how many image slots to expand.
+        # If the source field is missing, keep one preview + one URL column so the tab still has a sane header.
         if not fid or base_df is None or base_df.empty or fid not in base_df.columns:
-            # Keep a single blank column if the configured field does not exist yet.
-            fr2 = dict(fr)
-            fr2["alias"] = "Product Image 01"
-            fr2["output_key"] = unique_output_key("Product Image 01")
-            fr2["__image_source_field_id"] = fid
-            fr2["__image_index"] = 0
-            out.append(fr2)
-            continue
-
-        lists = base_df[fid].apply(_safe_json_list_loads)
-        real_max = min(max_images, max([len(x) for x in lists.tolist()] + [0]))
-
-        if real_max <= 0:
             real_max = 1
+        else:
+            lists = base_df[fid].apply(_safe_json_list_loads)
+            real_max = min(max_images, max([len(x) for x in lists.tolist()] + [0]))
+            if real_max <= 0:
+                real_max = 1
 
+        # First group: preview image formula columns.
+        # These reference the raw URL columns by token. The formula engine later resolves {Product Image 01}
+        # to the actual URL column letter even though the URL columns appear after the preview columns.
         for i in range(real_max):
-            fr2 = dict(fr)
-            fr2["alias"] = f"Product Image {i + 1:02d}"
-            fr2["output_key"] = unique_output_key(fr2["alias"])
-            fr2["field_type"] = "RAW"
-            fr2["expr"] = ""
-            fr2["__image_source_field_id"] = fid
-            fr2["__image_index"] = i
-            out.append(fr2)
+            url_alias = f"Product Image {i + 1:02d}"
+            preview_alias = f"Image {i + 1:02d}"
+
+            fr_preview = dict(fr)
+            fr_preview["alias"] = preview_alias
+            fr_preview["output_key"] = unique_output_key(preview_alias)
+            fr_preview["field_type"] = "CALC"
+            fr_preview["expr"] = f'=IF(LEN({{{url_alias}}}&"")=0,"",IMAGE({{{url_alias}}}))'
+            fr_preview.pop("__image_source_field_id", None)
+            fr_preview.pop("__image_index", None)
+            out.append(fr_preview)
+
+        # Second group: raw URL columns.
+        for i in range(real_max):
+            fr_url = dict(fr)
+            fr_url["alias"] = f"Product Image {i + 1:02d}"
+            fr_url["output_key"] = unique_output_key(fr_url["alias"])
+            fr_url["field_type"] = "RAW"
+            fr_url["expr"] = ""
+            fr_url["__image_source_field_id"] = fid
+            fr_url["__image_index"] = i
+            out.append(fr_url)
 
     return out
-
 
 def _norm_bool(x) -> bool:
     s = _safe_str(x).upper()
