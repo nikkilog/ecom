@@ -2189,15 +2189,38 @@ def run(
 
     core_plan = build_core_plan(df_ready, shopify)
 
-    rows_planned = len(meta_plan["set_inputs"]) + len(core_plan["product_inputs"]) + len(core_plan["tag_delta_rows"]) + len(core_plan["variant_inputs"])
+    # ---------------------------------------------------------
+    # Plan summary
+    # ---------------------------------------------------------
+    full_preview = meta_plan["preview_rows"] + core_plan["preview_rows"]
+
+    # rows_planned_ops = Shopify API write operation count.
+    # rows_planned_rows = human input rows planned for write.
+    # Example: one variant row for core.price + one row for core.compare_at_price
+    # may collapse into one Shopify productVariantsBulkUpdate input.
+    rows_planned_ops = (
+        len(meta_plan["set_inputs"])
+        + len(core_plan["product_inputs"])
+        + len(core_plan["tag_delta_rows"])
+        + len(core_plan["variant_inputs"])
+    )
+    rows_planned_rows = len(full_preview)
+
+    # Keep old key compatible, but make rows_planned mean sheet/input rows,
+    # not collapsed Shopify API operations.
+    rows_planned = rows_planned_rows
 
     df_unresolvable = df_ready[df_ready["_skip_reason"] != ""].copy()
+
     bad_detail_rows = [{
         "entity_type": _norm_str(r.get("entity_type")),
         "owner_id": "",
         "field_key": _norm_str(r.get("field_key")),
         "error_reason": _norm_str(r.get("reason")),
-        "message": f"sheet_row={r.get('sheet_row')} | gid_or_handle={r.get('gid_or_handle')} | action={r.get('action')} | reason={r.get('reason')}",
+        "message": (
+            f"sheet_row={r.get('sheet_row')} | gid_or_handle={r.get('gid_or_handle')} | "
+            f"action={r.get('action')} | desired_value={r.get('desired_value')} | reason={r.get('reason')}"
+        ),
     } for r in df_bad.to_dict("records")]
 
     unresolvable_detail_rows = [{
@@ -2205,25 +2228,58 @@ def run(
         "owner_id": _norm_str(r.get("owner_id")),
         "field_key": _norm_str(r.get("field_key")),
         "error_reason": _norm_str(r.get("_skip_reason")),
-        "message": f"sheet_row={r.get('sheet_row')} | owner_ref={r.get('owner_ref')} | reason={r.get('_skip_reason')}",
+        "message": (
+            f"sheet_row={r.get('sheet_row')} | owner_ref={r.get('owner_ref')} | "
+            f"action={r.get('action')} | desired_value={r.get('desired_value')} | "
+            f"reason={r.get('_skip_reason')}"
+        ),
     } for r in df_unresolvable.to_dict("records")]
 
     invalid_detail_rows = meta_plan["invalid_rows"] + core_plan["invalid_rows"]
     rows_skipped = len(df_bad) + len(df_unresolvable) + len(invalid_detail_rows)
 
-    preview = (meta_plan["preview_rows"] + core_plan["preview_rows"])[:preview_limit]
+    # preview_limit <= 0 means show all preview rows.
+    if preview_limit and preview_limit > 0:
+        preview = full_preview[:preview_limit]
+    else:
+        preview = full_preview
 
     warnings = []
+
+    _warn_limit = preview_limit if preview_limit and preview_limit > 0 else 50
+
     if not df_bad.empty:
-        warnings.append({"type": "unrecognized_rows", "count": int(len(df_bad)), "examples": df_bad.head(preview_limit).to_dict("records")})
+        warnings.append({
+            "type": "unrecognized_rows",
+            "count": int(len(df_bad)),
+            "examples": df_bad.head(_warn_limit).to_dict("records"),
+        })
+
     if not df_unresolvable.empty:
         warnings.append({
             "type": "unresolvable_rows",
             "count": int(len(df_unresolvable)),
-            "examples": df_unresolvable.head(preview_limit)[["sheet_row", "entity_type", "owner_ref", "field_key", "_skip_reason"]].to_dict("records"),
+            "examples": df_unresolvable.head(_warn_limit)[
+                ["sheet_row", "entity_type", "owner_ref", "field_key", "action", "desired_value", "_skip_reason"]
+            ].to_dict("records"),
         })
+
     if invalid_detail_rows:
-        warnings.append({"type": "invalid_rows", "count": int(len(invalid_detail_rows)), "examples": invalid_detail_rows[:preview_limit]})
+        warnings.append({
+            "type": "invalid_rows",
+            "count": int(len(invalid_detail_rows)),
+            "examples": invalid_detail_rows[:_warn_limit],
+        })
+
+    if rows_planned_ops != rows_planned_rows:
+        warnings.append({
+            "type": "planned_rows_collapsed_to_shopify_ops",
+            "count": int(rows_planned_rows - rows_planned_ops),
+            "message": (
+                f"Input planned rows={rows_planned_rows}, Shopify write ops={rows_planned_ops}. "
+                "This is expected when multiple core fields for the same owner are merged into one Shopify update."
+            ),
+        })
 
     if not confirmed:
         logger.log_row(
@@ -2238,7 +2294,9 @@ def run(
             rows_skipped=rows_skipped,
             message=(
                 f"Preview generated | rows_loaded={rows_loaded} | rows_pending={rows_pending} | "
-                f"rows_recognized={rows_recognized} | rows_planned={rows_planned} | rows_skipped={rows_skipped}"
+                f"rows_recognized={rows_recognized} | rows_planned_rows={rows_planned_rows} | "
+                f"shopify_write_ops={rows_planned_ops} | rows_skipped={rows_skipped} | "
+                f"runlog_url={runlog_sheet_url}"
             ),
             error_reason="",
         )
@@ -2263,6 +2321,8 @@ def run(
                 "rows_pending": rows_pending,
                 "rows_recognized": rows_recognized,
                 "rows_planned": rows_planned,
+                "rows_planned_rows": rows_planned_rows,
+                "shopify_write_ops": rows_planned_ops,
                 "rows_skipped": rows_skipped,
             },
             "preview": preview,
@@ -2288,7 +2348,11 @@ def run(
             rows_planned=rows_planned,
             rows_written=0,
             rows_skipped=rows_skipped,
-            message="Confirmed but DRY_RUN=True. No Shopify write executed.",
+            message=(
+                f"Confirmed but DRY_RUN=True. No Shopify write executed. | "
+                f"rows_planned_rows={rows_planned_rows} | shopify_write_ops={rows_planned_ops} | "
+                f"runlog_url={runlog_sheet_url}"
+            ),
             error_reason="",
         )
         logger.flush()
@@ -2299,12 +2363,21 @@ def run(
                 "rows_pending": rows_pending,
                 "rows_recognized": rows_recognized,
                 "rows_planned": rows_planned,
+                "rows_planned_rows": rows_planned_rows,
+                "shopify_write_ops": rows_planned_ops,
                 "rows_written": 0,
                 "rows_skipped": rows_skipped,
             },
             "preview": preview,
             "warnings": warnings,
-            "meta": {"site_code": site_code, "job_name": job_name, "run_id": run_id},
+            "meta": {
+                "site_code": site_code,
+                "job_name": job_name,
+                "run_id": run_id,
+                "edit_sheet_url": edit_sheet_url,
+                "cfg_sheet_url": cfg_sheet_url,
+                "runlog_sheet_url": runlog_sheet_url,
+            },
         }
 
     print("\n====================================")
@@ -2357,8 +2430,9 @@ def run(
         rows_written=rows_written,
         rows_skipped=rows_skipped,
         message=(
-            f"Apply completed | rows_planned={rows_planned} | rows_written={rows_written} | "
-            f"rows_skipped={rows_skipped} | apply_fail_count={apply_fail_count}"
+            f"Apply completed | rows_planned_rows={rows_planned_rows} | shopify_write_ops={rows_planned_ops} | "
+            f"rows_written={rows_written} | rows_skipped={rows_skipped} | "
+            f"apply_fail_count={apply_fail_count} | runlog_url={runlog_sheet_url}"
         ),
         error_reason="",
     )
@@ -2384,6 +2458,8 @@ def run(
             "rows_pending": rows_pending,
             "rows_recognized": rows_recognized,
             "rows_planned": rows_planned,
+            "rows_planned_rows": rows_planned_rows,
+            "shopify_write_ops": rows_planned_ops,
             "rows_written": rows_written,
             "rows_skipped": rows_skipped,
             "apply_fail_count": apply_fail_count,
