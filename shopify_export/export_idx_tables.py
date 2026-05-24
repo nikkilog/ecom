@@ -381,13 +381,11 @@ def make_fetch_df(view_df: pd.DataFrame, deps: set[str]) -> pd.DataFrame:
 
     for _, r in view_df.iterrows():
         fid = _clean_str(r.get("field_id"))
-        ft = _clean_str(r.get("field_type")).upper()
-        if not fid:
+        if not fid or fid in see
             continue
 
-        if ft != "CALC" and fid not in seen:
-            rows.append(dict(r))
-            seen.add(fid)
+        rows.append(dict(r))
+        seen.add(fid)
 
     for dep in deps:
         if dep in seen:
