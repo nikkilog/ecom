@@ -47,10 +47,6 @@ DL_HEADERS = [
     "field_key",
     "value",
     "value_type",
-    "source_view_ids",
-    "source_ref_field_key",
-    "ref_gid",
-    "ref_type",
 ]
 
 VALID_ENTITY_PREFIXES = {"PRODUCT", "VARIANT", "COLLECTION", "PAGE", "METAOBJECT_ENTRY"}
@@ -1025,10 +1021,6 @@ def run(
                         "field_key": fk,
                         "value": val,
                         "value_type": typ,
-                        "source_view_ids": "",
-                        "source_ref_field_key": "",
-                        "ref_gid": "",
-                        "ref_type": "",
                     }
                 )
 
@@ -1102,10 +1094,6 @@ def run(
                                 "field_key": fk,
                                 "value": mo_list_join_sep.join(mo_vals),
                                 "value_type": normalize_str(spec.get("data_type")) or "metaobject_ref_expanded",
-                                "source_view_ids": " , ".join(sorted(spec["source_view_ids"])),
-                                "source_ref_field_key": src_ref_fk,
-                                "ref_gid": " , ".join(ref_gids),
-                                "ref_type": " , ".join(sorted(list(dict.fromkeys(ref_types)))),
                             }
                         )
 
