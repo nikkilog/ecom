@@ -1316,6 +1316,42 @@ def build_and_write_view(
     }
 
 
+def _get_view_target_sheet_label(
+    cfg_tabs_df: pd.DataFrame,
+    view_id: str,
+    default_label: str = "export_product",
+) -> str:
+    """
+    Resolve which spreadsheet label a view should write to.
+
+    Cfg__ExportTabs can include target_sheet_label.
+    - blank / missing target_sheet_label => export_product
+    - non-blank target_sheet_label => lookup that label in Console Core Cfg__Sites
+
+    This keeps IDX__Products / IDX__Variants / DL__ValuesLong in export_product,
+    while allowing heavy output views to be split into export_product_view_2,
+    export_product_view_3, etc.
+    """
+    view_id = _safe_str(view_id)
+    if cfg_tabs_df is None or cfg_tabs_df.empty:
+        raise ValueError("Cfg__ExportTabs is empty")
+
+    if "view_id" not in cfg_tabs_df.columns:
+        raise ValueError("Cfg__ExportTabs 缺少必要字段：view_id")
+
+    hit = cfg_tabs_df[cfg_tabs_df["view_id"].astype(str).str.strip() == view_id]
+    if hit.empty:
+        raise ValueError(f"Cfg__ExportTabs 找不到 view_id={view_id}")
+
+    row = hit.iloc[0]
+    if "target_sheet_label" in cfg_tabs_df.columns:
+        label = _safe_str(row.get("target_sheet_label"))
+        if label:
+            return label
+
+    return default_label
+
+
 def run(
     *,
     site_code: str,
@@ -1330,19 +1366,27 @@ def run(
     gc = make_gspread_client_from_b64(gsheet_sa_b64)
 
     config_url = get_label_sheet_url_from_cfg_sites(gc, console_core_url, site_code, "config")
-    export_product_url = get_label_sheet_url_from_cfg_sites(gc, console_core_url, site_code, "export_product")
+
+    # Source sheet: always read IDX / DL from the canonical export_product file.
+    # Output sheets: resolved per view by Cfg__ExportTabs.target_sheet_label.
+    source_export_product_url = get_label_sheet_url_from_cfg_sites(
+        gc,
+        console_core_url,
+        site_code,
+        "export_product",
+    )
 
     sh_cfg = gc.open_by_url(config_url)
-    sh_data = gc.open_by_url(export_product_url)
+    sh_source = gc.open_by_url(source_export_product_url)
 
     ws_tabs = sh_cfg.worksheet("Cfg__ExportTabs")
     ws_fields = sh_cfg.worksheet("Cfg__ExportTabFields")
     cfg_tabs_df = read_ws_df(ws_tabs)
     cfg_fields_df = read_ws_df(ws_fields)
 
-    ws_idx_products = sh_data.worksheet("IDX__Products")
-    ws_idx_variants = sh_data.worksheet("IDX__Variants")
-    ws_dl = sh_data.worksheet("DL__ValuesLong")
+    ws_idx_products = sh_source.worksheet("IDX__Products")
+    ws_idx_variants = sh_source.worksheet("IDX__Variants")
+    ws_dl = sh_source.worksheet("DL__ValuesLong")
 
     df_idx_products = read_ws_df(ws_idx_products)
     df_idx_variants = read_ws_df(ws_idx_variants)
@@ -1354,27 +1398,59 @@ def run(
 
     if verbose:
         print("loaded:")
-        print("  cfg tabs rows     :", len(cfg_tabs_df))
-        print("  cfg fields rows   :", len(cfg_fields_df))
-        print("  idx products rows :", len(df_idx_products))
-        print("  idx variants rows :", len(df_idx_variants))
-        print("  dl rows           :", len(df_dl_values_long))
-        print("  dl long keys      :", len(long_value_map))
-        print("  products dup cols :", df_idx_products.columns.duplicated().any())
-        print("  variants dup cols :", df_idx_variants.columns.duplicated().any())
-        print("  has product_gid   :", "VARIANT|core.product_gid" in df_idx_variants.columns)
-        print("  has product.gid   :", "VARIANT|core.product.gid" in df_idx_variants.columns)
+        print("  cfg tabs rows        :", len(cfg_tabs_df))
+        print("  cfg fields rows      :", len(cfg_fields_df))
+        print("  source label         :", "export_product")
+        print("  source spreadsheet   :", getattr(sh_source, "title", ""))
+        print("  idx products rows    :", len(df_idx_products))
+        print("  idx variants rows    :", len(df_idx_variants))
+        print("  dl rows              :", len(df_dl_values_long))
+        print("  dl long keys         :", len(long_value_map))
+        print("  products dup cols    :", df_idx_products.columns.duplicated().any())
+        print("  variants dup cols    :", df_idx_variants.columns.duplicated().any())
+        print("  has product_gid      :", "VARIANT|core.product_gid" in df_idx_variants.columns)
+        print("  has product.gid      :", "VARIANT|core.product.gid" in df_idx_variants.columns)
+        print("  has target label col :", "target_sheet_label" in cfg_tabs_df.columns)
 
     enabled_view_ids = [k for k, v in (view_toggles or {}).items() if bool(v)]
     if not enabled_view_ids:
         raise ValueError("没有任何启用的 view。请在 VIEW_TOGGLES 里至少打开一个 True。")
 
+    # Cache opened output spreadsheets by Cfg__Sites label to avoid repeated open_by_url calls.
+    output_sheet_cache: Dict[str, Any] = {
+        "export_product": sh_source,
+    }
+    output_url_cache: Dict[str, str] = {
+        "export_product": source_export_product_url,
+    }
+
     results = []
     for vid in enabled_view_ids:
+        target_sheet_label = _get_view_target_sheet_label(
+            cfg_tabs_df=cfg_tabs_df,
+            view_id=vid,
+            default_label="export_product",
+        )
+
+        if target_sheet_label not in output_sheet_cache:
+            target_url = get_label_sheet_url_from_cfg_sites(
+                gc,
+                console_core_url,
+                site_code,
+                target_sheet_label,
+            )
+            output_sheet_cache[target_sheet_label] = gc.open_by_url(target_url)
+            output_url_cache[target_sheet_label] = target_url
+
+        sh_out = output_sheet_cache[target_sheet_label]
+
         if verbose:
             print(f"\n=== build view: {vid} ===")
+            print("target_sheet_label:", target_sheet_label)
+            print("target_spreadsheet:", getattr(sh_out, "title", ""))
+
         res = build_and_write_view(
-            sh_data=sh_data,
+            sh_data=sh_out,
             cfg_tabs_df=cfg_tabs_df,
             cfg_fields_df=cfg_fields_df,
             df_idx_products=df_idx_products,
@@ -1386,13 +1462,19 @@ def run(
             view_filter_overrides=view_filter_overrides or {},
             verbose=verbose,
         )
+        res["target_sheet_label"] = target_sheet_label
+        res["target_spreadsheet_title"] = getattr(sh_out, "title", "")
         results.append(res)
+
         if verbose:
             print("done:", res)
 
     return {
         "site_code": site_code,
+        "source_sheet_label": "export_product",
+        "source_spreadsheet_title": getattr(sh_source, "title", ""),
         "view_count": len(results),
+        "output_sheet_labels": sorted(output_sheet_cache.keys()),
         "results": results,
         "finished_at": _now_ts(),
     }
