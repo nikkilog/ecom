@@ -1,20 +1,16 @@
-# shopify_sync/edit_metafieldblocks.py
+# shopify_pre_edit/wide_to_metafieldblocks.py
 
 from __future__ import annotations
 
 import base64
 import datetime as dt
 import json
-import random
 import re
-import time
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import gspread
 import pandas as pd
-import requests
 from google.oauth2 import service_account
 
 try:
@@ -31,7 +27,12 @@ CFG_SITES_TAB_DEFAULT = "Cfg__Sites"
 CFG_ACCOUNT_TAB_DEFAULT = "Cfg__account_id"
 CFG_FIELDS_TAB_DEFAULT = "Cfg__Fields"
 
-INPUT_HEADER = [
+JOB_NAME = "wide_to_metafieldblocks"
+
+WIDE_INPUT_TAB_DEFAULT = "Wide_MFBs"
+LONG_OUTPUT_TAB_DEFAULT = "Long_MFBs"
+
+LONG_HEADER = [
     "entity_type",
     "gid_or_handle",
     "field_key",
@@ -45,97 +46,57 @@ INPUT_HEADER = [
     "note",
 ]
 
-RUNLOG_HEADER = [
-    "run_id",
-    "ts_cn",
-    "job_name",
-    "phase",
-    "log_type",
-    "status",
-    "site_code",
-    "entity_type",
-    "gid",
-    "field_key",
-    "rows_loaded",
-    "rows_pending",
-    "rows_recognized",
-    "rows_planned",
-    "rows_written",
-    "rows_skipped",
-    "message",
-    "error_reason",
-]
-
 SUPPORTED_ENTITY_TYPES = {"PRODUCT", "VARIANT", "COLLECTION", "PAGE"}
-SUPPORTED_ACTIONS = {"SET", "CLEAR", "SKIP"}
-SUPPORTED_BLOCK_TYPES = {"list_item", "bullet", "feature", "paragraph"}
-FORBIDDEN_SHOPIFY_PREFIXES = ("mf.shopify.", "v_mf.shopify.", "v.mf.shopify.")
 
-GOOGLE_SHEETS_CELL_LIMIT = 50000
+DEFAULT_IGNORE_COLUMNS = {
+    "",
+    "来源",
+    "source",
+    "SKU",
+    "sku",
+    "Product ID (numeric)",
+    "Product ID",
+    "Product GID",
+    "gid_or_handle",
+    "entity_type",
+    "Variant ID (numeric)",
+    "Variant ID",
+    "Collection ID (numeric)",
+    "Page ID (numeric)",
+    "Variant Base",
+    "Variant Root",
+    "Product Title",
+    "Handle",
+    "handle",
+    "note",
+    "Note",
+    "备注",
+}
+
+SPLIT_COMPAT_SEPARATORS = (";", "|", "\n")
+
+SUPPORTED_MFB_SCALAR_TEXT_TYPES = {
+    "multi_line_text_field",
+    "single_line_text_field",
+}
+
+
+def _is_list_data_type(data_type: str) -> bool:
+    return _norm_str(data_type).lower().startswith("list.")
+
+
+def _is_supported_mfb_data_type(data_type: str) -> bool:
+    dt_ = _norm_str(data_type).lower()
+    return (
+        _is_list_data_type(dt_)
+        or dt_ == "rich_text_field"
+        or dt_ in SUPPORTED_MFB_SCALAR_TEXT_TYPES
+    )
 
 
 # =========================================================
-# Shopify GraphQL
+# Small helpers
 # =========================================================
-
-Q_PRODUCT_BY_HANDLE = """
-query($handle: String!) {
-  productByHandle(handle: $handle) { id handle title }
-}
-"""
-
-Q_COLLECTION_BY_HANDLE = """
-query($handle: String!) {
-  collectionByHandle(handle: $handle) { id handle title }
-}
-"""
-
-Q_PAGES_BY_QUERY = """
-query($q: String!, $first: Int!) {
-  pages(first: $first, query: $q) { edges { node { id handle title } } }
-}
-"""
-
-Q_VARIANTS_BY_QUERY = """
-query($q: String!, $first: Int!) {
-  productVariants(first: $first, query: $q) { edges { node { id sku } } }
-}
-"""
-
-Q_NODES_EXIST = """
-query($ids: [ID!]!) {
-  nodes(ids: $ids) { id }
-}
-"""
-
-M_SET = """
-mutation setMf($metafields: [MetafieldsSetInput!]!) {
-  metafieldsSet(metafields: $metafields) {
-    metafields { id namespace key type value }
-    userErrors { field message code }
-  }
-}
-"""
-
-
-# =========================================================
-# Data objects
-# =========================================================
-
-@dataclass
-class ShopifyClient:
-    graph_url: str
-    headers: dict[str, str]
-    timeout: int = 60
-
-
-# =========================================================
-# Generic utils
-# =========================================================
-
-def _utc_run_id(prefix: str = "edit_metafieldblocks") -> str:
-    return dt.datetime.utcnow().strftime(f"{prefix}_%Y%m%d_%H%M%S")
-
 
 def _now_cn_str() -> str:
     try:
@@ -146,14 +107,28 @@ def _now_cn_str() -> str:
         return dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _utc_run_id(prefix: str = JOB_NAME) -> str:
+    return dt.datetime.utcnow().strftime(f"{prefix}_%Y%m%d_%H%M%S")
+
+
 def _norm_str(x: Any) -> str:
     if x is None:
         return ""
     s = str(x).strip()
-    return "" if s.lower() == "nan" else s
+    if s.lower() == "nan":
+        return ""
+    return s
 
 
-def _safe_int_or_none(x: Any) -> Optional[int]:
+def _norm_key(x: Any) -> str:
+    return re.sub(r"\s+", " ", _norm_str(x)).strip().lower()
+
+
+def _json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _safe_int(x: Any) -> Optional[int]:
     s = _norm_str(x)
     if not s:
         return None
@@ -163,56 +138,60 @@ def _safe_int_or_none(x: Any) -> Optional[int]:
         return None
 
 
-def _chunk_list(items: list[Any], size: int):
-    for i in range(0, len(items), size):
-        yield i, items[i:i + size]
-
-
-def _json_dumps(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-
-
 def _dedupe_keep_order(items: list[str]) -> list[str]:
     seen = set()
     out = []
     for item in items:
-        s = _norm_str(item)
-        if not s:
+        v = _norm_str(item)
+        if not v or v in seen:
             continue
-        if s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
+        seen.add(v)
+        out.append(v)
     return out
 
 
-def _is_json_array_string(s: str) -> bool:
-    s = _norm_str(s)
-    if not (s.startswith("[") and s.endswith("]")):
-        return False
-    try:
-        return isinstance(json.loads(s), list)
-    except Exception:
-        return False
-
-
-def _split_items(s: str) -> list[str]:
-    """
-    Compatibility fallback only. Standard Wide_MFBs should use Display Name-1/-2/-3.
-    """
-    s = _norm_str(s)
+def _split_list_cell(value: Any) -> list[str]:
+    s = _norm_str(value)
     if not s:
         return []
-    parts = re.split(r"[;\n|]+", s)
-    return [p.strip() for p in parts if p and p.strip()]
+
+    # JSON array compatibility, only for legacy/automation input.
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            arr = json.loads(s)
+            if isinstance(arr, list):
+                return [_norm_str(x) for x in arr if _norm_str(x)]
+        except Exception:
+            pass
+
+    parts = [s]
+    for sep in SPLIT_COMPAT_SEPARATORS:
+        new_parts = []
+        for p in parts:
+            new_parts.extend(p.split(sep))
+        parts = new_parts
+
+    return [_norm_str(p) for p in parts if _norm_str(p)]
 
 
-def _is_blank_row(row: dict[str, Any]) -> bool:
-    return all(_norm_str(row.get(c)) == "" for c in INPUT_HEADER)
+def _has_legacy_separator(value: Any) -> bool:
+    s = _norm_str(value)
+    return any(sep in s for sep in SPLIT_COMPAT_SEPARATORS)
+
+
+def _col_to_a1(col_num: int) -> str:
+    if col_num <= 0:
+        raise ValueError(f"Invalid column number: {col_num}")
+    result = ""
+    n = col_num
+    while n:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
 
 
 # =========================================================
-# Secrets / clients
+# Google auth / routing
 # =========================================================
 
 def _get_secret(secret_name: str) -> str:
@@ -237,63 +216,6 @@ def build_gsheet_client(gsheet_sa_b64_secret: str) -> gspread.Client:
     return gspread.authorize(creds)
 
 
-def build_shopify_client(
-    shopify_token_secret: str,
-    shop_domain: str,
-    api_version: str,
-    http_timeout: int = 60,
-) -> ShopifyClient:
-    token = _get_secret(shopify_token_secret)
-    return ShopifyClient(
-        graph_url=f"https://{shop_domain}/admin/api/{api_version}/graphql.json",
-        headers={
-            "X-Shopify-Access-Token": token,
-            "Content-Type": "application/json",
-        },
-        timeout=http_timeout,
-    )
-
-
-def gql(client: ShopifyClient, query: str, variables: Optional[dict] = None, retries: int = 6) -> dict:
-    payload = {"query": query, "variables": variables or {}}
-    last_err = None
-
-    for i in range(retries):
-        try:
-            r = requests.post(
-                client.graph_url,
-                headers=client.headers,
-                json=payload,
-                timeout=client.timeout,
-            )
-
-            try:
-                data = r.json()
-            except Exception:
-                raise RuntimeError(f"Non-JSON response. HTTP {r.status_code}: {r.text[:500]}")
-
-            if r.status_code >= 500:
-                raise RuntimeError(f"HTTP {r.status_code}: {data}")
-
-            if data.get("errors"):
-                raise RuntimeError(data["errors"])
-
-            if data.get("data") is None:
-                raise RuntimeError(f"No data returned: {data}")
-
-            return data["data"]
-
-        except Exception as e:
-            last_err = e
-            time.sleep(min(2**i, 12) + random.random())
-
-    raise RuntimeError(f"GraphQL failed after retries: {last_err}")
-
-
-# =========================================================
-# Sheet routing
-# =========================================================
-
 def get_sheet_url_by_label(
     gc: gspread.Client,
     console_core_url: str,
@@ -309,9 +231,10 @@ def get_sheet_url_by_label(
     if df.empty:
         raise ValueError(f"{cfg_sites_tab} is empty")
 
-    for c in ["site_code", "label", "sheet_url"]:
-        if c not in df.columns:
-            raise ValueError(f"{cfg_sites_tab} missing required column: {c}")
+    required = ["site_code", "label", "sheet_url"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"{cfg_sites_tab} missing required columns: {missing}")
 
     df["site_code"] = df["site_code"].astype(str).str.strip().str.upper()
     df["label"] = df["label"].astype(str).str.strip()
@@ -336,6 +259,9 @@ def open_ws_by_label_and_title(
     label: str,
     worksheet_title: str,
     cfg_sites_tab: str = CFG_SITES_TAB_DEFAULT,
+    create_if_missing: bool = False,
+    default_rows: int = 1000,
+    default_cols: int = 30,
 ):
     sheet_url = get_sheet_url_by_label(
         gc=gc,
@@ -345,1114 +271,856 @@ def open_ws_by_label_and_title(
         cfg_sites_tab=cfg_sites_tab,
     )
     sh = gc.open_by_url(sheet_url)
-    ws = sh.worksheet(worksheet_title)
+
+    try:
+        ws = sh.worksheet(worksheet_title)
+    except gspread.WorksheetNotFound:
+        if not create_if_missing:
+            raise
+        ws = sh.add_worksheet(
+            title=worksheet_title,
+            rows=default_rows,
+            cols=default_cols,
+        )
+
     return sh, ws, sheet_url
 
 
 def load_account_config(
     gc_console: gspread.Client,
     console_core_url: str,
-    cfg_account_tab: str,
+    site_code: str,
+    config_sheet_label: str = "config",  # kept for backward-compatible function signature; not used
+    cfg_sites_tab: str = CFG_SITES_TAB_DEFAULT,
+    cfg_account_tab: str = CFG_ACCOUNT_TAB_DEFAULT,
 ) -> dict[str, str]:
     """
-    Read Console Core / Cfg__account_id.
+    Read account/runtime secrets from Console Core / Cfg__account_id.
 
-    Supports:
-    1) header style:
-       key | value
-
-    2) header style:
-       config_key | config_value
-
-    3) no-header two-column key-value style:
-       SHOP_DOMAIN | xxx
-       SHOPIFY_API_VERSION | 2026-04
-       GSHEET_SA_B64_SECRET | NRP_GSHEET
-       SHOPIFY_TOKEN_SECRET | NRP_SHOPIFY_ACCESS_TOKEN
+    Important:
+      Cfg__account_id belongs to Console Core itself.
+      Do NOT route it through sheet_label=config.
+      sheet_label=config is only for business config tabs such as Cfg__Fields.
     """
     sh_console = gc_console.open_by_url(console_core_url)
     ws = sh_console.worksheet(cfg_account_tab)
-    values = ws.get_all_values()
+    rows = ws.get_all_records()
+    df = pd.DataFrame(rows)
 
-    if not values:
+    if df.empty:
         raise ValueError(f"{cfg_account_tab} is empty in Console Core")
 
-    values = [row for row in values if any(_norm_str(x) for x in row)]
-
-    if not values:
-        raise ValueError(f"{cfg_account_tab} has no non-empty rows in Console Core")
-
-    norm_rows = []
-    for row in values:
-        r = list(row) + ["", ""]
-        norm_rows.append([_norm_str(r[0]), _norm_str(r[1])])
-
-    first_key = norm_rows[0][0].lower().strip()
-    second_key = norm_rows[0][1].lower().strip()
-
-    out: dict[str, str] = {}
-
-    if first_key == "key" and second_key == "value":
-        data_rows = norm_rows[1:]
-    elif first_key == "config_key" and second_key == "config_value":
-        data_rows = norm_rows[1:]
-    else:
-        data_rows = norm_rows
-
-    for k, v in data_rows:
-        if k:
-            out[k] = v
-
-    required_any = [
-        "SHOP_DOMAIN",
-        "SHOPIFY_API_VERSION",
-        "GSHEET_SA_B64_SECRET",
-        "SHOPIFY_TOKEN_SECRET",
-    ]
-
-    found_required = [k for k in required_any if _norm_str(out.get(k))]
-    if not found_required:
-        raise ValueError(
-            f"{cfg_account_tab} does not look like a valid account config table. "
-            f"Expected key-value rows such as SHOP_DOMAIN / SHOPIFY_API_VERSION / "
-            f"GSHEET_SA_B64_SECRET / SHOPIFY_TOKEN_SECRET. First rows: {norm_rows[:5]}"
-        )
-
-    return out
-
-
-# =========================================================
-# RunLog
-# =========================================================
-
-class RunLogger:
-    def __init__(
-        self,
-        gc: gspread.Client,
-        runlog_sheet_url: str,
-        runlog_tab_name: str,
-        run_id: str,
-        job_name: str,
-        site_code: str,
-        flush_every: int = 200,
-    ):
-        self.gc = gc
-        self.runlog_sheet_url = runlog_sheet_url
-        self.runlog_tab_name = runlog_tab_name
-        self.run_id = run_id
-        self.job_name = job_name
-        self.site_code = site_code
-        self.flush_every = flush_every
-        self._buf: list[list[Any]] = []
-
-        sh = gc.open_by_url(runlog_sheet_url)
-        try:
-            self.ws = sh.worksheet(runlog_tab_name)
-        except gspread.WorksheetNotFound:
-            self.ws = sh.add_worksheet(title=runlog_tab_name, rows=1000, cols=len(RUNLOG_HEADER))
-
-        self.ws.update(range_name="A1:R1", values=[RUNLOG_HEADER])
-
-    def log_row(
-        self,
-        *,
-        phase: str,
-        log_type: str,
-        status: str,
-        entity_type: str = "",
-        gid: str = "",
-        field_key: str = "",
-        rows_loaded: int = 0,
-        rows_pending: int = 0,
-        rows_recognized: int = 0,
-        rows_planned: int = 0,
-        rows_written: int = 0,
-        rows_skipped: int = 0,
-        message: str = "",
-        error_reason: str = "",
-    ):
-        self._buf.append([
-            self.run_id,
-            _now_cn_str(),
-            self.job_name,
-            phase,
-            log_type,
-            status,
-            self.site_code,
-            entity_type,
-            gid,
-            field_key,
-            rows_loaded,
-            rows_pending,
-            rows_recognized,
-            rows_planned,
-            rows_written,
-            rows_skipped,
-            message,
-            error_reason,
-        ])
-
-        if len(self._buf) >= self.flush_every:
-            self.flush()
-
-    def flush(self):
-        if not self._buf:
-            return
-
-        for i in range(6):
-            try:
-                self.ws.append_rows(self._buf, value_input_option="RAW", table_range="A:R")
-                self._buf = []
-                return
-            except Exception:
-                time.sleep(min(2**i, 20) + random.random())
-
-        raise RuntimeError("Failed to write RunLog after retries")
-
-
-def log_grouped_details(
-    logger: RunLogger,
-    *,
-    phase: str,
-    status: str,
-    rows_loaded: int,
-    rows_pending: int,
-    rows_recognized: int,
-    rows_planned: int,
-    rows_written: int,
-    rows_skipped: int,
-    detail_rows: list[dict[str, Any]],
-    max_per_reason: int = 3,
-):
-    grouped = defaultdict(list)
-    for r in detail_rows:
-        reason = _norm_str(r.get("error_reason")) or "unknown"
-        grouped[reason].append(r)
-
-    for reason, items in grouped.items():
-        for row in items[:max_per_reason]:
-            logger.log_row(
-                phase=phase,
-                log_type="detail",
-                status=status,
-                entity_type=_norm_str(row.get("entity_type")),
-                gid=_norm_str(row.get("gid") or row.get("owner_id")),
-                field_key=_norm_str(row.get("field_key")),
-                rows_loaded=rows_loaded,
-                rows_pending=rows_pending,
-                rows_recognized=rows_recognized,
-                rows_planned=rows_planned,
-                rows_written=rows_written,
-                rows_skipped=rows_skipped,
-                message=_norm_str(row.get("message")),
-                error_reason=reason,
-            )
-
-
-# =========================================================
-# Input loading / filtering
-# =========================================================
-
-def load_blocks_sheet(ws_blocks) -> pd.DataFrame:
-    rows = ws_blocks.get_all_records()
-    df = pd.DataFrame(rows)
-
-    if df.empty:
-        return pd.DataFrame(columns=INPUT_HEADER + ["_sheet_row", "_source_order"])
-
-    missing = [c for c in INPUT_HEADER if c not in df.columns]
-    if missing:
-        raise ValueError(f"Edit__MetafieldBlocks missing required columns: {missing}")
-
-    df = df[INPUT_HEADER].copy()
-    df["_sheet_row"] = range(2, 2 + len(df))
-    df["_source_order"] = range(len(df))
-
-    for c in INPUT_HEADER:
-        df[c] = df[c].apply(_norm_str)
-
-    df = df[~df.apply(lambda r: _is_blank_row(r.to_dict()), axis=1)].copy()
-
-    df["entity_type"] = df["entity_type"].str.upper().str.strip()
-    df["block_type"] = df["block_type"].str.lower().str.strip()
-    df["action"] = df["action"].str.upper().str.strip()
-    df["mode"] = df["mode"].str.upper().str.strip()
-
-    return df
-
-
-def normalize_blocks_df(
-    df: pd.DataFrame,
-    mode_default: str = "STRICT",
-    action_default: str = "SET",
-    only_entity_types: Optional[set[str]] = None,
-    only_field_prefixes: Optional[set[str]] = None,
-) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
-    if df.empty:
-        return df.copy(), []
-
-    d = df.copy()
-    errors = []
-
-    d["mode"] = d["mode"].replace("", mode_default.upper())
-    d["action"] = d["action"].replace("", action_default.upper())
-
-    if only_entity_types:
-        allow = {x.upper().strip() for x in only_entity_types}
-        d = d[d["entity_type"].isin(allow)].copy()
-
-    if only_field_prefixes:
-        prefixes = tuple(only_field_prefixes)
-        d = d[d["field_key"].astype(str).str.startswith(prefixes)].copy()
-
-    for r in d.to_dict("records"):
-        sheet_row = r.get("_sheet_row")
-        field_key = _norm_str(r.get("field_key")).lower()
-
-        if r["entity_type"] not in SUPPORTED_ENTITY_TYPES:
-            errors.append({
-                "sheet_row": sheet_row,
-                "entity_type": r.get("entity_type", ""),
-                "field_key": r.get("field_key", ""),
-                "error_reason": "invalid_entity_type",
-                "message": f"entity_type={r['entity_type']}",
-            })
-
-        if not r["gid_or_handle"]:
-            errors.append({
-                "sheet_row": sheet_row,
-                "entity_type": r.get("entity_type", ""),
-                "field_key": r.get("field_key", ""),
-                "error_reason": "missing_gid_or_handle",
-                "message": "gid_or_handle is required",
-            })
-
-        if not r["field_key"]:
-            errors.append({
-                "sheet_row": sheet_row,
-                "entity_type": r.get("entity_type", ""),
-                "field_key": r.get("field_key", ""),
-                "error_reason": "missing_field_key",
-                "message": "field_key is required",
-            })
-
-        if field_key and any(field_key.startswith(p) for p in FORBIDDEN_SHOPIFY_PREFIXES):
-            errors.append({
-                "sheet_row": sheet_row,
-                "entity_type": r.get("entity_type", ""),
-                "field_key": r.get("field_key", ""),
-                "error_reason": "forbidden_shopify_field_key",
-                "message": f"field_key={r.get('field_key')}",
-            })
-
-        if r["action"] not in SUPPORTED_ACTIONS:
-            errors.append({
-                "sheet_row": sheet_row,
-                "entity_type": r.get("entity_type", ""),
-                "field_key": r.get("field_key", ""),
-                "error_reason": "invalid_action",
-                "message": f"action={r['action']}",
-            })
-
-        if r["action"] != "CLEAR":
-            if r["block_type"] not in SUPPORTED_BLOCK_TYPES:
-                errors.append({
-                    "sheet_row": sheet_row,
-                    "entity_type": r.get("entity_type", ""),
-                    "field_key": r.get("field_key", ""),
-                    "error_reason": "invalid_block_type",
-                    "message": f"block_type={r['block_type']}",
-                })
-
-    if errors:
-        return d, errors
-
-    d = d[d["action"] != "SKIP"].copy()
-
-    return d, []
-
-
-# =========================================================
-# Cfg Fields
-# =========================================================
-
-def load_cfg_fields(ws_cfg_fields) -> pd.DataFrame:
-    rows = ws_cfg_fields.get_all_records()
-    df = pd.DataFrame(rows)
-
-    if df.empty:
-        raise ValueError("Cfg__Fields is empty")
-
-    for c in ["entity_type", "field_key", "data_type", "source_type", "display_name"]:
-        if c not in df.columns:
-            df[c] = ""
-
-    df["entity_type"] = df["entity_type"].astype(str).str.upper().str.strip()
-    df["field_key"] = df["field_key"].astype(str).str.strip()
-    df["data_type"] = df["data_type"].astype(str).str.strip().str.lower()
-    df["source_type"] = df["source_type"].astype(str).str.strip().str.upper()
-    df["display_name"] = df["display_name"].astype(str).str.strip()
-
-    df = df[
-        (df["source_type"].eq("METAFIELD"))
-        | (df["field_key"].str.startswith("mf."))
-        | (df["field_key"].str.startswith("v_mf."))
-    ].copy()
-
-    return df
-
-
-def build_cfg_field_key_map(cfg_fields: pd.DataFrame) -> dict[tuple[str, str], str]:
-    mp: dict[tuple[str, str], str] = {}
-
-    for r in cfg_fields.to_dict("records"):
-        et = _norm_str(r.get("entity_type")).upper()
-        fk = _norm_str(r.get("field_key"))
-        dt_ = _norm_str(r.get("data_type")).lower()
-        if et and fk and dt_:
-            key = (et, fk)
-            if key in mp and mp[key] != dt_:
-                raise ValueError({
-                    "message": "Cfg__Fields has duplicate entity_type + field_key with different data_type",
-                    "entity_type": et,
-                    "field_key": fk,
-                    "data_types": [mp[key], dt_],
-                })
-            mp[key] = dt_
-
-    return mp
-
-
-def cfg_data_type_for_row(
-    entity_type: str,
-    field_key: str,
-    cfg_type_map: dict[tuple[str, str], str],
-) -> str:
-    et = _norm_str(entity_type).upper()
-    fk = _norm_str(field_key)
-    dt_ = cfg_type_map.get((et, fk))
-    if dt_:
-        return dt_
-
-    # Accept Cfg__Fields stored as mf.* for VARIANT only if input uses v_mf.* and matching key exists.
-    if fk.startswith("v_mf."):
-        dt_ = cfg_type_map.get((et, "mf." + fk[len("v_mf."):]))
-        if dt_:
-            return dt_
-
-    return ""
-
-
-def _ref_scalar_default(reference_default_kind: str) -> str:
-    k = _norm_str(reference_default_kind).lower() or "mixed"
-    return "metaobject_reference" if k == "metaobject" else "mixed_reference"
-
-
-def _ref_list_default(reference_default_kind: str) -> str:
-    k = _norm_str(reference_default_kind).lower() or "mixed"
-    return "list.metaobject_reference" if k == "metaobject" else "list.mixed_reference"
-
-
-def map_cfg_dtype_to_shopify_type(cfg_dt: str, reference_default_kind: str) -> str:
-    dt_ = _norm_str(cfg_dt).lower()
-
-    explicit_scalars = {
-        "boolean", "json",
-        "multi_line_text_field", "number_decimal", "number_integer", "rich_text_field", "single_line_text_field",
-        "product_reference", "variant_reference", "collection_reference", "metaobject_reference", "mixed_reference",
-    }
-    if dt_ in explicit_scalars:
-        return dt_
-
-    if dt_.startswith("list."):
-        inner = dt_[5:].strip()
-        explicit_list_inner = {
-            "boolean", "json",
-            "multi_line_text_field", "number_decimal", "number_integer", "rich_text_field", "single_line_text_field",
-            "product_reference", "variant_reference", "collection_reference", "metaobject_reference", "mixed_reference",
-        }
-        if inner in explicit_list_inner:
-            return "list." + inner
-        if inner in ("reference", "ref"):
-            return _ref_list_default(reference_default_kind)
-        if inner == "string":
-            return "list.single_line_text_field"
-        if inner == "text":
-            return "list.multi_line_text_field"
-        if inner in ("int", "integer"):
-            return "list.number_integer"
-        if inner in ("float", "decimal"):
-            return "list.number_decimal"
-        return "list.single_line_text_field"
-
-    if dt_ in ("reference", "ref"):
-        return _ref_scalar_default(reference_default_kind)
-    if dt_ == "text":
-        return "multi_line_text_field"
-    if dt_ in ("number", "int", "integer"):
-        return "number_integer"
-    if dt_ in ("decimal", "float"):
-        return "number_decimal"
-
-    return "single_line_text_field"
-
-
-def validate_block_type_vs_data_type(block_type: str, cfg_dt: str) -> Optional[str]:
-    bt = _norm_str(block_type).lower()
-    dt_ = _norm_str(cfg_dt).lower()
-
-    if bt == "list_item":
-        if dt_.startswith("list."):
-            return None
-        return f"block_type=list_item requires data_type=list.*, got {cfg_dt}"
-
-    if bt in {"bullet", "feature", "paragraph"}:
-        if dt_ == "rich_text_field":
-            return None
-        return f"block_type={bt} requires data_type=rich_text_field, got {cfg_dt}"
-
-    return f"unsupported block_type={block_type}"
-
-
-# =========================================================
-# Owner resolution
-# =========================================================
-
-def parse_field_key(field_key: str):
-    field_key = _norm_str(field_key)
-    if field_key.startswith("mf."):
-        prefix = "mf."
-    elif field_key.startswith("v_mf."):
-        prefix = "v_mf."
-    else:
-        return None
-
-    rest = field_key[len(prefix):]
-    parts = rest.split(".")
-    if len(parts) < 2:
-        return None
-
-    namespace = parts[0]
-    key = ".".join(parts[1:])
-    if not namespace or not key:
-        return None
-
-    return prefix, namespace, key
-
-
-def normalize_gid_or_numeric(entity_type: str, ref: str) -> Optional[str]:
-    s = _norm_str(ref)
-    et = _norm_str(entity_type).upper()
-
-    if s.startswith("gid://"):
-        return s
-
-    if re.fullmatch(r"\d+", s):
-        if et == "PRODUCT":
-            return f"gid://shopify/Product/{s}"
-        if et == "VARIANT":
-            return f"gid://shopify/ProductVariant/{s}"
-        if et == "COLLECTION":
-            return f"gid://shopify/Collection/{s}"
-        if et == "PAGE":
-            return f"gid://shopify/Page/{s}"
-
-    return None
-
-
-def resolve_product_by_handle(client: ShopifyClient, handle: str) -> Optional[str]:
-    data = gql(client, Q_PRODUCT_BY_HANDLE, {"handle": handle})
-    node = data.get("productByHandle")
-    return node["id"] if node else None
-
-
-def resolve_collection_by_handle(client: ShopifyClient, handle: str) -> Optional[str]:
-    data = gql(client, Q_COLLECTION_BY_HANDLE, {"handle": handle})
-    node = data.get("collectionByHandle")
-    return node["id"] if node else None
-
-
-def resolve_page_by_handle(client: ShopifyClient, handle: str) -> Optional[str]:
-    q = f'handle:"{handle}"'
-    data = gql(client, Q_PAGES_BY_QUERY, {"q": q, "first": 5})
-    edges = ((data.get("pages") or {}).get("edges") or [])
-    return edges[0]["node"]["id"] if edges else None
-
-
-def resolve_variant_by_sku(client: ShopifyClient, sku: str) -> Optional[str]:
-    q = f'sku:"{sku}"'
-    data = gql(client, Q_VARIANTS_BY_QUERY, {"q": q, "first": 5})
-    edges = ((data.get("productVariants") or {}).get("edges") or [])
-    return edges[0]["node"]["id"] if edges else None
-
-
-def nodes_exist_map(client: ShopifyClient, ids: list[str], chunk_size: int = 80) -> dict[str, bool]:
-    out = {}
-    ids = [x for x in ids if isinstance(x, str) and x.strip()]
-    for _, part in _chunk_list(ids, chunk_size):
-        data = gql(client, Q_NODES_EXIST, {"ids": part})
-        nodes = data.get("nodes") or []
-        exist_set = {n["id"] for n in nodes if n and n.get("id")}
-        for x in part:
-            out[x] = x in exist_set
-    return out
-
-
-def resolve_owner_ids(client: ShopifyClient, df_plan: pd.DataFrame) -> pd.DataFrame:
-    d = df_plan.copy()
-    d["owner_id"] = d.apply(lambda r: normalize_gid_or_numeric(r["entity_type"], r["gid_or_handle"]), axis=1)
-
-    mask_need = d["owner_id"].isna() & d["gid_or_handle"].ne("")
-    need = d.loc[mask_need, ["entity_type", "gid_or_handle"]].drop_duplicates()
-
-    cache: dict[tuple[str, str], Optional[str]] = {}
-
-    def resolve_one(et: str, ref: str) -> Optional[str]:
-        k = (et, ref)
-        if k in cache:
-            return cache[k]
-
-        v = None
-        if et == "PRODUCT":
-            v = resolve_product_by_handle(client, ref)
-        elif et == "COLLECTION":
-            v = resolve_collection_by_handle(client, ref)
-        elif et == "PAGE":
-            v = resolve_page_by_handle(client, ref)
-        elif et == "VARIANT":
-            v = resolve_variant_by_sku(client, ref)
-
-        cache[k] = v
-        return v
-
-    resolved_map = {}
-    for row in need.itertuples(index=False):
-        resolved_map[(row.entity_type, row.gid_or_handle)] = resolve_one(row.entity_type, row.gid_or_handle)
-
-    d["owner_id"] = d.apply(
-        lambda r: r["owner_id"] if r["owner_id"] else resolved_map.get((r["entity_type"], r["gid_or_handle"])),
-        axis=1,
+    lower_cols = {str(c).lower().strip(): c for c in df.columns}
+
+    # key/value style
+    if "key" in lower_cols and "value" in lower_cols:
+        k_col = lower_cols["key"]
+        v_col = lower_cols["value"]
+        out = {}
+        for r in df.to_dict("records"):
+            k = _norm_str(r.get(k_col))
+            v = _norm_str(r.get(v_col))
+            if k:
+                out[k] = v
+        return out
+
+    # config_key/config_value style
+    if "config_key" in lower_cols and "config_value" in lower_cols:
+        k_col = lower_cols["config_key"]
+        v_col = lower_cols["config_value"]
+        out = {}
+        for r in df.to_dict("records"):
+            k = _norm_str(r.get(k_col))
+            v = _norm_str(r.get(v_col))
+            if k:
+                out[k] = v
+        return out
+
+    # fallback: first two columns, but explicitly report the assumption
+    if len(df.columns) >= 2:
+        k_col, v_col = df.columns[:2]
+        out = {}
+        for r in df.to_dict("records"):
+            k = _norm_str(r.get(k_col))
+            v = _norm_str(r.get(v_col))
+            if k:
+                out[k] = v
+        if out:
+            return out
+
+    raise ValueError(
+        f"{cfg_account_tab} in Console Core must contain key/value or config_key/config_value columns. "
+        f"Found columns: {list(df.columns)}"
     )
 
-    d["_skip_reason"] = ""
-    d.loc[d["owner_id"].isna() | (d["owner_id"].astype(str).str.strip() == ""), "_skip_reason"] = "cannot_resolve_owner_id"
+# =========================================================
+# Cfg__Fields dictionary
+# =========================================================
 
-    mask_has_owner = d["_skip_reason"].eq("")
-    unique_owner_ids = d.loc[mask_has_owner, "owner_id"].astype(str).drop_duplicates().tolist()
-    exist_map = nodes_exist_map(client, unique_owner_ids, chunk_size=80)
+@dataclass
+class FieldDef:
+    display_name: str
+    field_key: str
+    data_type: str
+    entity_type: str
+    source_type: str
 
-    d["_owner_exists"] = d["owner_id"].apply(lambda x: bool(exist_map.get(x, False)) if x else False)
-    d.loc[mask_has_owner & (~d["_owner_exists"]), "_skip_reason"] = "owner_not_found_in_shop"
+
+def load_cfg_fields(
+    gc: gspread.Client,
+    console_core_url: str,
+    site_code: str,
+    config_sheet_label: str = "config",
+    cfg_tab_fields: str = CFG_FIELDS_TAB_DEFAULT,
+    cfg_sites_tab: str = CFG_SITES_TAB_DEFAULT,
+) -> pd.DataFrame:
+    _, ws, _ = open_ws_by_label_and_title(
+        gc=gc,
+        console_core_url=console_core_url,
+        site_code=site_code,
+        label=config_sheet_label,
+        worksheet_title=cfg_tab_fields,
+        cfg_sites_tab=cfg_sites_tab,
+        create_if_missing=False,
+    )
+
+    rows = ws.get_all_records()
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise ValueError(f"{cfg_tab_fields} is empty")
+
+    for c in ["display_name", "field_key", "data_type", "entity_type", "source_type"]:
+        if c not in df.columns:
+            raise ValueError(f"{cfg_tab_fields} missing required column: {c}")
+
+    d = df.copy()
+    d["display_name"] = d["display_name"].astype(str).str.strip()
+    d["field_key"] = d["field_key"].astype(str).str.strip()
+    d["data_type"] = d["data_type"].astype(str).str.strip().str.lower()
+    d["entity_type"] = d["entity_type"].astype(str).str.strip().str.upper()
+    d["source_type"] = d["source_type"].astype(str).str.strip().str.upper()
+
+    d = d[
+        (d["display_name"] != "")
+        & (d["field_key"] != "")
+        & (
+            d["source_type"].eq("METAFIELD")
+            | d["field_key"].str.startswith("mf.")
+            | d["field_key"].str.startswith("v_mf.")
+        )
+    ].copy()
 
     return d
 
 
+def build_cfg_display_map(
+    cfg_fields: pd.DataFrame,
+    target_entity_type: str = "PRODUCT",
+) -> dict[str, FieldDef]:
+    """
+    Build display_name -> FieldDef mapping for the current owner entity type.
+
+    Cfg__Fields may legitimately contain the same display_name for different owners,
+    for example:
+      PRODUCT / Variant Base -> mf.custom.variant_base
+      VARIANT / Variant Base -> v_mf.custom.variant_base
+
+    That is not an error. For Wide_MFBs, the mapping must be unique only within
+    the target entity_type currently being generated.
+    """
+    d = cfg_fields.copy()
+
+    target_entity_type = _norm_str(target_entity_type).upper() or "PRODUCT"
+
+    if "entity_type" not in d.columns:
+        raise ValueError("Cfg__Fields missing required column: entity_type")
+
+    d["entity_type"] = d["entity_type"].astype(str).str.strip().str.upper()
+    d = d[d["entity_type"].eq(target_entity_type)].copy()
+
+    if d.empty:
+        raise ValueError(f"Cfg__Fields has no rows for entity_type={target_entity_type}")
+
+    d["_display_key"] = d["display_name"].apply(_norm_key)
+
+    dup = d[d.duplicated("_display_key", keep=False)].copy()
+    if not dup.empty:
+        examples = dup[["display_name", "field_key", "data_type", "entity_type"]].head(50).to_dict("records")
+        raise ValueError({
+            "message": (
+                "Cfg__Fields has duplicate display_name within the same entity_type. "
+                "For Wide_MFBs mapping, display_name must be unique after filtering by entity_type."
+            ),
+            "target_entity_type": target_entity_type,
+            "examples": examples,
+        })
+
+    out = {}
+    for r in d.to_dict("records"):
+        out[r["_display_key"]] = FieldDef(
+            display_name=_norm_str(r.get("display_name")),
+            field_key=_norm_str(r.get("field_key")),
+            data_type=_norm_str(r.get("data_type")).lower(),
+            entity_type=_norm_str(r.get("entity_type")).upper(),
+            source_type=_norm_str(r.get("source_type")).upper(),
+        )
+    return out
+
+
+def lookup_field_def(
+    cfg_map: dict[str, FieldDef],
+    display_name: str,
+) -> Optional[FieldDef]:
+    return cfg_map.get(_norm_key(display_name))
+
+
 # =========================================================
-# Value builders
+# Wide header parsing
 # =========================================================
 
-def build_rich_text_bullet(items: list[str]) -> str:
-    clean_items = [x.strip() for x in items if x and x.strip()]
-    root = {
-        "type": "root",
-        "children": [
-            {
-                "type": "list",
-                "listType": "unordered",
-                "children": [
-                    {
-                        "type": "list-item",
-                        "children": [{"type": "text", "value": item}],
-                    }
-                    for item in clean_items
-                ],
-            }
-        ],
-    }
-    return _json_dumps(root)
+@dataclass
+class ParsedWideColumn:
+    source_col: str
+    display_name: str
+    block_seq: int
+    role: str  # "", "title", "body"
+    field_def: FieldDef
 
 
-def build_rich_text_feature(rows: list[dict[str, Any]]) -> str:
-    children = []
+def parse_number_suffix(header: str) -> tuple[str, Optional[int]]:
+    """
+    Display Name-1 / Display Name 1 -> (Display Name, 1)
+    Suffix number is block_seq, never part of Cfg__Fields.display_name.
+    """
+    h = _norm_str(header)
+    if not h:
+        return "", None
 
-    for r in rows:
-        title = _norm_str(r.get("title"))
-        body = _norm_str(r.get("body"))
-        if not title and not body:
-            continue
+    m = re.match(r"^(.*?)[\s_-]+(\d+)$", h)
+    if not m:
+        return h, None
 
-        paragraph_children = []
-        if title:
-            paragraph_children.append({"type": "text", "value": title, "bold": True})
-        if body:
-            paragraph_children.append({"type": "text", "value": f"\n{body}" if title else body})
-
-        children.append({"type": "paragraph", "children": paragraph_children})
-
-    return _json_dumps({"type": "root", "children": children})
+    base = _norm_str(m.group(1))
+    seq = _safe_int(m.group(2))
+    return base, seq
 
 
-def build_rich_text_paragraph(rows: list[dict[str, Any]]) -> str:
-    children = []
+def parse_role_from_display(base: str) -> tuple[str, str]:
+    """
+    PDP Feature Title -> (PDP Feature, title)
+    PDP Feature Body  -> (PDP Feature, body)
 
-    for r in rows:
-        title = _norm_str(r.get("title"))
-        body = _norm_str(r.get("body") or r.get("value"))
-        if not title and not body:
-            continue
+    Exact Cfg__Fields display_name is tried before this role stripping.
+    """
+    b = _norm_str(base)
+    m = re.match(r"^(.*?)[\s_-]+(Title|Body)$", b, flags=re.I)
+    if not m:
+        return b, ""
 
-        paragraph_children = []
-        if title:
-            paragraph_children.append({"type": "text", "value": title, "bold": True})
-        if body:
-            paragraph_children.append({"type": "text", "value": f"\n{body}" if title else body})
-
-        children.append({"type": "paragraph", "children": paragraph_children})
-
-    return _json_dumps({"type": "root", "children": children})
+    parent = _norm_str(m.group(1))
+    role = _norm_str(m.group(2)).lower()
+    return parent, role
 
 
-# Reference normalization
-
-def to_product_gid(x: str) -> str:
-    s = _norm_str(x)
-    if s.startswith("gid://shopify/Product/"):
-        return s
-    if re.fullmatch(r"\d+", s):
-        return f"gid://shopify/Product/{s}"
-    raise ValueError(f"Invalid Product reference value: {s}")
-
-
-def to_variant_gid(x: str) -> str:
-    s = _norm_str(x)
-    if s.startswith("gid://shopify/ProductVariant/"):
-        return s
-    if re.fullmatch(r"\d+", s):
-        return f"gid://shopify/ProductVariant/{s}"
-    raise ValueError(f"Invalid Variant reference value: {s}")
-
-
-def to_collection_gid(x: str) -> str:
-    s = _norm_str(x)
-    if s.startswith("gid://shopify/Collection/"):
-        return s
-    if re.fullmatch(r"\d+", s):
-        return f"gid://shopify/Collection/{s}"
-    raise ValueError(f"Invalid Collection reference value: {s}")
-
-
-def normalize_reference_items_by_type(mf_type: str, items: list[str]) -> list[str]:
-    t = _norm_str(mf_type).lower()
-
-    if t == "list.product_reference":
-        return [to_product_gid(x) for x in items]
-    if t == "product_reference":
-        return [to_product_gid(items[0])] if items else []
-
-    if t == "list.variant_reference":
-        return [to_variant_gid(x) for x in items]
-    if t == "variant_reference":
-        return [to_variant_gid(items[0])] if items else []
-
-    if t == "list.collection_reference":
-        return [to_collection_gid(x) for x in items]
-    if t == "collection_reference":
-        return [to_collection_gid(items[0])] if items else []
-
-    return items
-
-
-def build_metafield_value(
-    *,
-    block_type: str,
-    action: str,
-    mf_type: str,
-    rows: list[dict[str, Any]],
+def classify_block_type(
+    data_type: str,
+    role: str,
+    rich_text_default_block_type: str = "bullet",
 ) -> str:
-    action = _norm_str(action).upper()
-    block_type = _norm_str(block_type).lower()
-    mf_type = _norm_str(mf_type)
+    dt_ = _norm_str(data_type).lower()
+    role = _norm_str(role).lower()
 
-    if action == "CLEAR":
-        return "[]" if mf_type.startswith("list.") else ""
+    if _is_list_data_type(dt_):
+        return "list_item"
 
-    if block_type == "list_item":
-        values = [_norm_str(r.get("value")) for r in rows]
-        values = [v for v in values if v]
+    if dt_ == "rich_text_field":
+        if role in {"title", "body"}:
+            return "feature"
+        return rich_text_default_block_type
 
-        # Compatibility: split if legacy row still contains ; / newline / |
-        split_values = []
-        for v in values:
-            if re.search(r"[;\n|]", v):
-                split_values.extend(_split_items(v))
-            else:
-                split_values.append(v)
+    if dt_ == "multi_line_text_field":
+        return "multi_line_text"
 
-        split_values = _dedupe_keep_order(split_values)
-        split_values = normalize_reference_items_by_type(mf_type, split_values)
-        return _json_dumps(split_values)
+    if dt_ == "single_line_text_field":
+        return "single_line_text"
 
-    if block_type == "bullet":
-        items = [_norm_str(r.get("body") or r.get("value")) for r in rows]
-        return build_rich_text_bullet(items)
-
-    if block_type == "feature":
-        return build_rich_text_feature(rows)
-
-    if block_type == "paragraph":
-        return build_rich_text_paragraph(rows)
-
-    raise ValueError(f"Unsupported block_type: {block_type}")
+    return ""
 
 
-# =========================================================
-# Build plan
-# =========================================================
+def parse_wide_columns(
+    columns: list[str],
+    cfg_map: dict[str, FieldDef],
+    ignore_columns: Optional[set[str]] = None,
+    rich_text_default_block_type: str = "bullet",
+    error_on_unsupported_datatype: bool = True,
+) -> tuple[list[ParsedWideColumn], list[dict[str, Any]], list[dict[str, Any]]]:
+    ignore = set(DEFAULT_IGNORE_COLUMNS)
+    if ignore_columns:
+        ignore.update(ignore_columns)
 
-def _sort_group_rows(g: pd.DataFrame) -> pd.DataFrame:
-    d = g.copy()
-    d["_seq_sort"] = d["block_seq"].apply(_safe_int_or_none)
-    d["_seq_sort"] = d["_seq_sort"].apply(lambda x: 999999999 if x is None else x)
-    return d.sort_values(["_seq_sort", "_source_order"], kind="stable").copy()
-
-
-def build_plan(
-    df_blocks: pd.DataFrame,
-    cfg_type_map: dict[tuple[str, str], str],
-    reference_default_kind: str,
-) -> dict[str, Any]:
+    parsed = []
     errors = []
-    preview_rows = []
-    plan_rows = []
+    warnings = []
 
-    if df_blocks.empty:
-        return {"plan_rows": [], "preview_rows": [], "errors": []}
-
-    group_cols = ["entity_type", "gid_or_handle", "field_key"]
-
-    for group_key, g0 in df_blocks.groupby(group_cols, dropna=False, sort=False):
-        entity_type, gid_or_handle, field_key = group_key
-        g = _sort_group_rows(g0)
-
-        actions = [a for a in sorted(set(g["action"].astype(str).str.upper().str.strip().tolist())) if a]
-        if len(actions) > 1:
-            errors.append({
-                "entity_type": entity_type,
-                "gid_or_handle": gid_or_handle,
-                "field_key": field_key,
-                "error_reason": "mixed_actions_in_group",
-                "message": f"actions={actions}",
-                "sheet_rows": g["_sheet_row"].tolist(),
-            })
+    for col in columns:
+        col_s = _norm_str(col)
+        if not col_s or col_s in ignore:
             continue
 
-        action = actions[0] if actions else "SET"
-
-        parsed = parse_field_key(field_key)
-        if not parsed:
-            errors.append({
-                "entity_type": entity_type,
-                "gid_or_handle": gid_or_handle,
-                "field_key": field_key,
-                "error_reason": "field_key_not_recognized",
-                "message": f"field_key={field_key}",
-                "sheet_rows": g["_sheet_row"].tolist(),
-            })
-            continue
-
-        prefix, namespace, key = parsed
-
-        if prefix == "v_mf." and entity_type != "VARIANT":
-            errors.append({
-                "entity_type": entity_type,
-                "gid_or_handle": gid_or_handle,
-                "field_key": field_key,
-                "error_reason": "prefix_entity_mismatch",
-                "message": f"v_mf. requires entity_type=VARIANT, got {entity_type}",
-                "sheet_rows": g["_sheet_row"].tolist(),
-            })
-            continue
-
-        if prefix == "mf." and entity_type == "VARIANT":
-            errors.append({
-                "entity_type": entity_type,
-                "gid_or_handle": gid_or_handle,
-                "field_key": field_key,
-                "error_reason": "prefix_entity_mismatch",
-                "message": f"mf. cannot be used for entity_type=VARIANT; use v_mf.",
-                "sheet_rows": g["_sheet_row"].tolist(),
-            })
-            continue
-
-        cfg_dt = cfg_data_type_for_row(entity_type, field_key, cfg_type_map)
-        if not cfg_dt:
-            errors.append({
-                "entity_type": entity_type,
-                "gid_or_handle": gid_or_handle,
-                "field_key": field_key,
-                "error_reason": "missing_cfg_field_key",
-                "message": f"Cannot find field_key in Cfg__Fields for entity_type={entity_type}",
-                "sheet_rows": g["_sheet_row"].tolist(),
-            })
-            continue
-
-        block_types = [x for x in g["block_type"].astype(str).str.lower().str.strip().tolist() if x]
-        unique_block_types = sorted(set(block_types))
-
-        if action == "CLEAR":
-            block_type = unique_block_types[0] if unique_block_types else "list_item"
-        else:
-            if len(unique_block_types) != 1:
-                errors.append({
-                    "entity_type": entity_type,
-                    "gid_or_handle": gid_or_handle,
-                    "field_key": field_key,
-                    "error_reason": "mixed_block_types_in_group",
-                    "message": f"block_types={unique_block_types}",
-                    "sheet_rows": g["_sheet_row"].tolist(),
-                })
+        base, seq = parse_number_suffix(col_s)
+        if seq is None:
+            # This flow is for block/list fields. Single fields should not silently enter this flow.
+            if col_s in ignore:
                 continue
-            block_type = unique_block_types[0]
-
-        if action != "CLEAR":
-            msg = validate_block_type_vs_data_type(block_type, cfg_dt)
-            if msg:
+            # Try exact config only to give a clearer unsupported/single error.
+            fd_exact = lookup_field_def(cfg_map, col_s)
+            if fd_exact:
+                block_type = classify_block_type(
+                    fd_exact.data_type,
+                    role="",
+                    rich_text_default_block_type=rich_text_default_block_type,
+                )
+                if block_type:
+                    errors.append({
+                        "source_col": col_s,
+                        "error_reason": "missing_block_seq_suffix",
+                        "message": "MFB wide columns must use -1/-2/-3 suffix. This column maps to a block/list field but has no sequence suffix.",
+                    })
+                elif error_on_unsupported_datatype:
+                    errors.append({
+                        "source_col": col_s,
+                        "display_name": fd_exact.display_name,
+                        "field_key": fd_exact.field_key,
+                        "data_type": fd_exact.data_type,
+                        "error_reason": "unsupported_data_type_for_mfb",
+                        "message": "Wide_MFBs supports list.*, rich_text_field, multi_line_text_field, and single_line_text_field fields.",
+                    })
+            else:
                 errors.append({
-                    "entity_type": entity_type,
-                    "gid_or_handle": gid_or_handle,
-                    "field_key": field_key,
-                    "error_reason": "block_type_data_type_mismatch",
-                    "message": msg,
-                    "sheet_rows": g["_sheet_row"].tolist(),
+                    "source_col": col_s,
+                    "error_reason": "unknown_wide_column",
+                    "message": "Column is not ignored and cannot be found in Cfg__Fields.display_name. If it is metadata, add it to ignore_columns.",
                 })
-                continue
+            continue
 
-        mf_type = map_cfg_dtype_to_shopify_type(cfg_dt, reference_default_kind)
-        records = g.to_dict("records")
+        # Try exact display name first.
+        role = ""
+        fd = lookup_field_def(cfg_map, base)
+        display_for_lookup = base
 
-        try:
-            value_to_write = build_metafield_value(
-                block_type=block_type,
-                action=action,
-                mf_type=mf_type,
-                rows=records,
+        # If exact is not found, try stripping Title/Body role.
+        if not fd:
+            parent, role_candidate = parse_role_from_display(base)
+            if role_candidate:
+                fd2 = lookup_field_def(cfg_map, parent)
+                if fd2:
+                    fd = fd2
+                    role = role_candidate
+                    display_for_lookup = parent
+
+        if not fd:
+            errors.append({
+                "source_col": col_s,
+                "base_display_name": base,
+                "error_reason": "display_name_not_found_in_cfg_fields",
+                "message": "Base display_name after removing sequence suffix was not found in Cfg__Fields.",
+            })
+            continue
+
+        # If exact match exists and role not yet set, still detect Title/Body for rich_text feature columns
+        # only when exact display name is not itself the intended standalone config key.
+        if not role:
+            parent, role_candidate = parse_role_from_display(base)
+            if role_candidate and _norm_key(parent) == _norm_key(fd.display_name):
+                role = role_candidate
+
+        block_type = classify_block_type(
+            fd.data_type,
+            role=role,
+            rich_text_default_block_type=rich_text_default_block_type,
+        )
+
+        if not block_type:
+            if error_on_unsupported_datatype:
+                errors.append({
+                    "source_col": col_s,
+                    "display_name": display_for_lookup,
+                    "field_key": fd.field_key,
+                    "data_type": fd.data_type,
+                    "error_reason": "unsupported_data_type_for_mfb",
+                    "message": "Wide_MFBs supports list.*, rich_text_field, multi_line_text_field, and single_line_text_field fields.",
+                })
+            continue
+
+        if (fd.data_type.startswith("list.") or fd.data_type in SUPPORTED_MFB_SCALAR_TEXT_TYPES) and role:
+            errors.append({
+                "source_col": col_s,
+                "display_name": display_for_lookup,
+                "field_key": fd.field_key,
+                "data_type": fd.data_type,
+                "error_reason": "role_column_used_for_non_rich_text_field",
+                "message": "Title/Body role columns are only valid for rich_text_field.",
+            })
+            continue
+
+        parsed.append(ParsedWideColumn(
+            source_col=col_s,
+            display_name=fd.display_name,
+            block_seq=seq,
+            role=role,
+            field_def=fd,
+        ))
+
+    return parsed, errors, warnings
+
+
+# =========================================================
+# Wide loading / long building
+# =========================================================
+
+def load_wide_sheet(
+    ws_wide,
+    header_row: int = 1,
+    field_key_row: int = 2,
+    data_start_row: int = 3,
+) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """
+    Read Wide_MFBs with a two-row header convention.
+
+    Row 1: human wide column names, for example:
+      Product ID (numeric), Compatible Brand-1, Compatible Models-1
+
+    Row 2: generated field_key mapping row. It is NOT a data row.
+      This row is written by this job as a process record.
+
+    Row 3+: product data rows.
+    """
+    values = ws_wide.get_all_values()
+    if not values or len(values) < header_row:
+        return pd.DataFrame(), [], []
+
+    header_idx = header_row - 1
+    mapping_idx = field_key_row - 1
+    data_idx = data_start_row - 1
+
+    headers = [_norm_str(x) for x in values[header_idx]]
+    while headers and headers[-1] == "":
+        headers.pop()
+
+    if not headers:
+        return pd.DataFrame(), [], []
+
+    # Existing mapping row is returned only for diagnostics; the job regenerates it.
+    existing_mapping = []
+    if len(values) > mapping_idx:
+        existing_mapping = [_norm_str(x) for x in values[mapping_idx][:len(headers)]]
+        existing_mapping += [""] * (len(headers) - len(existing_mapping))
+
+    data_rows = values[data_idx:] if len(values) > data_idx else []
+    normalized_rows = []
+    for row in data_rows:
+        padded = list(row[:len(headers)]) + [""] * max(0, len(headers) - len(row))
+        normalized_rows.append([_norm_str(x) for x in padded])
+
+    df = pd.DataFrame(normalized_rows, columns=headers)
+    if df.empty:
+        return df, headers, existing_mapping
+
+    # Drop rows that are completely blank across the known wide columns.
+    mask_not_blank = df.apply(lambda r: any(_norm_str(x) for x in r.tolist()), axis=1)
+    df = df[mask_not_blank].copy()
+
+    for c in df.columns:
+        df[c] = df[c].apply(_norm_str)
+
+    return df, headers, existing_mapping
+
+
+def build_field_key_mapping_row(
+    columns: list[str],
+    parsed_cols: list[ParsedWideColumn],
+) -> list[str]:
+    """Build the row-2 field_key process record for Wide_MFBs."""
+    by_col = {p.source_col: p.field_def.field_key for p in parsed_cols}
+    return [by_col.get(_norm_str(c), "") for c in columns]
+
+
+def write_field_key_mapping_row(
+    ws_wide,
+    mapping_values: list[str],
+    field_key_row: int = 2,
+) -> dict[str, Any]:
+    if not mapping_values:
+        return {"mapping_row_written": 0}
+    last_col = _col_to_a1(len(mapping_values))
+    ws_wide.update(
+        range_name=f"A{field_key_row}:{last_col}{field_key_row}",
+        values=[mapping_values],
+        value_input_option="RAW",
+    )
+    return {"mapping_row_written": 1, "mapping_cols_written": len(mapping_values)}
+
+
+def get_owner_from_wide_row(
+    row: dict[str, Any],
+    default_entity_type: str = "PRODUCT",
+) -> tuple[str, str]:
+    entity_type = _norm_str(row.get("entity_type") or default_entity_type).upper()
+    if entity_type not in SUPPORTED_ENTITY_TYPES:
+        raise ValueError(f"Unsupported entity_type: {entity_type}")
+
+    # Prefer explicit gid_or_handle.
+    gid_or_handle = _norm_str(row.get("gid_or_handle"))
+
+    if not gid_or_handle:
+        if entity_type == "PRODUCT":
+            gid_or_handle = (
+                _norm_str(row.get("Product ID (numeric)"))
+                or _norm_str(row.get("Product ID"))
+                or _norm_str(row.get("Product GID"))
+                or _norm_str(row.get("Handle"))
+                or _norm_str(row.get("handle"))
             )
+        elif entity_type == "VARIANT":
+            gid_or_handle = (
+                _norm_str(row.get("Variant ID (numeric)"))
+                or _norm_str(row.get("Variant ID"))
+                or _norm_str(row.get("SKU"))
+            )
+        elif entity_type == "COLLECTION":
+            gid_or_handle = (
+                _norm_str(row.get("Collection ID (numeric)"))
+                or _norm_str(row.get("Collection ID"))
+                or _norm_str(row.get("Handle"))
+                or _norm_str(row.get("handle"))
+            )
+        elif entity_type == "PAGE":
+            gid_or_handle = (
+                _norm_str(row.get("Page ID (numeric)"))
+                or _norm_str(row.get("Page ID"))
+                or _norm_str(row.get("Handle"))
+                or _norm_str(row.get("handle"))
+            )
+
+    return entity_type, gid_or_handle
+
+
+def build_long_rows(
+    df_wide: pd.DataFrame,
+    parsed_cols: list[ParsedWideColumn],
+    *,
+    data_start_row: int = 3,
+    default_entity_type: str = "PRODUCT",
+    action_default: str = "SET",
+    mode_default: str = "STRICT",
+    add_source_note: bool = True,
+    dedupe_list_values_per_field: bool = True,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    out = []
+    errors = []
+    warnings = []
+
+    if df_wide.empty:
+        return out, errors, warnings
+
+    # Group parsed columns by source_col for lookup.
+    parsed_by_col = {p.source_col: p for p in parsed_cols}
+
+    for row_idx, row in enumerate(df_wide.to_dict("records"), start=data_start_row):
+        try:
+            entity_type, gid_or_handle = get_owner_from_wide_row(row, default_entity_type=default_entity_type)
         except Exception as e:
             errors.append({
-                "entity_type": entity_type,
-                "gid_or_handle": gid_or_handle,
-                "field_key": field_key,
-                "error_reason": "invalid_value",
+                "sheet_row": row_idx,
+                "error_reason": "invalid_owner",
                 "message": str(e),
-                "sheet_rows": g["_sheet_row"].tolist(),
             })
             continue
 
-        if len(value_to_write) >= GOOGLE_SHEETS_CELL_LIMIT:
+        if not gid_or_handle:
             errors.append({
-                "entity_type": entity_type,
-                "gid_or_handle": gid_or_handle,
-                "field_key": field_key,
-                "error_reason": "value_too_long",
-                "message": f"value length={len(value_to_write)} exceeds Google Sheets cell limit reference threshold",
-                "sheet_rows": g["_sheet_row"].tolist(),
+                "sheet_row": row_idx,
+                "error_reason": "missing_gid_or_handle",
+                "message": "Cannot determine gid_or_handle from wide row.",
             })
             continue
 
-        plan_row = {
-            "entity_type": entity_type,
-            "gid_or_handle": gid_or_handle,
-            "field_key": field_key,
-            "namespace": namespace,
-            "key": key,
-            "mf_type": mf_type,
-            "action": action,
-            "block_type": block_type,
-            "desired_value": value_to_write,
-            "source_rows": g["_sheet_row"].tolist(),
-        }
-        plan_rows.append(plan_row)
+        base_note = _norm_str(row.get("note") or row.get("Note") or row.get("备注"))
 
-        preview_rows.append({
-            "entity_type": entity_type,
-            "gid_or_handle": gid_or_handle,
-            "field_key": field_key,
-            "action": action,
-            "block_type": block_type,
-            "mf_type": mf_type,
-            "value_preview": value_to_write[:300],
-            "source_rows": ",".join(map(str, g["_sheet_row"].tolist()[:10])),
-        })
+        # Feature rows need combining title/body cells into a single long row.
+        # Scalar text fields also need combining Wide columns such as
+        # Compatible Fitment-1 / Compatible Fitment-2 into one metafield value.
+        feature_groups: dict[tuple[str, int], dict[str, Any]] = {}
+        scalar_text_groups: dict[str, dict[str, Any]] = {}
+        list_seen: dict[str, set[str]] = {}
 
-    return {
-        "plan_rows": plan_rows,
-        "preview_rows": preview_rows,
-        "errors": errors,
-    }
-
-
-# =========================================================
-# Apply Shopify
-# =========================================================
-
-def parse_error_index(field_path):
-    try:
-        if isinstance(field_path, list) and len(field_path) >= 2 and str(field_path[0]) == "metafields":
-            return int(field_path[1])
-    except Exception:
-        return None
-    return None
-
-
-def apply_plan(
-    client: ShopifyClient,
-    df_ready: pd.DataFrame,
-    set_batch_size: int,
-) -> dict[str, Any]:
-    rows = df_ready[df_ready["_skip_reason"].eq("")].copy()
-
-    set_inputs = []
-    meta_rows = []
-
-    for r in rows.to_dict("records"):
-        set_inputs.append({
-            "ownerId": r["owner_id"],
-            "namespace": r["namespace"],
-            "key": r["key"],
-            "type": r["mf_type"],
-            "value": str(r["desired_value"]),
-        })
-        meta_rows.append({
-            "entity_type": r.get("entity_type", ""),
-            "owner_id": r.get("owner_id", ""),
-            "field_key": r.get("field_key", ""),
-            "source_rows": r.get("source_rows", []),
-        })
-
-    total = len(set_inputs)
-    if total == 0:
-        return {
-            "ok_count": 0,
-            "fail_count": 0,
-            "total": 0,
-            "detail_fail_rows": [],
-        }
-
-    total_batches = (total + set_batch_size - 1) // set_batch_size
-    print(f"=== Applying metafieldsSet === total={total}, batches={total_batches}, batch_size={set_batch_size}")
-
-    ok_count = 0
-    fail_count = 0
-    detail_fail_rows = []
-
-    for batch_no, (start_idx, batch) in enumerate(_chunk_list(set_inputs, set_batch_size), start=1):
-        meta_batch = meta_rows[start_idx:start_idx + len(batch)]
-
-        print(f"Batch {batch_no}/{total_batches}: {len(batch)} items ... ", end="", flush=True)
-
-        try:
-            data = gql(client, M_SET, {"metafields": batch})
-            resp = data["metafieldsSet"]
-            user_errors = resp.get("userErrors") or []
-
-            if not user_errors:
-                ok_count += len(batch)
-                print("OK", flush=True)
+        for col_name, value in row.items():
+            col_name = _norm_str(col_name)
+            if col_name not in parsed_by_col:
                 continue
 
-            err_by_i = {}
-            non_indexed_errors = []
+            p = parsed_by_col[col_name]
+            v = _norm_str(value)
+            if not v:
+                continue
 
-            for e in user_errors:
-                idx = parse_error_index(e.get("field"))
-                if idx is None:
-                    non_indexed_errors.append(e)
-                else:
-                    err_by_i.setdefault(idx, []).append(e)
+            fd = p.field_def
+            block_type = classify_block_type(fd.data_type, p.role)
 
-            fail_items = 0
+            note_parts = []
+            if base_note:
+                note_parts.append(base_note)
+            if add_source_note:
+                note_parts.append(f"source_col={col_name}")
+            note = " | ".join(note_parts)
 
-            for idx, errs in err_by_i.items():
-                if not (0 <= idx < len(meta_batch)):
-                    continue
-
-                fail_items += 1
-                r = meta_batch[idx]
-                inp = batch[idx]
-                detail_fail_rows.append({
-                    "entity_type": r.get("entity_type", ""),
-                    "owner_id": r.get("owner_id", ""),
-                    "field_key": r.get("field_key", ""),
-                    "error_reason": "shopify_user_error",
-                    "message": (
-                        f"source_rows={r.get('source_rows')} | "
-                        f"code={errs[0].get('code', '')} | "
-                        f"msg={errs[0].get('message', '')} | "
-                        f"field={errs[0].get('field')} | "
-                        f"ns={inp.get('namespace')} key={inp.get('key')} "
-                        f"type={inp.get('type')} value={str(inp.get('value'))[:120]}"
-                    ),
-                })
-
-            if fail_items == 0:
-                fail_count += len(batch)
-                print(f"FAILED (fail={len(batch)})", flush=True)
-
-                detail_fail_rows.append({
-                    "entity_type": "",
-                    "owner_id": "",
-                    "field_key": "",
-                    "error_reason": "shopify_batch_error",
-                    "message": (
-                        f"batch_error start={start_idx} size={len(batch)} | "
-                        f"no per-item index returned | "
-                        f"user_errors={json.dumps(non_indexed_errors, ensure_ascii=False)[:500]}"
-                    ),
-                })
-            else:
-                batch_ok = len(batch) - fail_items
-                ok_count += batch_ok
-                fail_count += fail_items
-                print(f"PARTIAL_FAIL (ok={batch_ok}, fail={fail_items})", flush=True)
-
-                for e in non_indexed_errors[:3]:
-                    detail_fail_rows.append({
-                        "entity_type": "",
-                        "owner_id": "",
-                        "field_key": "",
-                        "error_reason": "shopify_batch_error",
-                        "message": (
-                            f"batch_error start={start_idx} size={len(batch)} | "
-                            f"code={e.get('code', '')} | "
-                            f"msg={e.get('message', '')} | "
-                            f"field={e.get('field')}"
-                        ),
+            if block_type == "list_item":
+                values = _split_list_cell(v)
+                if _has_legacy_separator(v) and len(values) > 1:
+                    warnings.append({
+                        "sheet_row": row_idx,
+                        "source_col": col_name,
+                        "field_key": fd.field_key,
+                        "warning_type": "legacy_separator_split",
+                        "message": "List cell contains separator. Standard input should use Display Name-1/-2/-3 columns.",
+                        "split_values": values,
                     })
 
-        except Exception as e:
-            fail_count += len(batch)
-            print("FAILED", flush=True)
-            print(f"  exception: {e}", flush=True)
+                if dedupe_list_values_per_field:
+                    seen_key = fd.field_key
+                    list_seen.setdefault(seen_key, set())
 
-            for r, inp in zip(meta_batch, batch):
-                detail_fail_rows.append({
-                    "entity_type": r.get("entity_type", ""),
-                    "owner_id": r.get("owner_id", ""),
-                    "field_key": r.get("field_key", ""),
-                    "error_reason": "batch_exception",
-                    "message": (
-                        f"source_rows={r.get('source_rows')} | exception: {e} | "
-                        f"ns={inp.get('namespace')} key={inp.get('key')} type={inp.get('type')}"
-                    ),
+                for item in values:
+                    if dedupe_list_values_per_field:
+                        if item in list_seen[fd.field_key]:
+                            continue
+                        list_seen[fd.field_key].add(item)
+
+                    out.append({
+                        "entity_type": entity_type,
+                        "gid_or_handle": gid_or_handle,
+                        "field_key": fd.field_key,
+                        "block_type": "list_item",
+                        "block_seq": str(p.block_seq),
+                        "title": "",
+                        "body": "",
+                        "value": item,
+                        "action": action_default,
+                        "mode": mode_default,
+                        "note": note,
+                    })
+
+            elif block_type in {"multi_line_text", "single_line_text"}:
+                # Treat each suffixed Wide column as one candidate value, then write one
+                # final row per field_key after all columns in this wide row are scanned.
+                key = fd.field_key
+                g = scalar_text_groups.setdefault(key, {
+                    "entity_type": entity_type,
+                    "gid_or_handle": gid_or_handle,
+                    "field_key": fd.field_key,
+                    "block_type": block_type,
+                    "block_seq": "",
+                    "title": "",
+                    "body": "",
+                    "value": "",
+                    "action": action_default,
+                    "mode": mode_default,
+                    "note": note,
+                    "data_type": fd.data_type,
+                    "_items": [],
+                    "_source_cols": [],
                 })
 
-    print(f"=== Apply done === total={total}, ok={ok_count}, fail={fail_count}", flush=True)
+                # For multi-line text, split legacy separators too, because old sheets may
+                # paste multiple fitments into one cell. For single-line text, keep the cell
+                # as one logical item and join later with comma.
+                if fd.data_type == "multi_line_text_field":
+                    values = _split_list_cell(v)
+                    if _has_legacy_separator(v) and len(values) > 1:
+                        warnings.append({
+                            "sheet_row": row_idx,
+                            "source_col": col_name,
+                            "field_key": fd.field_key,
+                            "warning_type": "legacy_separator_split",
+                            "message": "Multi-line text cell contains separator. Values were split and joined with line breaks.",
+                            "split_values": values,
+                        })
+                else:
+                    values = [v]
+
+                for item in values:
+                    item = _norm_str(item)
+                    if item:
+                        g["_items"].append((p.block_seq, item))
+                g["_source_cols"].append(col_name)
+
+            elif block_type == "bullet":
+                out.append({
+                    "entity_type": entity_type,
+                    "gid_or_handle": gid_or_handle,
+                    "field_key": fd.field_key,
+                    "block_type": "bullet",
+                    "block_seq": str(p.block_seq),
+                    "title": "",
+                    "body": v,
+                    "value": "",
+                    "action": action_default,
+                    "mode": mode_default,
+                    "note": note,
+                })
+
+            elif block_type == "feature":
+                key = (fd.field_key, p.block_seq)
+                g = feature_groups.setdefault(key, {
+                    "entity_type": entity_type,
+                    "gid_or_handle": gid_or_handle,
+                    "field_key": fd.field_key,
+                    "block_type": "feature",
+                    "block_seq": str(p.block_seq),
+                    "title": "",
+                    "body": "",
+                    "value": "",
+                    "action": action_default,
+                    "mode": mode_default,
+                    "note": note,
+                    "_source_cols": [],
+                })
+
+                if p.role == "title":
+                    g["title"] = v
+                elif p.role == "body":
+                    g["body"] = v
+                else:
+                    # Rich text field with no Title/Body role uses bullet by default, so this should not happen.
+                    g["body"] = v
+
+                g["_source_cols"].append(col_name)
+
+            elif block_type == "paragraph":
+                out.append({
+                    "entity_type": entity_type,
+                    "gid_or_handle": gid_or_handle,
+                    "field_key": fd.field_key,
+                    "block_type": "paragraph",
+                    "block_seq": str(p.block_seq),
+                    "title": "",
+                    "body": v,
+                    "value": "",
+                    "action": action_default,
+                    "mode": mode_default,
+                    "note": note,
+                })
+
+        for _, g in sorted(scalar_text_groups.items(), key=lambda kv: kv[0]):
+            items_with_seq = sorted(g.get("_items", []), key=lambda x: (_safe_int(x[0]) or 999999999))
+            values = [item for _, item in items_with_seq]
+            values = _dedupe_keep_order(values)
+
+            data_type = _norm_str(g.get("data_type")).lower()
+            if data_type == "multi_line_text_field":
+                final_value = "\n".join(values)
+            elif data_type == "single_line_text_field":
+                final_value = ", ".join(values)
+            else:
+                final_value = "\n".join(values)
+
+            source_cols = g.get("_source_cols") or []
+            note_parts = []
+            if base_note:
+                note_parts.append(base_note)
+            if add_source_note and source_cols:
+                note_parts.append("source_cols=" + ",".join(source_cols))
+
+            g["value"] = final_value
+            g["body"] = final_value if data_type == "multi_line_text_field" else ""
+            g["note"] = " | ".join(note_parts)
+            g.pop("_items", None)
+            g.pop("_source_cols", None)
+            g.pop("data_type", None)
+
+            if final_value:
+                out.append(g)
+
+        for (_, _), g in sorted(feature_groups.items(), key=lambda kv: kv[0]):
+            title = _norm_str(g.get("title"))
+            body = _norm_str(g.get("body"))
+
+            if title and not body:
+                warnings.append({
+                    "sheet_row": row_idx,
+                    "field_key": g["field_key"],
+                    "block_seq": g["block_seq"],
+                    "warning_type": "feature_title_without_body",
+                    "message": "Feature title exists but body is empty.",
+                })
+            if body and not title:
+                warnings.append({
+                    "sheet_row": row_idx,
+                    "field_key": g["field_key"],
+                    "block_seq": g["block_seq"],
+                    "warning_type": "feature_body_without_title",
+                    "message": "Feature body exists but title is empty.",
+                })
+
+            g.pop("_source_cols", None)
+            if title or body:
+                out.append(g)
+
+    out = sorted(
+        out,
+        key=lambda r: (
+            _norm_str(r.get("entity_type")),
+            _norm_str(r.get("gid_or_handle")),
+            _norm_str(r.get("field_key")),
+            _safe_int(r.get("block_seq")) or 999999999,
+            _norm_str(r.get("block_type")),
+        ),
+    )
+
+    return out, errors, warnings
+
+
+# =========================================================
+# Output write
+# =========================================================
+
+def ensure_long_header(ws_output):
+    values = ws_output.get_all_values()
+    if not values:
+        ws_output.update(range_name=f"A1:K1", values=[LONG_HEADER])
+        return
+
+    header = values[0]
+    if header[:len(LONG_HEADER)] != LONG_HEADER:
+        ws_output.update(range_name=f"A1:K1", values=[LONG_HEADER])
+
+
+def write_long_output(
+    ws_output,
+    long_rows: list[dict[str, Any]],
+    clear_output_first: bool = True,
+) -> dict[str, Any]:
+    df = pd.DataFrame(long_rows)
+    if df.empty:
+        df = pd.DataFrame(columns=LONG_HEADER)
+
+    for c in LONG_HEADER:
+        if c not in df.columns:
+            df[c] = ""
+
+    values = [LONG_HEADER] + df[LONG_HEADER].fillna("").astype(str).values.tolist()
+
+    if clear_output_first:
+        ws_output.clear()
+
+    ws_output.update(
+        range_name=f"A1:K{len(values)}",
+        values=values,
+        value_input_option="RAW",
+    )
 
     return {
-        "ok_count": ok_count,
-        "fail_count": fail_count,
-        "total": total,
-        "detail_fail_rows": detail_fail_rows,
+        "rows_written": int(len(df)),
     }
 
 
@@ -1463,534 +1131,302 @@ def apply_plan(
 def run(
     *,
     site_code: str,
-    job_name: str = "edit_metafieldblocks",
-
     console_core_url: str,
     console_gsheet_sa_b64_secret: str,
 
-    input_sheet_label: str = "edit",
+    input_sheet_label: str = "pre_edit",
+    output_sheet_label: str = "pre_edit",
     config_sheet_label: str = "config",
-    runlog_sheet_label: str = "runlog_sheet",
 
-    input_worksheet_title: str = "Edit__MetafieldBlocks",
+    input_worksheet_title: str = WIDE_INPUT_TAB_DEFAULT,
+    output_worksheet_title: str = LONG_OUTPUT_TAB_DEFAULT,
+
+    wide_header_row: int = 1,
+    wide_field_key_row: int = 2,
+    wide_data_start_row: int = 3,
+    write_wide_field_key_row: bool = True,
 
     cfg_sites_tab: str = CFG_SITES_TAB_DEFAULT,
     cfg_account_tab: str = CFG_ACCOUNT_TAB_DEFAULT,
     cfg_tab_fields: str = CFG_FIELDS_TAB_DEFAULT,
-    runlog_tab_name: str = "Ops__RunLog",
 
-    run_id: Optional[str] = None,
-    dry_run: bool = True,
-    confirmed: bool = False,
-
-    mode_default: str = "STRICT",
+    default_entity_type: str = "PRODUCT",
     action_default: str = "SET",
+    mode_default: str = "STRICT",
 
-    only_entity_types: Optional[set[str]] = None,
-    only_field_prefixes: Optional[set[str]] = None,
+    preview_only: bool = True,
+    create_output_tab_if_missing: bool = True,
+    clear_output_first: bool = True,
 
-    reference_default_kind: str = "mixed",
-    set_batch_size: int = 25,
-    http_timeout: int = 60,
-    preview_limit: int = 30,
-    detail_max_per_reason: int = 3,
+    rich_text_default_block_type: str = "bullet",
+    ignore_columns: Optional[set[str]] = None,
+    error_on_unsupported_datatype: bool = True,
+
+    dedupe_list_values_per_field: bool = True,
+    add_source_note: bool = True,
+
+    preview_limit: int = 50,
 ) -> dict[str, Any]:
     """
-    Direct write structured metafield blocks to Shopify.
+    Convert human-friendly Wide_MFBs into Long_MFBs / Edit__MetafieldBlocks-compatible rows.
 
-    Responsibility:
-      edit / Edit__MetafieldBlocks -> Shopify metafieldsSet -> runlog
+    Flow:
+      pre_edit / Wide_MFBs
+        -> wide_to_metafieldblocks.py
+      pre_edit / Long_MFBs
 
-    It does NOT generate Edit__ValuesLong.
+    Important:
+      - field_key and data_type come only from config / Cfg__Fields.
+      - Wide_MFBs row 1 is human header; row 2 is generated field_key mapping; row 3+ is data.
+      - Wide column suffix -1/-2/-3 is block_seq, not display_name.
+      - Standard list/scalar-text input is Display Name-1 / Display Name-2 / Display Name-3.
+      - For multi_line_text_field, suffixed columns are merged into one newline-delimited value.
+      - Legacy cell separators ;, |, newline are supported with warning.
     """
 
-    run_id = run_id or _utc_run_id("edit_metafieldblocks")
+    run_id = _utc_run_id(JOB_NAME)
 
-    # Bootstrap Console Core
+    # Bootstrap access to Console Core.
     gc_console = build_gsheet_client(console_gsheet_sa_b64_secret)
 
+    # Read account config from routed config sheet; use site GSHEET SA for business sheets.
     account_cfg = load_account_config(
         gc_console=gc_console,
         console_core_url=console_core_url,
+        site_code=site_code,
+        config_sheet_label=config_sheet_label,
+        cfg_sites_tab=cfg_sites_tab,
         cfg_account_tab=cfg_account_tab,
     )
 
-    shop_domain = _norm_str(account_cfg.get("SHOP_DOMAIN"))
-    api_version = _norm_str(account_cfg.get("SHOPIFY_API_VERSION")) or "2026-04"
-    gsheet_sa_b64_secret = _norm_str(account_cfg.get("GSHEET_SA_B64_SECRET"))
-    shopify_token_secret = _norm_str(account_cfg.get("SHOPIFY_TOKEN_SECRET"))
-
-    missing_cfg = [
-        k for k, v in {
-            "SHOP_DOMAIN": shop_domain,
-            "GSHEET_SA_B64_SECRET": gsheet_sa_b64_secret,
-            "SHOPIFY_TOKEN_SECRET": shopify_token_secret,
-        }.items()
-        if not v
-    ]
-    if missing_cfg:
-        raise ValueError(f"Cfg__account_id missing required keys: {missing_cfg}")
-
-    # Use site sheet service account from Cfg__account_id.
-    gc = build_gsheet_client(gsheet_sa_b64_secret)
-    shopify = build_shopify_client(
-        shopify_token_secret=shopify_token_secret,
-        shop_domain=shop_domain,
-        api_version=api_version,
-        http_timeout=http_timeout,
+    site_gsheet_secret = (
+        account_cfg.get("GSHEET_SA_B64_SECRET")
+        or account_cfg.get("gsheet_sa_b64_secret")
+        or console_gsheet_sa_b64_secret
     )
+    if not site_gsheet_secret:
+        raise ValueError("Missing GSHEET_SA_B64_SECRET in Cfg__account_id and no console secret fallback.")
 
-    _, ws_blocks, input_sheet_url = open_ws_by_label_and_title(
-        gc=gc,
+    gc_site = build_gsheet_client(site_gsheet_secret)
+
+    _, ws_wide, input_sheet_url = open_ws_by_label_and_title(
+        gc=gc_site,
         console_core_url=console_core_url,
         site_code=site_code,
         label=input_sheet_label,
         worksheet_title=input_worksheet_title,
         cfg_sites_tab=cfg_sites_tab,
+        create_if_missing=False,
     )
 
-    _, ws_cfg_fields, cfg_sheet_url = open_ws_by_label_and_title(
-        gc=gc,
+    _, ws_output, output_sheet_url = open_ws_by_label_and_title(
+        gc=gc_site,
         console_core_url=console_core_url,
         site_code=site_code,
-        label=config_sheet_label,
-        worksheet_title=cfg_tab_fields,
+        label=output_sheet_label,
+        worksheet_title=output_worksheet_title,
         cfg_sites_tab=cfg_sites_tab,
+        create_if_missing=create_output_tab_if_missing,
+        default_rows=1000,
+        default_cols=len(LONG_HEADER),
     )
 
-    runlog_sheet_url = get_sheet_url_by_label(
-        gc=gc,
+    cfg_fields = load_cfg_fields(
+        gc=gc_site,
         console_core_url=console_core_url,
         site_code=site_code,
-        label=runlog_sheet_label,
+        config_sheet_label=config_sheet_label,
+        cfg_tab_fields=cfg_tab_fields,
         cfg_sites_tab=cfg_sites_tab,
     )
+    cfg_map = build_cfg_display_map(cfg_fields, target_entity_type=default_entity_type)
 
-    logger = RunLogger(
-        gc=gc,
-        runlog_sheet_url=runlog_sheet_url,
-        runlog_tab_name=runlog_tab_name,
-        run_id=run_id,
-        job_name=job_name,
-        site_code=site_code,
+    df_wide, wide_columns, existing_field_key_row = load_wide_sheet(
+        ws_wide,
+        header_row=wide_header_row,
+        field_key_row=wide_field_key_row,
+        data_start_row=wide_data_start_row,
     )
 
-    df_raw = load_blocks_sheet(ws_blocks)
-    rows_loaded = int(len(df_raw))
-
-    df_blocks, validation_errors = normalize_blocks_df(
-        df=df_raw,
-        mode_default=mode_default,
-        action_default=action_default,
-        only_entity_types=only_entity_types,
-        only_field_prefixes=only_field_prefixes,
+    parsed_cols, parse_errors, parse_warnings = parse_wide_columns(
+        columns=wide_columns,
+        cfg_map=cfg_map,
+        ignore_columns=ignore_columns,
+        rich_text_default_block_type=rich_text_default_block_type,
+        error_on_unsupported_datatype=error_on_unsupported_datatype,
     )
 
-    rows_pending = int(len(df_blocks))
-
-    if validation_errors:
-        rows_skipped = int(len(validation_errors))
-        logger.log_row(
-            phase="preview",
-            log_type="summary",
-            status="ERROR",
-            rows_loaded=rows_loaded,
-            rows_pending=rows_pending,
-            rows_recognized=0,
-            rows_planned=0,
-            rows_written=0,
-            rows_skipped=rows_skipped,
-            message=f"Validation errors: {len(validation_errors)}",
-            error_reason="validation_error",
+    mapping_values = build_field_key_mapping_row(wide_columns, parsed_cols)
+    mapping_write_result = {"mapping_row_written": 0, "mapping_cols_written": 0}
+    if write_wide_field_key_row:
+        mapping_write_result = write_field_key_mapping_row(
+            ws_wide,
+            mapping_values=mapping_values,
+            field_key_row=wide_field_key_row,
         )
-        log_grouped_details(
-            logger,
-            phase="preview",
-            status="FAIL",
-            rows_loaded=rows_loaded,
-            rows_pending=rows_pending,
-            rows_recognized=0,
-            rows_planned=0,
-            rows_written=0,
-            rows_skipped=rows_skipped,
-            detail_rows=validation_errors,
-            max_per_reason=detail_max_per_reason,
-        )
-        logger.flush()
 
+    if parse_errors:
         return {
             "status": "error",
+            "job_name": JOB_NAME,
             "run_id": run_id,
-            "job_name": job_name,
+            "site_code": site_code,
             "summary": {
-                "rows_loaded": rows_loaded,
-                "rows_pending": rows_pending,
-                "rows_recognized": 0,
-                "rows_planned": 0,
-                "rows_written": 0,
-                "rows_skipped": rows_skipped,
-                "errors": len(validation_errors),
+                "rows_loaded": int(len(df_wide)),
+                "parsed_columns": int(len(parsed_cols)),
+                "parse_errors": int(len(parse_errors)),
+                "warnings": int(len(parse_warnings)),
+                "rows_generated": 0,
+                "written": 0,
+                **mapping_write_result,
             },
-            "errors": validation_errors[:preview_limit],
-            "warnings": [],
-            "preview": [],
+            "errors": parse_errors[:preview_limit],
+            "warnings": parse_warnings[:preview_limit],
             "meta": {
-                "site_code": site_code,
+                "input_sheet_label": input_sheet_label,
+                "output_sheet_label": output_sheet_label,
+                "config_sheet_label": config_sheet_label,
                 "input_sheet_url": input_sheet_url,
-                "cfg_sheet_url": cfg_sheet_url,
-                "runlog_sheet_url": runlog_sheet_url,
-                "runlog_tab_name": runlog_tab_name,
-                "shop_domain": shop_domain,
-                "api_version": api_version,
-                "gsheet_sa_b64_secret_from_cfg": gsheet_sa_b64_secret,
-                "shopify_token_secret_from_cfg": shopify_token_secret,
+                "output_sheet_url": output_sheet_url,
+                "input_worksheet_title": input_worksheet_title,
+                "output_worksheet_title": output_worksheet_title,
+                "cfg_tab_fields": cfg_tab_fields,
+                "site_gsheet_secret": site_gsheet_secret,
+                "wide_header_row": wide_header_row,
+                "wide_field_key_row": wide_field_key_row,
+                "wide_data_start_row": wide_data_start_row,
             },
         }
 
-    cfg_fields = load_cfg_fields(ws_cfg_fields)
-    cfg_type_map = build_cfg_field_key_map(cfg_fields)
-
-    plan = build_plan(
-        df_blocks=df_blocks,
-        cfg_type_map=cfg_type_map,
-        reference_default_kind=reference_default_kind,
+    long_rows, build_errors, build_warnings = build_long_rows(
+        df_wide=df_wide,
+        parsed_cols=parsed_cols,
+        data_start_row=wide_data_start_row,
+        default_entity_type=default_entity_type,
+        action_default=action_default,
+        mode_default=mode_default,
+        add_source_note=add_source_note,
+        dedupe_list_values_per_field=dedupe_list_values_per_field,
     )
 
-    build_errors = plan["errors"]
-    plan_rows = plan["plan_rows"]
-    preview_rows = plan["preview_rows"]
-
-    rows_recognized = int(len(df_blocks))
-    rows_planned = int(len(plan_rows))
+    warnings = parse_warnings + build_warnings
 
     if build_errors:
-        rows_skipped = int(len(build_errors))
-        logger.log_row(
-            phase="preview",
-            log_type="summary",
-            status="ERROR",
-            rows_loaded=rows_loaded,
-            rows_pending=rows_pending,
-            rows_recognized=rows_recognized,
-            rows_planned=rows_planned,
-            rows_written=0,
-            rows_skipped=rows_skipped,
-            message=f"Build plan errors: {len(build_errors)}",
-            error_reason="build_plan_error",
-        )
-        log_grouped_details(
-            logger,
-            phase="preview",
-            status="FAIL",
-            rows_loaded=rows_loaded,
-            rows_pending=rows_pending,
-            rows_recognized=rows_recognized,
-            rows_planned=rows_planned,
-            rows_written=0,
-            rows_skipped=rows_skipped,
-            detail_rows=build_errors,
-            max_per_reason=detail_max_per_reason,
-        )
-        logger.flush()
-
         return {
             "status": "error",
+            "job_name": JOB_NAME,
             "run_id": run_id,
-            "job_name": job_name,
+            "site_code": site_code,
             "summary": {
-                "rows_loaded": rows_loaded,
-                "rows_pending": rows_pending,
-                "rows_recognized": rows_recognized,
-                "rows_planned": rows_planned,
-                "rows_written": 0,
-                "rows_skipped": rows_skipped,
-                "errors": len(build_errors),
+                "rows_loaded": int(len(df_wide)),
+                "parsed_columns": int(len(parsed_cols)),
+                "build_errors": int(len(build_errors)),
+                "warnings": int(len(warnings)),
+                "rows_generated": int(len(long_rows)),
+                "written": 0,
+                **mapping_write_result,
             },
             "errors": build_errors[:preview_limit],
-            "warnings": [],
-            "preview": preview_rows[:preview_limit],
+            "warnings": warnings[:preview_limit],
+            "preview": long_rows[:preview_limit],
             "meta": {
-                "site_code": site_code,
                 "input_sheet_url": input_sheet_url,
-                "cfg_sheet_url": cfg_sheet_url,
-                "runlog_sheet_url": runlog_sheet_url,
-                "runlog_tab_name": runlog_tab_name,
-                "shop_domain": shop_domain,
-                "api_version": api_version,
-                "gsheet_sa_b64_secret_from_cfg": gsheet_sa_b64_secret,
-                "shopify_token_secret_from_cfg": shopify_token_secret,
+                "output_sheet_url": output_sheet_url,
+                "input_worksheet_title": input_worksheet_title,
+                "output_worksheet_title": output_worksheet_title,
+                "cfg_tab_fields": cfg_tab_fields,
+                "site_gsheet_secret": site_gsheet_secret,
+                "wide_header_row": wide_header_row,
+                "wide_field_key_row": wide_field_key_row,
+                "wide_data_start_row": wide_data_start_row,
             },
         }
 
-    df_plan = pd.DataFrame(plan_rows)
-    if df_plan.empty:
-        df_ready = pd.DataFrame(columns=[
-            "entity_type", "gid_or_handle", "field_key", "owner_id", "_skip_reason"
-        ])
-    else:
-        df_ready = resolve_owner_ids(shopify, df_plan)
-
-    df_unresolvable = df_ready[df_ready["_skip_reason"] != ""].copy() if not df_ready.empty else pd.DataFrame()
-    unresolvable_detail_rows = []
-    if not df_unresolvable.empty:
-        unresolvable_detail_rows = [
-            {
-                "entity_type": _norm_str(r.get("entity_type")),
-                "owner_id": _norm_str(r.get("owner_id")),
-                "field_key": _norm_str(r.get("field_key")),
-                "error_reason": _norm_str(r.get("_skip_reason")),
-                "message": (
-                    f"gid_or_handle={r.get('gid_or_handle')} | "
-                    f"source_rows={r.get('source_rows')} | "
-                    f"reason={r.get('_skip_reason')}"
-                ),
-            }
-            for r in df_unresolvable.to_dict("records")
-        ]
-
-    rows_skipped = int(len(df_unresolvable))
-    rows_resolvable = int(len(df_ready) - rows_skipped) if not df_ready.empty else 0
-
-    preview_ready = []
-    if not df_ready.empty:
-        for r in df_ready.head(preview_limit).to_dict("records"):
-            preview_ready.append({
-                "entity_type": r.get("entity_type", ""),
-                "gid_or_handle": r.get("gid_or_handle", ""),
-                "owner_id": r.get("owner_id", ""),
-                "field_key": r.get("field_key", ""),
-                "action": r.get("action", ""),
-                "block_type": r.get("block_type", ""),
-                "mf_type": r.get("mf_type", ""),
-                "skip_reason": r.get("_skip_reason", ""),
-                "value_preview": _norm_str(r.get("desired_value"))[:300],
-                "source_rows": r.get("source_rows", ""),
-            })
-
-    if not confirmed:
-        status = "needs_confirmation"
-        logger.log_row(
-            phase="preview",
-            log_type="summary",
-            status="NEEDS_CONFIRMATION",
-            rows_loaded=rows_loaded,
-            rows_pending=rows_pending,
-            rows_recognized=rows_recognized,
-            rows_planned=rows_planned,
-            rows_written=0,
-            rows_skipped=rows_skipped,
-            message=(
-                f"Preview generated | rows_loaded={rows_loaded} | rows_pending={rows_pending} | "
-                f"rows_recognized={rows_recognized} | rows_planned={rows_planned} | "
-                f"rows_resolvable={rows_resolvable} | rows_skipped={rows_skipped}"
-            ),
-            error_reason="",
-        )
-        log_grouped_details(
-            logger,
-            phase="preview",
-            status="SKIP",
-            rows_loaded=rows_loaded,
-            rows_pending=rows_pending,
-            rows_recognized=rows_recognized,
-            rows_planned=rows_planned,
-            rows_written=0,
-            rows_skipped=rows_skipped,
-            detail_rows=unresolvable_detail_rows,
-            max_per_reason=detail_max_per_reason,
-        )
-        logger.flush()
-
+    if preview_only:
         return {
-            "status": status,
+            "status": "preview",
+            "job_name": JOB_NAME,
             "run_id": run_id,
-            "job_name": job_name,
+            "site_code": site_code,
             "summary": {
-                "rows_loaded": rows_loaded,
-                "rows_pending": rows_pending,
-                "rows_recognized": rows_recognized,
-                "rows_planned": rows_planned,
-                "rows_resolvable": rows_resolvable,
-                "rows_written": 0,
-                "rows_skipped": rows_skipped,
-                "errors": 0,
+                "rows_loaded": int(len(df_wide)),
+                "parsed_columns": int(len(parsed_cols)),
+                "warnings": int(len(warnings)),
+                "rows_generated": int(len(long_rows)),
+                "written": 0,
+                **mapping_write_result,
             },
-            "errors": [],
-            "warnings": [
+            "warnings": warnings[:preview_limit],
+            "preview": long_rows[:preview_limit],
+            "parsed_columns": [
                 {
-                    "type": "unresolvable_rows",
-                    "count": int(len(unresolvable_detail_rows)),
-                    "examples": unresolvable_detail_rows[:preview_limit],
+                    "source_col": p.source_col,
+                    "display_name": p.field_def.display_name,
+                    "field_key": p.field_def.field_key,
+                    "data_type": p.field_def.data_type,
+                    "block_seq": p.block_seq,
+                    "role": p.role,
+                    "block_type": classify_block_type(p.field_def.data_type, p.role, rich_text_default_block_type),
                 }
-            ] if unresolvable_detail_rows else [],
-            "preview": preview_ready,
+                for p in parsed_cols[:preview_limit]
+            ],
             "meta": {
-                "site_code": site_code,
                 "input_sheet_url": input_sheet_url,
-                "cfg_sheet_url": cfg_sheet_url,
-                "runlog_sheet_url": runlog_sheet_url,
-                "runlog_tab_name": runlog_tab_name,
-                "shop_domain": shop_domain,
-                "api_version": api_version,
-                "gsheet_sa_b64_secret_from_cfg": gsheet_sa_b64_secret,
-                "shopify_token_secret_from_cfg": shopify_token_secret,
-                "dry_run": dry_run,
-                "confirmed": confirmed,
+                "output_sheet_url": output_sheet_url,
+                "input_worksheet_title": input_worksheet_title,
+                "output_worksheet_title": output_worksheet_title,
+                "cfg_tab_fields": cfg_tab_fields,
+                "generated_at_cn": _now_cn_str(),
+                "site_gsheet_secret": site_gsheet_secret,
+                "wide_header_row": wide_header_row,
+                "wide_field_key_row": wide_field_key_row,
+                "wide_data_start_row": wide_data_start_row,
             },
         }
 
-    if dry_run:
-        logger.log_row(
-            phase="apply",
-            log_type="summary",
-            status="SUCCESS",
-            rows_loaded=rows_loaded,
-            rows_pending=rows_pending,
-            rows_recognized=rows_recognized,
-            rows_planned=rows_planned,
-            rows_written=0,
-            rows_skipped=rows_skipped,
-            message="Confirmed but DRY_RUN=True. No Shopify write executed.",
-            error_reason="",
-        )
-        log_grouped_details(
-            logger,
-            phase="apply",
-            status="SKIP",
-            rows_loaded=rows_loaded,
-            rows_pending=rows_pending,
-            rows_recognized=rows_recognized,
-            rows_planned=rows_planned,
-            rows_written=0,
-            rows_skipped=rows_skipped,
-            detail_rows=unresolvable_detail_rows,
-            max_per_reason=detail_max_per_reason,
-        )
-        logger.flush()
-
-        return {
-            "status": "dry_run_confirmed_no_apply",
-            "run_id": run_id,
-            "job_name": job_name,
-            "summary": {
-                "rows_loaded": rows_loaded,
-                "rows_pending": rows_pending,
-                "rows_recognized": rows_recognized,
-                "rows_planned": rows_planned,
-                "rows_resolvable": rows_resolvable,
-                "rows_written": 0,
-                "rows_skipped": rows_skipped,
-                "errors": 0,
-            },
-            "errors": [],
-            "warnings": [
-                {
-                    "type": "unresolvable_rows",
-                    "count": int(len(unresolvable_detail_rows)),
-                    "examples": unresolvable_detail_rows[:preview_limit],
-                }
-            ] if unresolvable_detail_rows else [],
-            "preview": preview_ready,
-            "meta": {
-                "site_code": site_code,
-                "input_sheet_url": input_sheet_url,
-                "cfg_sheet_url": cfg_sheet_url,
-                "runlog_sheet_url": runlog_sheet_url,
-                "runlog_tab_name": runlog_tab_name,
-                "shop_domain": shop_domain,
-                "api_version": api_version,
-                "gsheet_sa_b64_secret_from_cfg": gsheet_sa_b64_secret,
-                "shopify_token_secret_from_cfg": shopify_token_secret,
-                "dry_run": dry_run,
-                "confirmed": confirmed,
-            },
-        }
-
-    apply_result = apply_plan(
-        client=shopify,
-        df_ready=df_ready,
-        set_batch_size=set_batch_size,
+    write_result = write_long_output(
+        ws_output=ws_output,
+        long_rows=long_rows,
+        clear_output_first=clear_output_first,
     )
-
-    rows_written = int(apply_result["ok_count"])
-    apply_fail_count = int(apply_result["fail_count"])
-
-    final_status = "SUCCESS"
-    if apply_fail_count > 0 and rows_written > 0:
-        final_status = "PARTIAL_SUCCESS"
-    elif apply_fail_count > 0 and rows_written == 0:
-        final_status = "ERROR"
-
-    all_fail_detail_rows = unresolvable_detail_rows + apply_result["detail_fail_rows"]
-    rows_skipped_final = rows_skipped
-
-    logger.log_row(
-        phase="apply",
-        log_type="summary",
-        status=final_status,
-        rows_loaded=rows_loaded,
-        rows_pending=rows_pending,
-        rows_recognized=rows_recognized,
-        rows_planned=rows_planned,
-        rows_written=rows_written,
-        rows_skipped=rows_skipped_final,
-        message=(
-            f"Apply completed | rows_planned={rows_planned} | rows_written={rows_written} | "
-            f"rows_skipped={rows_skipped_final} | apply_fail_count={apply_fail_count}"
-        ),
-        error_reason="",
-    )
-    log_grouped_details(
-        logger,
-        phase="apply",
-        status="FAIL",
-        rows_loaded=rows_loaded,
-        rows_pending=rows_pending,
-        rows_recognized=rows_recognized,
-        rows_planned=rows_planned,
-        rows_written=rows_written,
-        rows_skipped=rows_skipped_final,
-        detail_rows=all_fail_detail_rows,
-        max_per_reason=detail_max_per_reason,
-    )
-    logger.flush()
 
     return {
-        "status": "applied",
+        "status": "written",
+        "job_name": JOB_NAME,
         "run_id": run_id,
-        "job_name": job_name,
+        "site_code": site_code,
         "summary": {
-            "rows_loaded": rows_loaded,
-            "rows_pending": rows_pending,
-            "rows_recognized": rows_recognized,
-            "rows_planned": rows_planned,
-            "rows_resolvable": rows_resolvable,
-            "rows_written": rows_written,
-            "rows_skipped": rows_skipped_final,
-            "apply_fail_count": apply_fail_count,
-            "errors": int(apply_fail_count),
+            "rows_loaded": int(len(df_wide)),
+            "parsed_columns": int(len(parsed_cols)),
+            "warnings": int(len(warnings)),
+            "rows_generated": int(len(long_rows)),
+            **write_result,
+            **mapping_write_result,
         },
-        "errors": apply_result["detail_fail_rows"][:preview_limit],
-        "warnings": [
+        "warnings": warnings[:preview_limit],
+        "preview": long_rows[:preview_limit],
+        "parsed_columns": [
             {
-                "type": "unresolvable_rows",
-                "count": int(len(unresolvable_detail_rows)),
-                "examples": unresolvable_detail_rows[:preview_limit],
+                "source_col": p.source_col,
+                "display_name": p.field_def.display_name,
+                "field_key": p.field_def.field_key,
+                "data_type": p.field_def.data_type,
+                "block_seq": p.block_seq,
+                "role": p.role,
+                "block_type": classify_block_type(p.field_def.data_type, p.role, rich_text_default_block_type),
             }
-        ] if unresolvable_detail_rows else [],
-        "preview": preview_ready,
+            for p in parsed_cols[:preview_limit]
+        ],
         "meta": {
-            "site_code": site_code,
             "input_sheet_url": input_sheet_url,
-            "cfg_sheet_url": cfg_sheet_url,
-            "runlog_sheet_url": runlog_sheet_url,
-            "runlog_tab_name": runlog_tab_name,
-            "shop_domain": shop_domain,
-            "api_version": api_version,
-            "gsheet_sa_b64_secret_from_cfg": gsheet_sa_b64_secret,
-            "shopify_token_secret_from_cfg": shopify_token_secret,
-            "dry_run": dry_run,
-            "confirmed": confirmed,
-            "final_status": final_status,
+            "output_sheet_url": output_sheet_url,
+            "input_worksheet_title": input_worksheet_title,
+            "output_worksheet_title": output_worksheet_title,
+            "cfg_tab_fields": cfg_tab_fields,
+            "generated_at_cn": _now_cn_str(),
+            "site_gsheet_secret": site_gsheet_secret,
+            "wide_header_row": wide_header_row,
+            "wide_field_key_row": wide_field_key_row,
+            "wide_data_start_row": wide_data_start_row,
         },
     }
