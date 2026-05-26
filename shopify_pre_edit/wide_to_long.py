@@ -702,8 +702,29 @@ def should_output_field(field_key: str, meta: dict[str, str], *, exclude_display
     k = str(field_key or "").strip().lower()
     if not k:
         return False
-    if k.startswith("core.") or k.startswith("calc."):
+
+    # calc.* is derived/display logic, never a write target.
+    if k.startswith("calc."):
         return False
+
+    # core.* must be allowed for Edit__Core / core field writes, for example:
+    #   core.title
+    #   core.seo_title
+    #   core.seo_description
+    # Owner identity fields are still blocked because they should be used as gid_or_handle,
+    # not emitted as editable rows.
+    if k.startswith("core."):
+        if k in {
+            "core.id",
+            "core.gid",
+            "core.legacy_id",
+            "core.product_id",
+            "core.variant_id",
+            "core.collection_id",
+            "core.page_id",
+        }:
+            return False
+        return True
 
     if exclude_display_only:
         joined = " ".join([
