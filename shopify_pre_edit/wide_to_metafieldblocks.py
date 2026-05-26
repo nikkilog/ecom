@@ -384,15 +384,45 @@ def load_cfg_fields(
     return d
 
 
-def build_cfg_display_map(cfg_fields: pd.DataFrame) -> dict[str, FieldDef]:
+def build_cfg_display_map(
+    cfg_fields: pd.DataFrame,
+    target_entity_type: str = "PRODUCT",
+) -> dict[str, FieldDef]:
+    """
+    Build display_name -> FieldDef mapping for the current owner entity type.
+
+    Cfg__Fields may legitimately contain the same display_name for different owners,
+    for example:
+      PRODUCT / Variant Base -> mf.custom.variant_base
+      VARIANT / Variant Base -> v_mf.custom.variant_base
+
+    That is not an error. For Wide_MFBs, the mapping must be unique only within
+    the target entity_type currently being generated.
+    """
     d = cfg_fields.copy()
+
+    target_entity_type = _norm_str(target_entity_type).upper() or "PRODUCT"
+
+    if "entity_type" not in d.columns:
+        raise ValueError("Cfg__Fields missing required column: entity_type")
+
+    d["entity_type"] = d["entity_type"].astype(str).str.strip().str.upper()
+    d = d[d["entity_type"].eq(target_entity_type)].copy()
+
+    if d.empty:
+        raise ValueError(f"Cfg__Fields has no rows for entity_type={target_entity_type}")
+
     d["_display_key"] = d["display_name"].apply(_norm_key)
 
     dup = d[d.duplicated("_display_key", keep=False)].copy()
     if not dup.empty:
         examples = dup[["display_name", "field_key", "data_type", "entity_type"]].head(50).to_dict("records")
         raise ValueError({
-            "message": "Cfg__Fields has duplicate display_name. It must be unique for Wide_MFBs mapping.",
+            "message": (
+                "Cfg__Fields has duplicate display_name within the same entity_type. "
+                "For Wide_MFBs mapping, display_name must be unique after filtering by entity_type."
+            ),
+            "target_entity_type": target_entity_type,
             "examples": examples,
         })
 
@@ -1017,7 +1047,7 @@ def run(
         cfg_tab_fields=cfg_tab_fields,
         cfg_sites_tab=cfg_sites_tab,
     )
-    cfg_map = build_cfg_display_map(cfg_fields)
+    cfg_map = build_cfg_display_map(cfg_fields, target_entity_type=default_entity_type)
 
     df_wide = load_wide_sheet(ws_wide)
 
