@@ -68,7 +68,7 @@ RUNLOG_HEADER = [
 
 SUPPORTED_ENTITY_TYPES = {"PRODUCT", "VARIANT", "COLLECTION", "PAGE"}
 SUPPORTED_ACTIONS = {"SET", "CLEAR", "SKIP"}
-SUPPORTED_BLOCK_TYPES = {"list_item", "bullet", "feature", "paragraph"}
+SUPPORTED_BLOCK_TYPES = {"list_item", "bullet", "feature", "paragraph", "multi_line_text", "single_line_text"}
 FORBIDDEN_SHOPIFY_PREFIXES = ("mf.shopify.", "v_mf.shopify.", "v.mf.shopify.")
 
 GOOGLE_SHEETS_CELL_LIMIT = 50000
@@ -811,6 +811,16 @@ def validate_block_type_vs_data_type(block_type: str, cfg_dt: str) -> Optional[s
             return None
         return f"block_type={bt} requires data_type=rich_text_field, got {cfg_dt}"
 
+    if bt == "multi_line_text":
+        if dt_ in {"multi_line_text_field", "text"}:
+            return None
+        return f"block_type=multi_line_text requires data_type=multi_line_text_field, got {cfg_dt}"
+
+    if bt == "single_line_text":
+        if dt_ in {"single_line_text_field", "string"}:
+            return None
+        return f"block_type=single_line_text requires data_type=single_line_text_field, got {cfg_dt}"
+
     return f"unsupported block_type={block_type}"
 
 
@@ -1012,6 +1022,40 @@ def build_rich_text_paragraph(rows: list[dict[str, Any]]) -> str:
     return _json_dumps({"type": "root", "children": children})
 
 
+def build_multi_line_text(rows: list[dict[str, Any]]) -> str:
+    """
+    Build a scalar Shopify multi_line_text_field value from Edit__MetafieldBlocks rows.
+
+    Standard input from Wide_MFBs:
+      block_type = multi_line_text
+      value      = final multi-line text
+      body       = blank
+
+    Compatibility input:
+      body can also be used when value is blank.
+      Multiple rows for the same owner + field_key are joined by newline in block_seq order.
+    """
+    values = []
+    for r in rows:
+        v = _norm_str(r.get("value") or r.get("body"))
+        if v:
+            values.append(v)
+    return "\n".join(values)
+
+
+def build_single_line_text(rows: list[dict[str, Any]]) -> str:
+    """
+    Build a scalar Shopify single_line_text_field value.
+    Multiple rows are joined with comma + space as a compatibility fallback.
+    """
+    values = []
+    for r in rows:
+        v = _norm_str(r.get("value") or r.get("body"))
+        if v:
+            values.append(v)
+    return ", ".join(values)
+
+
 # Reference normalization
 
 def to_product_gid(x: str) -> str:
@@ -1101,6 +1145,12 @@ def build_metafield_value(
 
     if block_type == "paragraph":
         return build_rich_text_paragraph(rows)
+
+    if block_type == "multi_line_text":
+        return build_multi_line_text(rows)
+
+    if block_type == "single_line_text":
+        return build_single_line_text(rows)
 
     raise ValueError(f"Unsupported block_type: {block_type}")
 
