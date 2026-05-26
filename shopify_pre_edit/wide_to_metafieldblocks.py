@@ -261,28 +261,29 @@ def load_account_config(
     gc_console: gspread.Client,
     console_core_url: str,
     site_code: str,
-    config_sheet_label: str = "config",
+    config_sheet_label: str = "config",  # kept for backward-compatible function signature; not used
     cfg_sites_tab: str = CFG_SITES_TAB_DEFAULT,
     cfg_account_tab: str = CFG_ACCOUNT_TAB_DEFAULT,
 ) -> dict[str, str]:
-    config_sheet_url = get_sheet_url_by_label(
-        gc=gc_console,
-        console_core_url=console_core_url,
-        site_code=site_code,
-        label=config_sheet_label,
-        cfg_sites_tab=cfg_sites_tab,
-    )
-    sh_cfg = gc_console.open_by_url(config_sheet_url)
-    ws = sh_cfg.worksheet(cfg_account_tab)
+    """
+    Read account/runtime secrets from Console Core / Cfg__account_id.
+
+    Important:
+      Cfg__account_id belongs to Console Core itself.
+      Do NOT route it through sheet_label=config.
+      sheet_label=config is only for business config tabs such as Cfg__Fields.
+    """
+    sh_console = gc_console.open_by_url(console_core_url)
+    ws = sh_console.worksheet(cfg_account_tab)
     rows = ws.get_all_records()
     df = pd.DataFrame(rows)
 
     if df.empty:
-        raise ValueError(f"{cfg_account_tab} is empty")
+        raise ValueError(f"{cfg_account_tab} is empty in Console Core")
 
-    # Support both key/value and wider config styles.
-    lower_cols = {c.lower().strip(): c for c in df.columns}
+    lower_cols = {str(c).lower().strip(): c for c in df.columns}
 
+    # key/value style
     if "key" in lower_cols and "value" in lower_cols:
         k_col = lower_cols["key"]
         v_col = lower_cols["value"]
@@ -294,6 +295,7 @@ def load_account_config(
                 out[k] = v
         return out
 
+    # config_key/config_value style
     if "config_key" in lower_cols and "config_value" in lower_cols:
         k_col = lower_cols["config_key"]
         v_col = lower_cols["config_value"]
@@ -305,16 +307,22 @@ def load_account_config(
                 out[k] = v
         return out
 
-    # Fallback: first two columns.
-    k_col, v_col = df.columns[:2]
-    out = {}
-    for r in df.to_dict("records"):
-        k = _norm_str(r.get(k_col))
-        v = _norm_str(r.get(v_col))
-        if k:
-            out[k] = v
-    return out
+    # fallback: first two columns, but explicitly report the assumption
+    if len(df.columns) >= 2:
+        k_col, v_col = df.columns[:2]
+        out = {}
+        for r in df.to_dict("records"):
+            k = _norm_str(r.get(k_col))
+            v = _norm_str(r.get(v_col))
+            if k:
+                out[k] = v
+        if out:
+            return out
 
+    raise ValueError(
+        f"{cfg_account_tab} in Console Core must contain key/value or config_key/config_value columns. "
+        f"Found columns: {list(df.columns)}"
+    )
 
 # =========================================================
 # Cfg__Fields dictionary
