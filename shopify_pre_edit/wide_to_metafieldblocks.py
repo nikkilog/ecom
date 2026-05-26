@@ -161,6 +161,17 @@ def _has_legacy_separator(value: Any) -> bool:
     return any(sep in s for sep in SPLIT_COMPAT_SEPARATORS)
 
 
+def _col_to_a1(col_num: int) -> str:
+    if col_num <= 0:
+        raise ValueError(f"Invalid column number: {col_num}")
+    result = ""
+    n = col_num
+    while n:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
 # =========================================================
 # Google auth / routing
 # =========================================================
@@ -643,15 +654,87 @@ def parse_wide_columns(
 # Wide loading / long building
 # =========================================================
 
-def load_wide_sheet(ws_wide) -> pd.DataFrame:
-    rows = ws_wide.get_all_records()
-    df = pd.DataFrame(rows)
+def load_wide_sheet(
+    ws_wide,
+    header_row: int = 1,
+    field_key_row: int = 2,
+    data_start_row: int = 3,
+) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """
+    Read Wide_MFBs with a two-row header convention.
+
+    Row 1: human wide column names, for example:
+      Product ID (numeric), Compatible Brand-1, Compatible Models-1
+
+    Row 2: generated field_key mapping row. It is NOT a data row.
+      This row is written by this job as a process record.
+
+    Row 3+: product data rows.
+    """
+    values = ws_wide.get_all_values()
+    if not values or len(values) < header_row:
+        return pd.DataFrame(), [], []
+
+    header_idx = header_row - 1
+    mapping_idx = field_key_row - 1
+    data_idx = data_start_row - 1
+
+    headers = [_norm_str(x) for x in values[header_idx]]
+    while headers and headers[-1] == "":
+        headers.pop()
+
+    if not headers:
+        return pd.DataFrame(), [], []
+
+    # Existing mapping row is returned only for diagnostics; the job regenerates it.
+    existing_mapping = []
+    if len(values) > mapping_idx:
+        existing_mapping = [_norm_str(x) for x in values[mapping_idx][:len(headers)]]
+        existing_mapping += [""] * (len(headers) - len(existing_mapping))
+
+    data_rows = values[data_idx:] if len(values) > data_idx else []
+    normalized_rows = []
+    for row in data_rows:
+        padded = list(row[:len(headers)]) + [""] * max(0, len(headers) - len(row))
+        normalized_rows.append([_norm_str(x) for x in padded])
+
+    df = pd.DataFrame(normalized_rows, columns=headers)
     if df.empty:
-        return pd.DataFrame()
-    df = df.fillna("")
+        return df, headers, existing_mapping
+
+    # Drop rows that are completely blank across the known wide columns.
+    mask_not_blank = df.apply(lambda r: any(_norm_str(x) for x in r.tolist()), axis=1)
+    df = df[mask_not_blank].copy()
+
     for c in df.columns:
         df[c] = df[c].apply(_norm_str)
-    return df
+
+    return df, headers, existing_mapping
+
+
+def build_field_key_mapping_row(
+    columns: list[str],
+    parsed_cols: list[ParsedWideColumn],
+) -> list[str]:
+    """Build the row-2 field_key process record for Wide_MFBs."""
+    by_col = {p.source_col: p.field_def.field_key for p in parsed_cols}
+    return [by_col.get(_norm_str(c), "") for c in columns]
+
+
+def write_field_key_mapping_row(
+    ws_wide,
+    mapping_values: list[str],
+    field_key_row: int = 2,
+) -> dict[str, Any]:
+    if not mapping_values:
+        return {"mapping_row_written": 0}
+    last_col = _col_to_a1(len(mapping_values))
+    ws_wide.update(
+        range_name=f"A{field_key_row}:{last_col}{field_key_row}",
+        values=[mapping_values],
+        value_input_option="RAW",
+    )
+    return {"mapping_row_written": 1, "mapping_cols_written": len(mapping_values)}
 
 
 def get_owner_from_wide_row(
@@ -702,6 +785,7 @@ def build_long_rows(
     df_wide: pd.DataFrame,
     parsed_cols: list[ParsedWideColumn],
     *,
+    data_start_row: int = 3,
     default_entity_type: str = "PRODUCT",
     action_default: str = "SET",
     mode_default: str = "STRICT",
@@ -718,7 +802,7 @@ def build_long_rows(
     # Group parsed columns by source_col for lookup.
     parsed_by_col = {p.source_col: p for p in parsed_cols}
 
-    for row_idx, row in enumerate(df_wide.to_dict("records"), start=2):
+    for row_idx, row in enumerate(df_wide.to_dict("records"), start=data_start_row):
         try:
             entity_type, gid_or_handle = get_owner_from_wide_row(row, default_entity_type=default_entity_type)
         except Exception as e:
@@ -956,6 +1040,11 @@ def run(
     input_worksheet_title: str = WIDE_INPUT_TAB_DEFAULT,
     output_worksheet_title: str = LONG_OUTPUT_TAB_DEFAULT,
 
+    wide_header_row: int = 1,
+    wide_field_key_row: int = 2,
+    wide_data_start_row: int = 3,
+    write_wide_field_key_row: bool = True,
+
     cfg_sites_tab: str = CFG_SITES_TAB_DEFAULT,
     cfg_account_tab: str = CFG_ACCOUNT_TAB_DEFAULT,
     cfg_tab_fields: str = CFG_FIELDS_TAB_DEFAULT,
@@ -987,6 +1076,7 @@ def run(
 
     Important:
       - field_key and data_type come only from config / Cfg__Fields.
+      - Wide_MFBs row 1 is human header; row 2 is generated field_key mapping; row 3+ is data.
       - Wide column suffix -1/-2/-3 is block_seq, not display_name.
       - Standard list input is Display Name-1 / Display Name-2 / Display Name-3.
       - Legacy cell separators ;, |, newline are supported with warning.
@@ -1049,15 +1139,29 @@ def run(
     )
     cfg_map = build_cfg_display_map(cfg_fields, target_entity_type=default_entity_type)
 
-    df_wide = load_wide_sheet(ws_wide)
+    df_wide, wide_columns, existing_field_key_row = load_wide_sheet(
+        ws_wide,
+        header_row=wide_header_row,
+        field_key_row=wide_field_key_row,
+        data_start_row=wide_data_start_row,
+    )
 
     parsed_cols, parse_errors, parse_warnings = parse_wide_columns(
-        columns=df_wide.columns.tolist() if not df_wide.empty else [],
+        columns=wide_columns,
         cfg_map=cfg_map,
         ignore_columns=ignore_columns,
         rich_text_default_block_type=rich_text_default_block_type,
         error_on_unsupported_datatype=error_on_unsupported_datatype,
     )
+
+    mapping_values = build_field_key_mapping_row(wide_columns, parsed_cols)
+    mapping_write_result = {"mapping_row_written": 0, "mapping_cols_written": 0}
+    if write_wide_field_key_row:
+        mapping_write_result = write_field_key_mapping_row(
+            ws_wide,
+            mapping_values=mapping_values,
+            field_key_row=wide_field_key_row,
+        )
 
     if parse_errors:
         return {
@@ -1072,6 +1176,7 @@ def run(
                 "warnings": int(len(parse_warnings)),
                 "rows_generated": 0,
                 "written": 0,
+                **mapping_write_result,
             },
             "errors": parse_errors[:preview_limit],
             "warnings": parse_warnings[:preview_limit],
@@ -1085,12 +1190,16 @@ def run(
                 "output_worksheet_title": output_worksheet_title,
                 "cfg_tab_fields": cfg_tab_fields,
                 "site_gsheet_secret": site_gsheet_secret,
+                "wide_header_row": wide_header_row,
+                "wide_field_key_row": wide_field_key_row,
+                "wide_data_start_row": wide_data_start_row,
             },
         }
 
     long_rows, build_errors, build_warnings = build_long_rows(
         df_wide=df_wide,
         parsed_cols=parsed_cols,
+        data_start_row=wide_data_start_row,
         default_entity_type=default_entity_type,
         action_default=action_default,
         mode_default=mode_default,
@@ -1113,6 +1222,7 @@ def run(
                 "warnings": int(len(warnings)),
                 "rows_generated": int(len(long_rows)),
                 "written": 0,
+                **mapping_write_result,
             },
             "errors": build_errors[:preview_limit],
             "warnings": warnings[:preview_limit],
@@ -1124,6 +1234,9 @@ def run(
                 "output_worksheet_title": output_worksheet_title,
                 "cfg_tab_fields": cfg_tab_fields,
                 "site_gsheet_secret": site_gsheet_secret,
+                "wide_header_row": wide_header_row,
+                "wide_field_key_row": wide_field_key_row,
+                "wide_data_start_row": wide_data_start_row,
             },
         }
 
@@ -1139,6 +1252,7 @@ def run(
                 "warnings": int(len(warnings)),
                 "rows_generated": int(len(long_rows)),
                 "written": 0,
+                **mapping_write_result,
             },
             "warnings": warnings[:preview_limit],
             "preview": long_rows[:preview_limit],
@@ -1162,6 +1276,9 @@ def run(
                 "cfg_tab_fields": cfg_tab_fields,
                 "generated_at_cn": _now_cn_str(),
                 "site_gsheet_secret": site_gsheet_secret,
+                "wide_header_row": wide_header_row,
+                "wide_field_key_row": wide_field_key_row,
+                "wide_data_start_row": wide_data_start_row,
             },
         }
 
@@ -1182,6 +1299,7 @@ def run(
             "warnings": int(len(warnings)),
             "rows_generated": int(len(long_rows)),
             **write_result,
+            **mapping_write_result,
         },
         "warnings": warnings[:preview_limit],
         "preview": long_rows[:preview_limit],
@@ -1205,5 +1323,8 @@ def run(
             "cfg_tab_fields": cfg_tab_fields,
             "generated_at_cn": _now_cn_str(),
             "site_gsheet_secret": site_gsheet_secret,
+            "wide_header_row": wide_header_row,
+            "wide_field_key_row": wide_field_key_row,
+            "wide_data_start_row": wide_data_start_row,
         },
     }
