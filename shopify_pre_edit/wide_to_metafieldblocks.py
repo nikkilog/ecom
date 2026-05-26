@@ -489,8 +489,14 @@ class ParsedWideColumn:
 
 def parse_number_suffix(header: str) -> tuple[str, Optional[int]]:
     """
-    Display Name-1 / Display Name 1 -> (Display Name, 1)
-    Suffix number is block_seq, never part of Cfg__Fields.display_name.
+    Parse the trailing sequence number from a Wide_MFBs header.
+
+    Supported examples:
+      Key Features-Title-1 -> (Key Features-Title, 1)
+      Key Features Body 1  -> (Key Features Body, 1)
+      Compatible Brand-1   -> (Compatible Brand, 1)
+
+    The trailing number is block_seq. It is never part of Cfg__Fields.display_name.
     """
     h = _norm_str(header)
     if not h:
@@ -507,10 +513,19 @@ def parse_number_suffix(header: str) -> tuple[str, Optional[int]]:
 
 def parse_role_from_display(base: str) -> tuple[str, str]:
     """
-    PDP Feature Title -> (PDP Feature, title)
-    PDP Feature Body  -> (PDP Feature, body)
+    Parse rich_text feature role from the base header after removing block_seq.
 
-    Exact Cfg__Fields display_name is tried before this role stripping.
+    Supported standard format:
+      Key Features-Title-1 -> parent=Key Features, role=title, block_seq=1
+      Key Features-Body-1  -> parent=Key Features, role=body,  block_seq=1
+
+    Backward-compatible format also works:
+      Key Features Title 1 -> parent=Key Features, role=title, block_seq=1
+      Key Features Body 1  -> parent=Key Features, role=body,  block_seq=1
+
+    Important:
+      parent must exist in Cfg__Fields.display_name.
+      Title/Body itself should NOT be added as a separate display_name.
     """
     b = _norm_str(base)
     m = re.match(r"^(.*?)[\s_-]+(Title|Body)$", b, flags=re.I)
@@ -584,7 +599,7 @@ def parse_wide_columns(
                     errors.append({
                         "source_col": col_s,
                         "error_reason": "missing_block_seq_suffix",
-                        "message": "MFB wide columns must use -1/-2/-3 suffix. This column maps to a block/list field but has no sequence suffix.",
+                        "message": "MFB wide columns must use -1/-2/-3 suffix. For rich_text feature pairs, use Display Name-Title-1 and Display Name-Body-1.",
                     })
                 elif error_on_unsupported_datatype:
                     errors.append({
@@ -1180,6 +1195,9 @@ def run(
       - Wide_MFBs row 1 is human header; row 2 is generated field_key mapping; row 3+ is data.
       - Wide column suffix -1/-2/-3 is block_seq, not display_name.
       - Standard list/scalar-text input is Display Name-1 / Display Name-2 / Display Name-3.
+      - Standard rich_text feature input is Display Name-Title-1 / Display Name-Body-1.
+        Example: if Cfg__Fields.display_name is Key Features, use Key Features-Title-1 and Key Features-Body-1.
+      - Backward-compatible rich_text feature input Display Name Title 1 / Display Name Body 1 is also supported.
       - For multi_line_text_field, suffixed columns are merged into one newline-delimited value.
       - Legacy cell separators ;, |, newline are supported with warning.
     """
