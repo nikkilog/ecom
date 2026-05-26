@@ -52,6 +52,27 @@ SUPPORTED_RICH_BLOCK_TYPES = {"bullet", "feature", "paragraph"}
 
 FORBIDDEN_SHOPIFY_PREFIXES = ("mf.shopify.", "v_mf.shopify.", "v.mf.shopify.")
 
+RUNLOG_HEADER = [
+    "run_id",
+    "ts_cn",
+    "job_name",
+    "phase",
+    "log_type",
+    "status",
+    "site_code",
+    "entity_type",
+    "gid",
+    "field_key",
+    "rows_loaded",
+    "rows_pending",
+    "rows_recognized",
+    "rows_planned",
+    "rows_written",
+    "rows_skipped",
+    "message",
+    "error_reason",
+]
+
 
 Q_PRODUCT_BY_HANDLE = """
 query($handle: String!) {
@@ -325,6 +346,131 @@ def open_ws_by_label_and_title(
     ws = sh.worksheet(worksheet_title)
     return sh, ws, sheet_url
 
+
+
+
+# =========================================================
+# RunLog
+# =========================================================
+
+class RunLogger:
+    def __init__(
+        self,
+        gc: gspread.Client,
+        runlog_sheet_url: str,
+        runlog_tab_name: str,
+        run_id: str,
+        job_name: str,
+        site_code: str,
+        flush_every: int = 200,
+    ):
+        self.runlog_sheet_url = runlog_sheet_url
+        self.runlog_tab_name = runlog_tab_name
+        self.run_id = run_id
+        self.job_name = job_name
+        self.site_code = site_code
+        self.flush_every = flush_every
+        self._buf: list[list[Any]] = []
+
+        sh = gc.open_by_url(runlog_sheet_url)
+        try:
+            self.ws = sh.worksheet(runlog_tab_name)
+        except gspread.WorksheetNotFound:
+            self.ws = sh.add_worksheet(title=runlog_tab_name, rows=1000, cols=len(RUNLOG_HEADER))
+
+        self.ws.update(range_name="A1:R1", values=[RUNLOG_HEADER])
+
+    def log_row(
+        self,
+        *,
+        phase: str,
+        log_type: str,
+        status: str,
+        entity_type: str = "",
+        gid: str = "",
+        field_key: str = "",
+        rows_loaded: int = 0,
+        rows_pending: int = 0,
+        rows_recognized: int = 0,
+        rows_planned: int = 0,
+        rows_written: int = 0,
+        rows_skipped: int = 0,
+        message: str = "",
+        error_reason: str = "",
+    ):
+        self._buf.append([
+            self.run_id,
+            _now_cn_str(),
+            self.job_name,
+            phase,
+            log_type,
+            status,
+            self.site_code,
+            entity_type,
+            gid,
+            field_key,
+            rows_loaded,
+            rows_pending,
+            rows_recognized,
+            rows_planned,
+            rows_written,
+            rows_skipped,
+            message,
+            error_reason,
+        ])
+        if len(self._buf) >= self.flush_every:
+            self.flush()
+
+    def flush(self):
+        if not self._buf:
+            return
+        for i in range(6):
+            try:
+                self.ws.append_rows(self._buf, value_input_option="RAW", table_range="A:R")
+                self._buf = []
+                return
+            except Exception:
+                time.sleep(min(2**i, 20) + random.random())
+        raise RuntimeError("Failed to write RunLog after retries")
+
+
+def log_grouped_details(
+    logger: RunLogger,
+    *,
+    phase: str,
+    status: str,
+    rows_loaded: int,
+    rows_pending: int,
+    rows_recognized: int,
+    rows_planned: int,
+    rows_written: int,
+    rows_skipped: int,
+    detail_rows: list[dict[str, Any]],
+    max_per_reason: int = 3,
+):
+    grouped = defaultdict(list)
+    for r in detail_rows:
+        reason = _norm_str(r.get("error_reason")) or "unknown"
+        grouped[reason].append(r)
+
+    for reason, items in grouped.items():
+        for row in items[:max_per_reason]:
+            logger.log_row(
+                phase=phase,
+                log_type="detail",
+                status=status,
+                entity_type=_norm_str(row.get("entity_type")),
+                gid=_norm_str(row.get("owner_id") or row.get("gid") or row.get("gid_or_handle")),
+                field_key=_norm_str(row.get("field_key")),
+                rows_loaded=rows_loaded,
+                rows_pending=rows_pending,
+                rows_recognized=rows_recognized,
+                rows_planned=rows_planned,
+                rows_written=rows_written,
+                rows_skipped=rows_skipped,
+                message=_norm_str(row.get("message")),
+                error_reason=reason,
+            )
 
 def load_account_config(
     gc_console: gspread.Client,
@@ -1042,7 +1188,10 @@ def resolve_owner_ids(
         clean_inp = dict(inp)
         clean_inp.pop("owner_ref", None)
         resolved_inputs.append(clean_inp)
-        resolved_meta.append(meta)
+
+        meta2 = dict(meta)
+        meta2["owner_id"] = owner_id
+        resolved_meta.append(meta2)
 
     return resolved_inputs, resolved_meta, errors
 
@@ -1181,9 +1330,11 @@ def run(
     input_worksheet_title: str = "Edit__MetafieldBlocks",
 
     config_sheet_label: str = "config",
+    runlog_sheet_label: str = "runlog_sheet",
     cfg_tab_fields: str = CFG_FIELDS_TAB_DEFAULT,
     cfg_sites_tab: str = CFG_SITES_TAB_DEFAULT,
     cfg_account_tab: str = CFG_ACCOUNT_TAB_DEFAULT,
+    runlog_tab_name: str = "Ops__RunLog",
 
     dry_run: bool = True,
     confirmed: bool = False,
@@ -1199,6 +1350,7 @@ def run(
 
     set_batch_size: int = 25,
     http_timeout: int = 60,
+    detail_max_per_reason: int = 3,
 ) -> dict[str, Any]:
     """
     Direct Shopify writer for structured metafield blocks.
@@ -1207,6 +1359,7 @@ def run(
       edit / Edit__MetafieldBlocks -> Shopify metafieldsSet
 
     It does NOT write Edit__ValuesLong.
+    It writes RunLog to sheet_label=runlog_sheet / runlog_tab_name.
     """
     run_id = _utc_run_id("edit_metafieldblocks")
 
@@ -1258,6 +1411,103 @@ def run(
         cfg_sites_tab=cfg_sites_tab,
     )
 
+    runlog_sheet_url = get_sheet_url_by_label(
+        gc=gc_site,
+        console_core_url=console_core_url,
+        site_code=site_code,
+        label=runlog_sheet_label,
+        cfg_sites_tab=cfg_sites_tab,
+    )
+    logger = RunLogger(
+        gc=gc_site,
+        runlog_sheet_url=runlog_sheet_url,
+        runlog_tab_name=runlog_tab_name,
+        run_id=run_id,
+        job_name=job_name,
+        site_code=site_code,
+    )
+
+    def _meta(extra: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        base = {
+            "console_core_url": console_core_url,
+            "input_sheet_url": input_sheet_url,
+            "cfg_sheet_url": cfg_sheet_url,
+            "runlog_sheet_url": runlog_sheet_url,
+            "runlog_tab_name": runlog_tab_name,
+            "input_worksheet_title": input_worksheet_title,
+            "cfg_tab_fields": cfg_tab_fields,
+            "site_gsheet_secret": site_gsheet_secret,
+            "shop_domain": shop_domain,
+            "api_version": api_version,
+            "dry_run": dry_run,
+            "confirmed": confirmed,
+        }
+        if extra:
+            base.update(extra)
+        return base
+
+    def _result(
+        *,
+        status: str,
+        summary: dict[str, Any],
+        phase: str,
+        log_status: str,
+        message: str,
+        error_reason: str = "",
+        errors: Optional[list[dict[str, Any]]] = None,
+        warnings: Optional[list[dict[str, Any]]] = None,
+        preview: Optional[list[dict[str, Any]]] = None,
+        meta_extra: Optional[dict[str, Any]] = None,
+        detail_status: str = "FAIL",
+    ) -> dict[str, Any]:
+        rows_loaded = int(summary.get("rows_loaded", 0) or 0)
+        rows_pending = int(summary.get("rows_pending", summary.get("rows_in_scope", 0)) or 0)
+        rows_recognized = int(summary.get("rows_recognized", summary.get("rows_in_scope", 0)) or 0)
+        rows_planned = int(summary.get("rows_planned", 0) or 0)
+        rows_written = int(summary.get("rows_written", summary.get("written", 0)) or 0)
+        rows_skipped = int(summary.get("rows_skipped", len(errors or [])) or 0)
+
+        logger.log_row(
+            phase=phase,
+            log_type="summary",
+            status=log_status,
+            rows_loaded=rows_loaded,
+            rows_pending=rows_pending,
+            rows_recognized=rows_recognized,
+            rows_planned=rows_planned,
+            rows_written=rows_written,
+            rows_skipped=rows_skipped,
+            message=message,
+            error_reason=error_reason,
+        )
+        if errors:
+            log_grouped_details(
+                logger,
+                phase=phase,
+                status=detail_status,
+                rows_loaded=rows_loaded,
+                rows_pending=rows_pending,
+                rows_recognized=rows_recognized,
+                rows_planned=rows_planned,
+                rows_written=rows_written,
+                rows_skipped=rows_skipped,
+                detail_rows=errors,
+                max_per_reason=detail_max_per_reason,
+            )
+        logger.flush()
+
+        return {
+            "status": status,
+            "site_code": site_code,
+            "job_name": job_name,
+            "run_id": run_id,
+            "summary": summary,
+            "errors": (errors or [])[:preview_limit],
+            "warnings": (warnings or [])[:preview_limit],
+            "preview": (preview or [])[:preview_limit],
+            "meta": _meta(meta_extra),
+        }
+
     cfg_fields = load_cfg_fields(ws_cfg_fields)
     cfg_field_map = build_cfg_field_map(cfg_fields)
 
@@ -1266,6 +1516,7 @@ def run(
         mode_default=mode_default,
         action_default=action_default,
     )
+    rows_loaded = int(len(df_raw))
 
     df_blocks, validation_errors = normalize_and_validate_blocks(
         df=df_raw,
@@ -1273,32 +1524,28 @@ def run(
         only_entity_types=only_entity_types,
         only_field_prefixes=only_field_prefixes,
     )
+    rows_in_scope = int(len(df_blocks))
 
     if validation_errors:
-        return {
-            "status": "error",
-            "site_code": site_code,
-            "job_name": job_name,
-            "run_id": run_id,
-            "summary": {
-                "rows_loaded": int(len(df_raw)),
-                "rows_in_scope": int(len(df_blocks)),
-                "rows_planned": 0,
-                "errors": int(len(validation_errors)),
-                "written": 0,
-            },
-            "errors": validation_errors[:preview_limit],
-            "meta": {
-                "console_core_url": console_core_url,
-                "input_sheet_url": input_sheet_url,
-                "cfg_sheet_url": cfg_sheet_url,
-                "input_worksheet_title": input_worksheet_title,
-                "cfg_tab_fields": cfg_tab_fields,
-                "site_gsheet_secret": site_gsheet_secret,
-                "shop_domain": shop_domain,
-                "api_version": api_version,
-            },
+        summary = {
+            "rows_loaded": rows_loaded,
+            "rows_pending": rows_in_scope,
+            "rows_recognized": rows_in_scope,
+            "rows_planned": 0,
+            "rows_written": 0,
+            "rows_skipped": int(len(validation_errors)),
+            "errors": int(len(validation_errors)),
         }
+        return _result(
+            status="error",
+            summary=summary,
+            phase="preview",
+            log_status="ERROR",
+            message=f"Validation failed. errors={len(validation_errors)}",
+            error_reason="validation_errors",
+            errors=validation_errors,
+            preview=[],
+        )
 
     set_inputs, meta_rows, preview_rows, build_errors = build_grouped_metafield_inputs(
         df_blocks=df_blocks,
@@ -1308,31 +1555,25 @@ def run(
     )
 
     if build_errors:
-        return {
-            "status": "error",
-            "site_code": site_code,
-            "job_name": job_name,
-            "run_id": run_id,
-            "summary": {
-                "rows_loaded": int(len(df_raw)),
-                "rows_in_scope": int(len(df_blocks)),
-                "rows_planned": int(len(set_inputs)),
-                "errors": int(len(build_errors)),
-                "written": 0,
-            },
-            "errors": build_errors[:preview_limit],
-            "preview": preview_rows[:preview_limit],
-            "meta": {
-                "console_core_url": console_core_url,
-                "input_sheet_url": input_sheet_url,
-                "cfg_sheet_url": cfg_sheet_url,
-                "input_worksheet_title": input_worksheet_title,
-                "cfg_tab_fields": cfg_tab_fields,
-                "site_gsheet_secret": site_gsheet_secret,
-                "shop_domain": shop_domain,
-                "api_version": api_version,
-            },
+        summary = {
+            "rows_loaded": rows_loaded,
+            "rows_pending": rows_in_scope,
+            "rows_recognized": rows_in_scope,
+            "rows_planned": int(len(set_inputs)),
+            "rows_written": 0,
+            "rows_skipped": int(len(build_errors)),
+            "errors": int(len(build_errors)),
         }
+        return _result(
+            status="error",
+            summary=summary,
+            phase="preview",
+            log_status="ERROR",
+            message=f"Build failed. errors={len(build_errors)}",
+            error_reason="build_errors",
+            errors=build_errors,
+            preview=preview_rows,
+        )
 
     shopify = build_shopify_client(
         shopify_token_secret=shopify_token_secret,
@@ -1348,90 +1589,68 @@ def run(
     )
 
     if resolve_errors:
-        return {
-            "status": "error",
-            "site_code": site_code,
-            "job_name": job_name,
-            "run_id": run_id,
-            "summary": {
-                "rows_loaded": int(len(df_raw)),
-                "rows_in_scope": int(len(df_blocks)),
-                "rows_planned": int(len(set_inputs)),
-                "rows_resolved": int(len(resolved_inputs)),
-                "errors": int(len(resolve_errors)),
-                "written": 0,
-            },
-            "errors": resolve_errors[:preview_limit],
-            "preview": preview_rows[:preview_limit],
-            "meta": {
-                "console_core_url": console_core_url,
-                "input_sheet_url": input_sheet_url,
-                "cfg_sheet_url": cfg_sheet_url,
-                "input_worksheet_title": input_worksheet_title,
-                "cfg_tab_fields": cfg_tab_fields,
-                "site_gsheet_secret": site_gsheet_secret,
-                "shop_domain": shop_domain,
-                "api_version": api_version,
-            },
+        summary = {
+            "rows_loaded": rows_loaded,
+            "rows_pending": rows_in_scope,
+            "rows_recognized": rows_in_scope,
+            "rows_planned": int(len(set_inputs)),
+            "rows_resolved": int(len(resolved_inputs)),
+            "rows_written": 0,
+            "rows_skipped": int(len(resolve_errors)),
+            "errors": int(len(resolve_errors)),
         }
+        return _result(
+            status="error",
+            summary=summary,
+            phase="preview",
+            log_status="ERROR",
+            message=f"Owner resolution failed. errors={len(resolve_errors)}",
+            error_reason="resolve_errors",
+            errors=resolve_errors,
+            preview=preview_rows,
+        )
 
     if not confirmed:
-        return {
-            "status": "needs_confirmation",
-            "site_code": site_code,
-            "job_name": job_name,
-            "run_id": run_id,
-            "summary": {
-                "rows_loaded": int(len(df_raw)),
-                "rows_in_scope": int(len(df_blocks)),
-                "rows_planned": int(len(resolved_inputs)),
-                "errors": 0,
-                "written": 0,
-            },
-            "preview": preview_rows[:preview_limit],
-            "meta": {
-                "console_core_url": console_core_url,
-                "input_sheet_url": input_sheet_url,
-                "cfg_sheet_url": cfg_sheet_url,
-                "input_worksheet_title": input_worksheet_title,
-                "cfg_tab_fields": cfg_tab_fields,
-                "site_gsheet_secret": site_gsheet_secret,
-                "shop_domain": shop_domain,
-                "api_version": api_version,
-                "dry_run": dry_run,
-                "confirmed": confirmed,
-                "generated_at_cn": _now_cn_str(),
-            },
+        summary = {
+            "rows_loaded": rows_loaded,
+            "rows_pending": rows_in_scope,
+            "rows_recognized": rows_in_scope,
+            "rows_planned": int(len(resolved_inputs)),
+            "rows_written": 0,
+            "rows_skipped": 0,
+            "errors": 0,
         }
+        return _result(
+            status="needs_confirmation",
+            summary=summary,
+            phase="preview",
+            log_status="NEEDS_CONFIRMATION",
+            message="Preview generated. No Shopify write executed.",
+            preview=preview_rows,
+            meta_extra={"generated_at_cn": _now_cn_str()},
+            detail_status="SKIP",
+        )
 
     if dry_run:
-        return {
-            "status": "dry_run_confirmed_no_apply",
-            "site_code": site_code,
-            "job_name": job_name,
-            "run_id": run_id,
-            "summary": {
-                "rows_loaded": int(len(df_raw)),
-                "rows_in_scope": int(len(df_blocks)),
-                "rows_planned": int(len(resolved_inputs)),
-                "errors": 0,
-                "written": 0,
-            },
-            "preview": preview_rows[:preview_limit],
-            "meta": {
-                "console_core_url": console_core_url,
-                "input_sheet_url": input_sheet_url,
-                "cfg_sheet_url": cfg_sheet_url,
-                "input_worksheet_title": input_worksheet_title,
-                "cfg_tab_fields": cfg_tab_fields,
-                "site_gsheet_secret": site_gsheet_secret,
-                "shop_domain": shop_domain,
-                "api_version": api_version,
-                "dry_run": dry_run,
-                "confirmed": confirmed,
-                "generated_at_cn": _now_cn_str(),
-            },
+        summary = {
+            "rows_loaded": rows_loaded,
+            "rows_pending": rows_in_scope,
+            "rows_recognized": rows_in_scope,
+            "rows_planned": int(len(resolved_inputs)),
+            "rows_written": 0,
+            "rows_skipped": 0,
+            "errors": 0,
         }
+        return _result(
+            status="dry_run_confirmed_no_apply",
+            summary=summary,
+            phase="apply",
+            log_status="SUCCESS",
+            message="Confirmed but DRY_RUN=True. No Shopify write executed.",
+            preview=preview_rows,
+            meta_extra={"generated_at_cn": _now_cn_str()},
+            detail_status="SKIP",
+        )
 
     apply_result = apply_metafields_set(
         client=shopify,
@@ -1442,40 +1661,39 @@ def run(
 
     rows_written = int(apply_result["ok_count"])
     apply_fail_count = int(apply_result["fail_count"])
+    detail_fail_rows = apply_result.get("detail_fail_rows") or []
 
     if apply_fail_count > 0 and rows_written > 0:
         status = "partial_success"
+        log_status = "PARTIAL_SUCCESS"
     elif apply_fail_count > 0 and rows_written == 0:
         status = "error"
+        log_status = "ERROR"
     else:
         status = "applied"
+        log_status = "SUCCESS"
 
-    return {
-        "status": status,
-        "site_code": site_code,
-        "job_name": job_name,
-        "run_id": run_id,
-        "summary": {
-            "rows_loaded": int(len(df_raw)),
-            "rows_in_scope": int(len(df_blocks)),
-            "rows_planned": int(len(resolved_inputs)),
-            "rows_written": rows_written,
-            "apply_fail_count": apply_fail_count,
-            "errors": int(len(apply_result["detail_fail_rows"])),
-        },
-        "errors": apply_result["detail_fail_rows"][:preview_limit],
-        "preview": preview_rows[:preview_limit],
-        "meta": {
-            "console_core_url": console_core_url,
-            "input_sheet_url": input_sheet_url,
-            "cfg_sheet_url": cfg_sheet_url,
-            "input_worksheet_title": input_worksheet_title,
-            "cfg_tab_fields": cfg_tab_fields,
-            "site_gsheet_secret": site_gsheet_secret,
-            "shop_domain": shop_domain,
-            "api_version": api_version,
-            "dry_run": dry_run,
-            "confirmed": confirmed,
-            "applied_at_cn": _now_cn_str(),
-        },
+    summary = {
+        "rows_loaded": rows_loaded,
+        "rows_pending": rows_in_scope,
+        "rows_recognized": rows_in_scope,
+        "rows_planned": int(len(resolved_inputs)),
+        "rows_written": rows_written,
+        "rows_skipped": int(apply_fail_count),
+        "apply_fail_count": apply_fail_count,
+        "errors": int(len(detail_fail_rows)),
     }
+    return _result(
+        status=status,
+        summary=summary,
+        phase="apply",
+        log_status=log_status,
+        message=(
+            f"Apply completed | rows_planned={len(resolved_inputs)} | "
+            f"rows_written={rows_written} | apply_fail_count={apply_fail_count}"
+        ),
+        error_reason="" if not detail_fail_rows else "shopify_apply_errors",
+        errors=detail_fail_rows,
+        preview=preview_rows,
+        meta_extra={"applied_at_cn": _now_cn_str()},
+    )
