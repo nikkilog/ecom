@@ -75,6 +75,24 @@ DEFAULT_IGNORE_COLUMNS = {
 
 SPLIT_COMPAT_SEPARATORS = (";", "|", "\n")
 
+SUPPORTED_MFB_SCALAR_TEXT_TYPES = {
+    "multi_line_text_field",
+    "single_line_text_field",
+}
+
+
+def _is_list_data_type(data_type: str) -> bool:
+    return _norm_str(data_type).lower().startswith("list.")
+
+
+def _is_supported_mfb_data_type(data_type: str) -> bool:
+    dt_ = _norm_str(data_type).lower()
+    return (
+        _is_list_data_type(dt_)
+        or dt_ == "rich_text_field"
+        or dt_ in SUPPORTED_MFB_SCALAR_TEXT_TYPES
+    )
+
 
 # =========================================================
 # Small helpers
@@ -512,13 +530,19 @@ def classify_block_type(
     dt_ = _norm_str(data_type).lower()
     role = _norm_str(role).lower()
 
-    if dt_.startswith("list."):
+    if _is_list_data_type(dt_):
         return "list_item"
 
     if dt_ == "rich_text_field":
         if role in {"title", "body"}:
             return "feature"
         return rich_text_default_block_type
+
+    if dt_ == "multi_line_text_field":
+        return "multi_line_text"
+
+    if dt_ == "single_line_text_field":
+        return "single_line_text"
 
     return ""
 
@@ -569,7 +593,7 @@ def parse_wide_columns(
                         "field_key": fd_exact.field_key,
                         "data_type": fd_exact.data_type,
                         "error_reason": "unsupported_data_type_for_mfb",
-                        "message": "This field is not list.* or rich_text_field; use the normal single-value flow.",
+                        "message": "Wide_MFBs supports list.*, rich_text_field, multi_line_text_field, and single_line_text_field fields.",
                     })
             else:
                 errors.append({
@@ -624,17 +648,17 @@ def parse_wide_columns(
                     "field_key": fd.field_key,
                     "data_type": fd.data_type,
                     "error_reason": "unsupported_data_type_for_mfb",
-                    "message": "Wide_MFBs only supports list.* and rich_text_field fields.",
+                    "message": "Wide_MFBs supports list.*, rich_text_field, multi_line_text_field, and single_line_text_field fields.",
                 })
             continue
 
-        if fd.data_type.startswith("list.") and role:
+        if (fd.data_type.startswith("list.") or fd.data_type in SUPPORTED_MFB_SCALAR_TEXT_TYPES) and role:
             errors.append({
                 "source_col": col_s,
                 "display_name": display_for_lookup,
                 "field_key": fd.field_key,
                 "data_type": fd.data_type,
-                "error_reason": "role_column_used_for_list_field",
+                "error_reason": "role_column_used_for_non_rich_text_field",
                 "message": "Title/Body role columns are only valid for rich_text_field.",
             })
             continue
@@ -824,7 +848,10 @@ def build_long_rows(
         base_note = _norm_str(row.get("note") or row.get("Note") or row.get("备注"))
 
         # Feature rows need combining title/body cells into a single long row.
+        # Scalar text fields also need combining Wide columns such as
+        # Compatible Fitment-1 / Compatible Fitment-2 into one metafield value.
         feature_groups: dict[tuple[str, int], dict[str, Any]] = {}
+        scalar_text_groups: dict[str, dict[str, Any]] = {}
         list_seen: dict[str, set[str]] = {}
 
         for col_name, value in row.items():
@@ -883,6 +910,50 @@ def build_long_rows(
                         "note": note,
                     })
 
+            elif block_type in {"multi_line_text", "single_line_text"}:
+                # Treat each suffixed Wide column as one candidate value, then write one
+                # final row per field_key after all columns in this wide row are scanned.
+                key = fd.field_key
+                g = scalar_text_groups.setdefault(key, {
+                    "entity_type": entity_type,
+                    "gid_or_handle": gid_or_handle,
+                    "field_key": fd.field_key,
+                    "block_type": block_type,
+                    "block_seq": "",
+                    "title": "",
+                    "body": "",
+                    "value": "",
+                    "action": action_default,
+                    "mode": mode_default,
+                    "note": note,
+                    "data_type": fd.data_type,
+                    "_items": [],
+                    "_source_cols": [],
+                })
+
+                # For multi-line text, split legacy separators too, because old sheets may
+                # paste multiple fitments into one cell. For single-line text, keep the cell
+                # as one logical item and join later with comma.
+                if fd.data_type == "multi_line_text_field":
+                    values = _split_list_cell(v)
+                    if _has_legacy_separator(v) and len(values) > 1:
+                        warnings.append({
+                            "sheet_row": row_idx,
+                            "source_col": col_name,
+                            "field_key": fd.field_key,
+                            "warning_type": "legacy_separator_split",
+                            "message": "Multi-line text cell contains separator. Values were split and joined with line breaks.",
+                            "split_values": values,
+                        })
+                else:
+                    values = [v]
+
+                for item in values:
+                    item = _norm_str(item)
+                    if item:
+                        g["_items"].append((p.block_seq, item))
+                g["_source_cols"].append(col_name)
+
             elif block_type == "bullet":
                 out.append({
                     "entity_type": entity_type,
@@ -939,6 +1010,36 @@ def build_long_rows(
                     "mode": mode_default,
                     "note": note,
                 })
+
+        for _, g in sorted(scalar_text_groups.items(), key=lambda kv: kv[0]):
+            items_with_seq = sorted(g.get("_items", []), key=lambda x: (_safe_int(x[0]) or 999999999))
+            values = [item for _, item in items_with_seq]
+            values = _dedupe_keep_order(values)
+
+            data_type = _norm_str(g.get("data_type")).lower()
+            if data_type == "multi_line_text_field":
+                final_value = "\n".join(values)
+            elif data_type == "single_line_text_field":
+                final_value = ", ".join(values)
+            else:
+                final_value = "\n".join(values)
+
+            source_cols = g.get("_source_cols") or []
+            note_parts = []
+            if base_note:
+                note_parts.append(base_note)
+            if add_source_note and source_cols:
+                note_parts.append("source_cols=" + ",".join(source_cols))
+
+            g["value"] = final_value
+            g["body"] = final_value if data_type == "multi_line_text_field" else ""
+            g["note"] = " | ".join(note_parts)
+            g.pop("_items", None)
+            g.pop("_source_cols", None)
+            g.pop("data_type", None)
+
+            if final_value:
+                out.append(g)
 
         for (_, _), g in sorted(feature_groups.items(), key=lambda kv: kv[0]):
             title = _norm_str(g.get("title"))
@@ -1078,7 +1179,8 @@ def run(
       - field_key and data_type come only from config / Cfg__Fields.
       - Wide_MFBs row 1 is human header; row 2 is generated field_key mapping; row 3+ is data.
       - Wide column suffix -1/-2/-3 is block_seq, not display_name.
-      - Standard list input is Display Name-1 / Display Name-2 / Display Name-3.
+      - Standard list/scalar-text input is Display Name-1 / Display Name-2 / Display Name-3.
+      - For multi_line_text_field, suffixed columns are merged into one newline-delimited value.
       - Legacy cell separators ;, |, newline are supported with warning.
     """
 
