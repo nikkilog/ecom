@@ -14,7 +14,7 @@ from google.oauth2 import service_account
 
 try:
     from google.colab import userdata
-except Exception:
+except Exception:  # pragma: no cover
     userdata = None
 
 
@@ -23,6 +23,7 @@ except Exception:
 # =========================================================
 
 CFG_SITES_TAB_DEFAULT = "Cfg__Sites"
+CFG_ACCOUNT_TAB_DEFAULT = "Cfg__account_id"
 
 INPUT_HEADER = [
     "entity_type",
@@ -59,7 +60,6 @@ SUPPORTED_BLOCK_TYPES = {
 }
 
 GENERATOR_MARKER = "[generated_by=edit_metafieldblocks]"
-
 GOOGLE_SHEETS_CELL_LIMIT = 50000
 
 
@@ -87,14 +87,6 @@ def _norm_str(x: Any) -> str:
     if s.lower() == "nan":
         return ""
     return s
-
-
-def _norm_upper(x: Any) -> str:
-    return _norm_str(x).upper()
-
-
-def _norm_block_type(x: Any) -> str:
-    return _norm_str(x).lower()
 
 
 def _safe_int_or_none(x: Any) -> Optional[int]:
@@ -130,7 +122,7 @@ def _json_dumps(obj: Any) -> str:
 
 
 # =========================================================
-# Google auth / sheet routing
+# Colab Secrets / Google Sheets auth
 # =========================================================
 
 def _get_secret(secret_name: str) -> str:
@@ -143,7 +135,11 @@ def _get_secret(secret_name: str) -> str:
 
 
 def build_gsheet_client(gsheet_sa_b64_secret: str) -> gspread.Client:
-    sa_b64 = _get_secret(gsheet_sa_b64_secret)
+    secret_name = _norm_str(gsheet_sa_b64_secret)
+    if not secret_name:
+        raise ValueError("gsheet_sa_b64_secret is required")
+
+    sa_b64 = _get_secret(secret_name)
     sa_info = json.loads(base64.b64decode(sa_b64).decode("utf-8"))
     creds = service_account.Credentials.from_service_account_info(
         sa_info,
@@ -153,6 +149,51 @@ def build_gsheet_client(gsheet_sa_b64_secret: str) -> gspread.Client:
         ],
     )
     return gspread.authorize(creds)
+
+
+# =========================================================
+# Console Core routing / account config
+# =========================================================
+
+def read_cfg_account_id(
+    gc: gspread.Client,
+    console_core_url: str,
+    cfg_account_tab: str = CFG_ACCOUNT_TAB_DEFAULT,
+) -> dict[str, str]:
+    """Read key-value config from Console Core / Cfg__account_id.
+
+    Supports both:
+    - 2-column no-header layout: key | value
+    - get_all_records-style layout if the first row is header-like
+    """
+    sh = gc.open_by_url(console_core_url)
+    ws = sh.worksheet(cfg_account_tab)
+    values = ws.get_all_values()
+
+    out: dict[str, str] = {}
+    for row in values:
+        if not row:
+            continue
+        key = _norm_str(row[0]) if len(row) >= 1 else ""
+        val = _norm_str(row[1]) if len(row) >= 2 else ""
+        if not key:
+            continue
+        # Ignore obvious header rows if present.
+        if key.lower() in {"key", "config_key", "name"}:
+            continue
+        out[key] = val
+
+    if not out:
+        raise ValueError(f"{cfg_account_tab} is empty or not a key-value table")
+
+    return out
+
+
+def get_required_account_value(account_cfg: dict[str, str], key: str) -> str:
+    v = _norm_str(account_cfg.get(key))
+    if not v:
+        raise ValueError(f"Cfg__account_id missing required key or value: {key}")
+    return v
 
 
 def get_sheet_url_by_label(
@@ -188,30 +229,22 @@ def get_sheet_url_by_label(
     if m.empty:
         raise ValueError(f"Cannot find sheet_url for site_code={site_code}, label={label} in {cfg_sites_tab}")
 
+    if len(m) > 1:
+        # Keep deterministic behavior: first non-empty row in the sheet wins.
+        m = m.head(1)
+
     return m.iloc[0]["sheet_url"]
 
 
-def open_ws_by_label_and_title(
+def open_ws_by_url_and_title(
     gc: gspread.Client,
-    console_core_url: str,
-    site_code: str,
-    label: str,
+    sheet_url: str,
     worksheet_title: str,
-    cfg_sites_tab: str = CFG_SITES_TAB_DEFAULT,
     create_if_missing: bool = False,
     default_rows: int = 1000,
     default_cols: int = 20,
 ):
-    sheet_url = get_sheet_url_by_label(
-        gc=gc,
-        console_core_url=console_core_url,
-        site_code=site_code,
-        label=label,
-        cfg_sites_tab=cfg_sites_tab,
-    )
-
     sh = gc.open_by_url(sheet_url)
-
     try:
         ws = sh.worksheet(worksheet_title)
     except gspread.WorksheetNotFound:
@@ -222,8 +255,7 @@ def open_ws_by_label_and_title(
             rows=default_rows,
             cols=default_cols,
         )
-
-    return sh, ws, sheet_url
+    return sh, ws
 
 
 # =========================================================
@@ -266,7 +298,7 @@ def normalize_blocks_df(
         return df.copy(), []
 
     d = df.copy()
-    errors = []
+    errors: list[dict[str, Any]] = []
 
     d["mode"] = d["mode"].replace("", mode_default.upper())
     d["action"] = d["action"].replace("", "SET")
@@ -314,7 +346,6 @@ def normalize_blocks_df(
         return d, errors
 
     d = d[d["action"] != "SKIP"].copy()
-
     return d, []
 
 
@@ -380,12 +411,7 @@ def build_rich_text_feature(rows: list[dict[str, Any]]) -> str:
             "children": paragraph_children,
         })
 
-    root = {
-        "type": "root",
-        "children": children,
-    }
-
-    return _json_dumps(root)
+    return _json_dumps({"type": "root", "children": children})
 
 
 def build_rich_text_paragraph(rows: list[dict[str, Any]]) -> str:
@@ -418,12 +444,7 @@ def build_rich_text_paragraph(rows: list[dict[str, Any]]) -> str:
             "children": paragraph_children,
         })
 
-    root = {
-        "type": "root",
-        "children": children,
-    }
-
-    return _json_dumps(root)
+    return _json_dumps({"type": "root", "children": children})
 
 
 # =========================================================
@@ -451,8 +472,8 @@ def build_valueslong_rows(
     run_id: str,
     dedupe_list_values: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    errors = []
-    out_rows = []
+    errors: list[dict[str, Any]] = []
+    out_rows: list[dict[str, Any]] = []
 
     if df_blocks.empty:
         return out_rows, errors
@@ -517,10 +538,8 @@ def build_valueslong_rows(
         if block_type == "list_item":
             values = [_norm_str(r.get("value")) for r in records]
             values = [v for v in values if v]
-
             if dedupe_list_values:
                 values = _dedupe_keep_order(values)
-
             desired_value = _json_dumps(values)
 
         elif block_type == "bullet":
@@ -575,22 +594,18 @@ def build_valueslong_rows(
 
 def _worksheet_values_to_df(ws) -> pd.DataFrame:
     values = ws.get_all_values()
-
     if not values:
         return pd.DataFrame(columns=OUTPUT_HEADER)
 
     header = values[0]
     body = values[1:]
-
     if not header:
         return pd.DataFrame(columns=OUTPUT_HEADER)
 
     df = pd.DataFrame(body, columns=header)
-
     for c in OUTPUT_HEADER:
         if c not in df.columns:
             df[c] = ""
-
     return df[OUTPUT_HEADER].copy()
 
 
@@ -620,7 +635,6 @@ def write_valueslong_output(
     for c in OUTPUT_HEADER:
         if c not in generated_df.columns:
             generated_df[c] = ""
-
     generated_df = generated_df[OUTPUT_HEADER].fillna("").astype(str)
 
     if clear_output_first:
@@ -628,8 +642,7 @@ def write_valueslong_output(
         preserved_count = 0
         removed_generated_count = 0
     else:
-        existing_df = _worksheet_values_to_df(ws_output)
-        existing_df = existing_df.fillna("").astype(str)
+        existing_df = _worksheet_values_to_df(ws_output).fillna("").astype(str)
 
         if replace_generated:
             mask_generated = existing_df["note"].astype(str).str.contains(
@@ -671,59 +684,84 @@ def write_valueslong_output(
 def run(
     *,
     site_code: str,
-    gsheet_sa_b64_secret: str,
     console_core_url: str,
+    console_gsheet_sa_b64_secret: str,
+    job_name: str = "edit_metafieldblocks",
 
     input_sheet_label: str = "edit",
     output_sheet_label: str = "edit",
-
     input_worksheet_title: str = "Edit__MetafieldBlocks",
     output_worksheet_title: str = "Edit__ValuesLong",
 
     cfg_sites_tab: str = CFG_SITES_TAB_DEFAULT,
+    cfg_account_tab: str = CFG_ACCOUNT_TAB_DEFAULT,
+    account_gsheet_secret_key: str = "GSHEET_SA_B64_SECRET",
 
     mode_default: str = "STRICT",
-
     preview_only: bool = True,
     replace_generated: bool = True,
     clear_output_first: bool = False,
-
     dedupe_list_values: bool = True,
     create_output_tab_if_missing: bool = True,
-
     preview_limit: int = 30,
 ) -> dict[str, Any]:
-    """
-    Build standard Edit__ValuesLong rows from human-friendly Edit__MetafieldBlocks.
+    """Build standard Edit__ValuesLong rows from human-friendly Edit__MetafieldBlocks.
 
     Responsibility:
-      Edit__MetafieldBlocks -> Edit__ValuesLong
+      Console Core / Cfg__Sites + Cfg__account_id
+      -> route edit sheet
+      -> Edit__MetafieldBlocks
+      -> Edit__ValuesLong
 
-    It does NOT write Shopify.
-    Shopify write remains handled by edit_metafields.py.
+    This module does NOT write Shopify.
+    Final Shopify write remains handled by shopify_sync/edit_metafields.py.
     """
 
     run_id = _utc_run_id("metafieldblocks")
 
-    gc = build_gsheet_client(gsheet_sa_b64_secret)
+    # Bootstrap client only opens Console Core.
+    gc_console = build_gsheet_client(console_gsheet_sa_b64_secret)
 
-    _, ws_blocks, input_sheet_url = open_ws_by_label_and_title(
-        gc=gc,
+    account_cfg = read_cfg_account_id(
+        gc=gc_console,
+        console_core_url=console_core_url,
+        cfg_account_tab=cfg_account_tab,
+    )
+    gsheet_sa_b64_secret = get_required_account_value(account_cfg, account_gsheet_secret_key)
+
+    # Target client opens site/edit/config sheets. Usually same as bootstrap for one site,
+    # but intentionally routed from Cfg__account_id rather than Cell 1.
+    if gsheet_sa_b64_secret == console_gsheet_sa_b64_secret:
+        gc_target = gc_console
+    else:
+        gc_target = build_gsheet_client(gsheet_sa_b64_secret)
+
+    input_sheet_url = get_sheet_url_by_label(
+        gc=gc_console,
         console_core_url=console_core_url,
         site_code=site_code,
         label=input_sheet_label,
-        worksheet_title=input_worksheet_title,
         cfg_sites_tab=cfg_sites_tab,
-        create_if_missing=False,
     )
-
-    _, ws_output, output_sheet_url = open_ws_by_label_and_title(
-        gc=gc,
+    output_sheet_url = get_sheet_url_by_label(
+        gc=gc_console,
         console_core_url=console_core_url,
         site_code=site_code,
         label=output_sheet_label,
-        worksheet_title=output_worksheet_title,
         cfg_sites_tab=cfg_sites_tab,
+    )
+
+    _, ws_blocks = open_ws_by_url_and_title(
+        gc=gc_target,
+        sheet_url=input_sheet_url,
+        worksheet_title=input_worksheet_title,
+        create_if_missing=False,
+    )
+
+    _, ws_output = open_ws_by_url_and_title(
+        gc=gc_target,
+        sheet_url=output_sheet_url,
+        worksheet_title=output_worksheet_title,
         create_if_missing=create_output_tab_if_missing,
         default_rows=1000,
         default_cols=len(OUTPUT_HEADER),
@@ -735,12 +773,32 @@ def run(
         mode_default=mode_default,
     )
 
+    base_meta = {
+        "site_code": site_code,
+        "job_name": job_name,
+        "run_id": run_id,
+        "console_core_url": console_core_url,
+        "input_sheet_url": input_sheet_url,
+        "output_sheet_url": output_sheet_url,
+        "input_sheet_label": input_sheet_label,
+        "output_sheet_label": output_sheet_label,
+        "input_worksheet_title": input_worksheet_title,
+        "output_worksheet_title": output_worksheet_title,
+        "cfg_sites_tab": cfg_sites_tab,
+        "cfg_account_tab": cfg_account_tab,
+        "account_gsheet_secret_key": account_gsheet_secret_key,
+        "gsheet_sa_b64_secret_from_cfg": gsheet_sa_b64_secret,
+        "replace_generated": replace_generated,
+        "clear_output_first": clear_output_first,
+        "generated_at_cn": _now_cn_str(),
+    }
+
     if validation_errors:
         return {
             "status": "error",
             "run_id": run_id,
             "site_code": site_code,
-            "job_name": "edit_metafieldblocks",
+            "job_name": job_name,
             "summary": {
                 "rows_loaded": int(len(df_raw)),
                 "rows_valid": 0,
@@ -748,12 +806,7 @@ def run(
                 "errors": int(len(validation_errors)),
             },
             "errors": validation_errors[:preview_limit],
-            "meta": {
-                "input_sheet_url": input_sheet_url,
-                "output_sheet_url": output_sheet_url,
-                "input_worksheet_title": input_worksheet_title,
-                "output_worksheet_title": output_worksheet_title,
-            },
+            "meta": base_meta,
         }
 
     generated_rows, build_errors = build_valueslong_rows(
@@ -767,7 +820,7 @@ def run(
             "status": "error",
             "run_id": run_id,
             "site_code": site_code,
-            "job_name": "edit_metafieldblocks",
+            "job_name": job_name,
             "summary": {
                 "rows_loaded": int(len(df_raw)),
                 "rows_valid": int(len(df_blocks)),
@@ -776,12 +829,7 @@ def run(
             },
             "errors": build_errors[:preview_limit],
             "preview": generated_rows[:preview_limit],
-            "meta": {
-                "input_sheet_url": input_sheet_url,
-                "output_sheet_url": output_sheet_url,
-                "input_worksheet_title": input_worksheet_title,
-                "output_worksheet_title": output_worksheet_title,
-            },
+            "meta": base_meta,
         }
 
     if preview_only:
@@ -789,7 +837,7 @@ def run(
             "status": "preview",
             "run_id": run_id,
             "site_code": site_code,
-            "job_name": "edit_metafieldblocks",
+            "job_name": job_name,
             "summary": {
                 "rows_loaded": int(len(df_raw)),
                 "rows_valid": int(len(df_blocks)),
@@ -798,15 +846,7 @@ def run(
                 "written": 0,
             },
             "preview": generated_rows[:preview_limit],
-            "meta": {
-                "input_sheet_url": input_sheet_url,
-                "output_sheet_url": output_sheet_url,
-                "input_worksheet_title": input_worksheet_title,
-                "output_worksheet_title": output_worksheet_title,
-                "replace_generated": replace_generated,
-                "clear_output_first": clear_output_first,
-                "generated_at_cn": _now_cn_str(),
-            },
+            "meta": base_meta,
         }
 
     write_result = write_valueslong_output(
@@ -820,7 +860,7 @@ def run(
         "status": "written",
         "run_id": run_id,
         "site_code": site_code,
-        "job_name": "edit_metafieldblocks",
+        "job_name": job_name,
         "summary": {
             "rows_loaded": int(len(df_raw)),
             "rows_valid": int(len(df_blocks)),
@@ -829,13 +869,5 @@ def run(
             **write_result,
         },
         "preview": generated_rows[:preview_limit],
-        "meta": {
-            "input_sheet_url": input_sheet_url,
-            "output_sheet_url": output_sheet_url,
-            "input_worksheet_title": input_worksheet_title,
-            "output_worksheet_title": output_worksheet_title,
-            "replace_generated": replace_generated,
-            "clear_output_first": clear_output_first,
-            "generated_at_cn": _now_cn_str(),
-        },
+        "meta": base_meta,
     }
