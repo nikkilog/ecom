@@ -1032,7 +1032,7 @@ def build_long_rows(
                 note_parts.append("source_cols=" + ",".join(source_cols))
 
             g["value"] = final_value
-            g["body"] = final_value if data_type == "multi_line_text_field" else ""
+            g["body"] = ""
             g["note"] = " | ".join(note_parts)
             g.pop("_items", None)
             g.pop("_source_cols", None)
