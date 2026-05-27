@@ -4,9 +4,6 @@ shopify_sync.edit_theme_template
 
 Batch update Shopify theme template suffix for PRODUCT / COLLECTION / PAGE from Google Sheets.
 
-Root-fix version: Cfg__account_id is parsed from raw two-column values so both headerless
-and headered key/value config tabs are supported safely.
-
 Input worksheet:
   Edit__ThemeTemplate
 
@@ -174,154 +171,23 @@ def _worksheet_to_df(ws: gspread.Worksheet) -> pd.DataFrame:
     values = ws.get_all_values()
     if not values:
         return pd.DataFrame()
-    headers = [_as_str(h) for h in values[0]]
+    headers = [h.strip() for h in values[0]]
     rows = values[1:]
-
-    # Make duplicate/blank headers safe for pandas/gspread tables.
-    safe_headers: List[str] = []
-    seen: Dict[str, int] = {}
-    for i, h in enumerate(headers):
-        base = h or f"__blank_col_{i + 1}"
-        if base in seen:
-            seen[base] += 1
-            safe_headers.append(f"{base}__dup{seen[base]}")
-        else:
-            seen[base] = 0
-            safe_headers.append(base)
-
-    width = len(safe_headers)
-    normalized_rows = []
-    for row in rows:
-        row = list(row[:width]) + [""] * max(0, width - len(row))
-        normalized_rows.append(row)
-
-    df = pd.DataFrame(normalized_rows, columns=safe_headers)
+    df = pd.DataFrame(rows, columns=headers)
     # Drop fully blank rows.
     if len(df):
         df = df.loc[~df.apply(lambda r: all(_as_str(x) == "" for x in r), axis=1)].copy()
     return df
 
 
-def _norm_config_key(v: Any) -> str:
-    """Normalize config keys so Cfg__account_id is not fragile."""
-    s = _as_str(v)
-    s = s.replace("﻿", "")
-    s = s.replace("：", ":")
-    s = re.sub(r"\s+", "", s)
-    return s.upper()
-
-
-def _looks_like_config_header(key: str, value: str) -> bool:
-    k = _norm_config_key(key).lower()
-    v = _norm_config_key(value).lower()
-    header_keys = {
-        "key", "configkey", "config_key", "settingkey", "setting_key",
-        "name", "fieldkey", "field_key", "accountkey", "account_key",
-        "配置项", "配置键", "字段", "字段名",
-    }
-    header_values = {
-        "value", "configvalue", "config_value", "settingvalue", "setting_value",
-        "val", "fieldvalue", "field_value", "accountvalue", "account_value",
-        "配置值", "值",
-    }
-    return k in header_keys and v in header_values
-
-
-def _worksheet_to_key_value_config(
-    ws: gspread.Worksheet,
-    *,
-    tab_name: str = "Cfg__account_id",
-    strict_duplicates: bool = True,
-) -> Dict[str, str]:
-    """
-    Read a 2-column key/value config worksheet directly from raw values.
-
-    This intentionally does NOT go through _worksheet_to_df(), because config tabs
-    are often headerless. A headerless sheet like this is valid:
-
-        SHOP_DOMAIN              | aeqjdw-r1.myshopify.com
-        SHOPIFY_API_VERSION      | 2026-01
-        SHOPIFY_TOKEN_SECRET     | NRP_SHOPIFY_ACCESS_TOKEN
-
-    A headered version is also valid:
-
-        config_key               | config_value
-        SHOP_DOMAIN              | aeqjdw-r1.myshopify.com
-
-    Rules:
-      - first two columns are used; extra columns are ignored
-      - fully blank rows are ignored
-      - keys are normalized to uppercase, whitespace-free form
-      - duplicate keys with different values are blocked
-      - duplicate keys with the same value are harmless
-    """
-    values = ws.get_all_values()
-    if not values:
-        raise ValueError(f"{tab_name} is empty.")
-
-    out: Dict[str, str] = {}
-    raw_seen: Dict[str, str] = {}
-    duplicate_conflicts: List[str] = []
-
-    for row_idx, row in enumerate(values, start=1):
-        row = list(row)
-        key_raw = _as_str(row[0] if len(row) >= 1 else "")
-        val_raw = _as_str(row[1] if len(row) >= 2 else "")
-
-        if not key_raw and not val_raw:
-            continue
-
-        # Skip a real header row only when both columns look like headers.
-        if row_idx == 1 and _looks_like_config_header(key_raw, val_raw):
-            continue
-
-        key_norm = _norm_config_key(key_raw)
-        if not key_norm:
-            continue
-
-        if key_norm in out:
-            if out[key_norm] != val_raw:
-                duplicate_conflicts.append(
-                    f"row {row_idx}: {key_raw} duplicates {raw_seen.get(key_norm, key_norm)} with different values"
-                )
-            continue
-
-        out[key_norm] = val_raw
-        raw_seen[key_norm] = key_raw
-
-    if strict_duplicates and duplicate_conflicts:
-        raise ValueError(
-            f"{tab_name} has duplicate config keys with different values: "
-            + "; ".join(duplicate_conflicts[:10])
-        )
-
-    if not out:
-        raise ValueError(
-            f"{tab_name} did not produce any config key/value pairs. "
-            "Expected first two columns to be config key and config value."
-        )
-
-    return out
-
-
 def _dict_from_two_col_df(df: pd.DataFrame) -> Dict[str, str]:
-    """Backward-compatible parser for existing callers. Prefer _worksheet_to_key_value_config for config tabs."""
     if df.empty or df.shape[1] < 2:
         return {}
-
     key_col = df.columns[0]
     val_col = df.columns[1]
-    out: Dict[str, str] = {}
-
-    # If df came from a headerless two-column sheet, pandas consumed the first config row as headers.
-    # Put it back unless those headers look like real key/value headers.
-    if not _looks_like_config_header(key_col, val_col):
-        k0 = _norm_config_key(key_col)
-        if k0:
-            out[k0] = _as_str(val_col)
-
+    out = {}
     for _, row in df.iterrows():
-        k = _norm_config_key(row.get(key_col))
+        k = _as_str(row.get(key_col))
         if not k:
             continue
         out[k] = _as_str(row.get(val_col))
@@ -350,14 +216,9 @@ def _find_site_route(cfg_sites: pd.DataFrame, site_code: str, label: str) -> Dic
 
 
 def _pick_config(account_cfg: Dict[str, str], key: str, required: bool = True, default: str = "") -> str:
-    key_norm = _norm_config_key(key)
-    val = _as_str(account_cfg.get(key_norm, default))
+    val = _as_str(account_cfg.get(key, default))
     if required and not val:
-        available = ", ".join(sorted(account_cfg.keys())) or "<none>"
-        raise ValueError(
-            f"Cfg__account_id missing required config: {key}. "
-            f"Available keys read from Cfg__account_id: {available}"
-        )
+        raise ValueError(f"Cfg__account_id missing required config: {key}")
     return val
 
 
@@ -471,6 +332,39 @@ def _resolve_gid(client: ShopifyClient, entity_type: str, gid_or_handle: str) ->
     raise ValueError(f"Unsupported entity_type: {entity_type}")
 
 
+def _resolve_all_gids(client: ShopifyClient, plans: List[Dict[str, Any]]) -> Tuple[Dict[Tuple[str, str], str], List[Dict[str, Any]]]:
+    """
+    Resolve each unique (entity_type, gid_or_handle) once.
+
+    Numeric IDs and GIDs are converted locally with no Shopify lookup.
+    Handles still require one Shopify lookup per unique handle, but duplicates are cached.
+    """
+    resolved: Dict[Tuple[str, str], str] = {}
+    errors: List[Dict[str, Any]] = []
+
+    seen: set[Tuple[str, str]] = set()
+    for plan in plans:
+        entity_type = plan["entity_type"]
+        raw = _as_str(plan["gid_or_handle"])
+        key = (entity_type, raw)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        try:
+            resolved[key] = _resolve_gid(client, entity_type, raw)
+        except Exception as exc:
+            errors.append({
+                **plan,
+                "gid": raw,
+                "status": "error",
+                "error": str(exc),
+                "error_reason": type(exc).__name__,
+            })
+
+    return resolved, errors
+
+
 def _template_value_for_action(action: str, desired_value: str) -> Optional[str]:
     if action == "CLEAR":
         return None
@@ -563,12 +457,17 @@ class RunLogger:
         job_name: str,
         site_code: str,
         enabled: bool = True,
+        flush_every: int = 200,
+        print_rows: bool = False,
     ):
         self.ws = ws
         self.run_id = run_id
         self.job_name = job_name
         self.site_code = site_code
         self.enabled = enabled and ws is not None
+        self.flush_every = max(1, int(flush_every or 200))
+        self.print_rows = bool(print_rows)
+        self._buf: List[List[Any]] = []
         self.headers = [
             "run_id",
             "ts_cn",
@@ -639,9 +538,27 @@ class RunLogger:
             message,
             error_reason,
         ]
-        print(f"[{status}] {phase} | {entity_type} | {gid} | {field_key} | {message}")
+        if self.print_rows or log_type == "summary" or status in {"error", "ERROR"}:
+            print(f"[{status}] {phase} | {entity_type} | {gid} | {field_key} | {message}")
         if self.enabled:
-            self.ws.append_row(row, value_input_option="USER_ENTERED")
+            self._buf.append(row)
+            if len(self._buf) >= self.flush_every:
+                self.flush()
+
+    def flush(self) -> None:
+        if not self.enabled or not self._buf:
+            return
+        rows = self._buf
+        last_exc = None
+        for i in range(6):
+            try:
+                self.ws.append_rows(rows, value_input_option="USER_ENTERED", table_range="A:R")
+                self._buf = []
+                return
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(min(2 ** i, 20))
+        raise RuntimeError(f"Failed to write RunLog after retries: {last_exc}")
 
 
 # -----------------------------
@@ -749,7 +666,10 @@ def run(
     confirmed: bool = False,
     only_entity_types: Optional[set] = None,
     only_field_keys: Optional[set] = None,
-    sleep_seconds: float = 0.15,
+    sleep_seconds: float = 0.0,
+    runlog_flush_every: int = 200,
+    runlog_print_rows: bool = False,
+    progress_every: int = 25,
 ) -> Dict[str, Any]:
     """
     Execute edit_theme_template job.
@@ -784,7 +704,7 @@ def run(
     cfg_sites_df = _worksheet_to_df(cfg_sites_ws)
 
     account_ws = console_sh.worksheet(cfg_account_tab)
-    account_cfg = _worksheet_to_key_value_config(account_ws, tab_name=cfg_account_tab)
+    account_cfg = _dict_from_two_col_df(_worksheet_to_df(account_ws))
 
     input_route = _find_site_route(cfg_sites_df, site_code, input_sheet_label)
     runlog_route = _find_site_route(cfg_sites_df, site_code, runlog_sheet_label)
@@ -806,7 +726,15 @@ def run(
     except Exception as exc:
         print(f"[WARN] Runlog sheet unavailable: {exc}")
 
-    logger = RunLogger(runlog_ws, rid, job_name, site_code, enabled=True)
+    logger = RunLogger(
+        runlog_ws,
+        rid,
+        job_name,
+        site_code,
+        enabled=True,
+        flush_every=runlog_flush_every,
+        print_rows=runlog_print_rows,
+    )
 
     rows_loaded = len(input_df)
     logger.log(
@@ -849,6 +777,7 @@ def run(
             message=f"Validation failed with {len(validation_errors)} error(s). No Shopify writes executed.",
             error_reason="validation_errors",
         )
+        logger.flush()
         return {
             "status": "error",
             "run_id": rid,
@@ -884,15 +813,44 @@ def run(
     rows_skipped = 0
     row_results: List[Dict[str, Any]] = []
 
-    for plan in plans:
+    # Resolve all unique owners once before the write loop.
+    # This removes repeated handle lookup cost when multiple rows point to the same object.
+    gid_cache, resolve_errors = _resolve_all_gids(client, plans)
+
+    for err in resolve_errors:
+        rows_skipped += 1
+        logger.log(
+            phase="resolve",
+            log_type="row",
+            status="error",
+            entity_type=err.get("entity_type", ""),
+            gid=err.get("gid_or_handle", ""),
+            field_key=err.get("field_key", ""),
+            rows_loaded=rows_loaded,
+            rows_recognized=rows_recognized,
+            rows_planned=rows_planned,
+            rows_written=rows_written,
+            rows_skipped=rows_skipped,
+            message=f"Row {err.get('sheet_row')} failed to resolve owner: {err.get('error')}",
+            error_reason=err.get("error_reason", "resolve_error"),
+        )
+        row_results.append(err)
+
+    error_keys = {(e["entity_type"], _as_str(e["gid_or_handle"])) for e in resolve_errors}
+    write_plans = [p for p in plans if (p["entity_type"], _as_str(p["gid_or_handle"])) not in error_keys]
+
+    total_to_process = len(write_plans)
+    if total_to_process:
+        print(f"Apply loop: total={total_to_process}, dry_run={dry_run}, sleep_seconds={sleep_seconds}")
+
+    for i, plan in enumerate(write_plans, start=1):
         entity_type = plan["entity_type"]
         field_key = plan["field_key"]
-        raw_gid = plan["gid_or_handle"]
+        raw_gid = _as_str(plan["gid_or_handle"])
         template_suffix = plan["template_suffix"]
+        gid = gid_cache[(entity_type, raw_gid)]
 
         try:
-            gid = _resolve_gid(client, entity_type, raw_gid)
-
             msg_value = "DEFAULT_TEMPLATE" if template_suffix is None else template_suffix
             if dry_run:
                 rows_skipped += 1
@@ -904,32 +862,40 @@ def run(
                     gid=gid,
                     field_key=field_key,
                     rows_loaded=rows_loaded,
+                    rows_recognized=rows_recognized,
                     rows_planned=rows_planned,
+                    rows_written=rows_written,
                     rows_skipped=rows_skipped,
                     message=f"Would update templateSuffix to {msg_value}. Source row={plan['sheet_row']}",
                 )
                 row_results.append({**plan, "gid": gid, "status": "planned", "result": None})
-                continue
+            else:
+                node = _update_template(client, entity_type, gid, template_suffix)
+                rows_written += 1
+                logger.log(
+                    phase="write",
+                    log_type="row",
+                    status="ok",
+                    entity_type=entity_type,
+                    gid=gid,
+                    field_key=field_key,
+                    rows_loaded=rows_loaded,
+                    rows_recognized=rows_recognized,
+                    rows_planned=rows_planned,
+                    rows_written=rows_written,
+                    rows_skipped=rows_skipped,
+                    message=f"Updated templateSuffix to {msg_value}. Shopify returned templateSuffix={node.get('templateSuffix')}",
+                )
+                row_results.append({**plan, "gid": gid, "status": "written", "result": node})
 
-            node = _update_template(client, entity_type, gid, template_suffix)
-            rows_written += 1
-            logger.log(
-                phase="write",
-                log_type="row",
-                status="ok",
-                entity_type=entity_type,
-                gid=gid,
-                field_key=field_key,
-                rows_loaded=rows_loaded,
-                rows_planned=rows_planned,
-                rows_written=rows_written,
-                rows_skipped=rows_skipped,
-                message=f"Updated templateSuffix to {msg_value}. Shopify returned templateSuffix={node.get('templateSuffix')}",
-            )
-            row_results.append({**plan, "gid": gid, "status": "written", "result": node})
+                if sleep_seconds:
+                    time.sleep(sleep_seconds)
 
-            if sleep_seconds:
-                time.sleep(sleep_seconds)
+            if progress_every and (i % progress_every == 0 or i == total_to_process):
+                print(
+                    f"Progress {i}/{total_to_process}: written={rows_written}, skipped={rows_skipped}",
+                    flush=True,
+                )
 
         except Exception as exc:
             rows_skipped += 1
@@ -938,16 +904,17 @@ def run(
                 log_type="row",
                 status="error",
                 entity_type=entity_type,
-                gid=raw_gid,
+                gid=gid,
                 field_key=field_key,
                 rows_loaded=rows_loaded,
+                rows_recognized=rows_recognized,
                 rows_planned=rows_planned,
                 rows_written=rows_written,
                 rows_skipped=rows_skipped,
                 message=f"Row {plan['sheet_row']} failed: {exc}",
                 error_reason=type(exc).__name__,
             )
-            row_results.append({**plan, "gid": raw_gid, "status": "error", "error": str(exc)})
+            row_results.append({**plan, "gid": gid, "status": "error", "error": str(exc)})
 
     final_status = "dry_run" if dry_run else "ok"
     if any(r["status"] == "error" for r in row_results):
@@ -964,6 +931,8 @@ def run(
         rows_skipped=rows_skipped,
         message=f"Finished. dry_run={dry_run}, written={rows_written}, skipped={rows_skipped}",
     )
+
+    logger.flush()
 
     print("====================================")
     print("JOB RESULT")
