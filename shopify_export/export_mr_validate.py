@@ -190,6 +190,7 @@ def _get_cfg_field_meta(df_fields: pd.DataFrame, metafield_key: str) -> Dict[str
     col_entity_type = _pick_col(df, ["entity_type"])
     col_field_key = _pick_col(df, ["field_key"])
     col_field_type = _pick_col(df, ["field_type"])
+    col_data_type = _pick_col(df, ["data_type"])
     col_namespace = _pick_col(df, ["namespace"])
     col_key = _pick_col(df, ["key"])
 
@@ -217,6 +218,18 @@ def _get_cfg_field_meta(df_fields: pd.DataFrame, metafield_key: str) -> Dict[str
         vals = [_norm(x) for x in dfx[col_field_type].tolist() if _norm(x)]
         if vals:
             field_type = vals[0]
+
+    # Some existing Cfg__Fields rows use field_type=RAW and data_type=metaobject_reference.
+    # For MR validation we need the Shopify metafield type, so data_type is a safe fallback
+    # when it is the column that actually contains the reference type.
+    data_type = ""
+    if col_data_type:
+        vals = [_norm(x) for x in dfx[col_data_type].tolist() if _norm(x)]
+        if vals:
+            data_type = vals[0]
+
+    if "reference" not in _norm_lower(field_type) and "reference" in _norm_lower(data_type):
+        field_type = data_type
 
     namespace = ""
     key = ""
