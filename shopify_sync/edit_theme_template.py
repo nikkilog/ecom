@@ -194,6 +194,100 @@ def _dict_from_two_col_df(df: pd.DataFrame) -> Dict[str, str]:
     return out
 
 
+def _col_norm(c: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", _as_str(c).lower()).strip("_")
+
+
+def _find_col(df: pd.DataFrame, candidates: set[str]) -> Optional[str]:
+    norm_map = {_col_norm(c): c for c in df.columns}
+    for cand in candidates:
+        if cand in norm_map:
+            return norm_map[cand]
+    return None
+
+
+def _looks_like_cfg_key(s: Any) -> bool:
+    v = _as_str(s)
+    return bool(v and re.fullmatch(r"[A-Z][A-Z0-9_]*", v))
+
+
+def _load_account_config(df: pd.DataFrame, site_code: str) -> Dict[str, str]:
+    """
+    Load Cfg__account_id robustly.
+
+    Supported shapes:
+      1) key | value
+         SHOP_DOMAIN | xxx.myshopify.com
+
+      2) site_code/account_id | key/config_key | value/config_value
+         NRP | SHOP_DOMAIN | xxx.myshopify.com
+
+      3) one row per site with config keys as columns
+         site_code | SHOP_DOMAIN | SHOPIFY_API_VERSION | ...
+
+    This avoids the old failure where a 3-column Cfg__account_id was read as
+    {site_code: key} instead of {key: value}.
+    """
+    if df.empty:
+        return {}
+
+    d = df.copy()
+    d.columns = [_as_str(c) for c in d.columns]
+    site_code_norm = _as_str(site_code).upper()
+
+    key_col = _find_col(d, {"key", "config_key", "cfg_key", "field_key", "name", "setting", "config_name"})
+    val_col = _find_col(d, {"value", "config_value", "cfg_value", "setting_value", "val"})
+    site_col = _find_col(d, {"site_code", "account_id", "account", "site", "store_code"})
+
+    # Shape 2: explicit key/value columns, optionally scoped by site_code/account_id.
+    if key_col and val_col:
+        work = d.copy()
+        if site_col:
+            site_vals = work[site_col].map(lambda x: _as_str(x).upper())
+            # Prefer exact site rows. If none exist, allow global/blank rows.
+            exact = work[site_vals.eq(site_code_norm)].copy()
+            if not exact.empty:
+                work = exact
+            else:
+                work = work[site_vals.eq("")].copy()
+
+        out: Dict[str, str] = {}
+        for _, row in work.iterrows():
+            k = _as_str(row.get(key_col))
+            if k:
+                out[k] = _as_str(row.get(val_col))
+        return out
+
+    # Shape 3: one row per site, config keys are columns.
+    if site_col:
+        work = d[d[site_col].map(lambda x: _as_str(x).upper()).eq(site_code_norm)].copy()
+        if not work.empty:
+            row = work.iloc[0].to_dict()
+            return {k: _as_str(v) for k, v in row.items() if _as_str(k) and _as_str(k) != site_col and _as_str(v)}
+
+    # Shape 1: simple two-column key/value table.
+    # Prefer the column pair where the first column contains Shopify-style config keys.
+    cols = list(d.columns)
+    if len(cols) >= 2:
+        best_pair = (cols[0], cols[1])
+        best_score = -1
+        for i in range(len(cols) - 1):
+            c1, c2 = cols[i], cols[i + 1]
+            score = int(d[c1].map(_looks_like_cfg_key).sum())
+            if score > best_score:
+                best_score = score
+                best_pair = (c1, c2)
+
+        out: Dict[str, str] = {}
+        for _, row in d.iterrows():
+            k = _as_str(row.get(best_pair[0]))
+            if k:
+                out[k] = _as_str(row.get(best_pair[1]))
+        return out
+
+    return {}
+
+
 def _find_site_route(cfg_sites: pd.DataFrame, site_code: str, label: str) -> Dict[str, str]:
     required = {"site_code", "label"}
     missing = required - set(cfg_sites.columns)
@@ -704,7 +798,12 @@ def run(
     cfg_sites_df = _worksheet_to_df(cfg_sites_ws)
 
     account_ws = console_sh.worksheet(cfg_account_tab)
-    account_cfg = _dict_from_two_col_df(_worksheet_to_df(account_ws))
+    account_df = _worksheet_to_df(account_ws)
+    account_cfg = _load_account_config(account_df, site_code)
+
+    # Fail early with visible diagnostics if required account config is not loaded.
+    # Do not print secret values. Only print loaded keys.
+    print("ACCOUNT_CONFIG_KEYS     =", sorted(account_cfg.keys()))
 
     input_route = _find_site_route(cfg_sites_df, site_code, input_sheet_label)
     runlog_route = _find_site_route(cfg_sites_df, site_code, runlog_sheet_label)
