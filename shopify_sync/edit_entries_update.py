@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import random
 import re
 import time
@@ -293,6 +294,177 @@ def build_gc(sa_b64: str):
     ]
     creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
     return gspread.authorize(creds)
+
+
+
+
+def load_account_config_from_console(
+    *,
+    console_core_url: str,
+    console_gsheet_sa_b64: str,
+    cfg_account_tab: str = "Cfg__account_id",
+) -> Dict[str, str]:
+    """
+    Load account/site runtime config from Console Core / Cfg__account_id.
+
+    Expected sheet layout:
+      Column A = config key
+      Column B = config value
+
+    Example:
+      SHOP_DOMAIN                aeqjdw-r1.myshopify.com
+      SHOPIFY_API_VERSION         2026-01
+      GSHEET_SA_B64_SECRET        NRP_GSHEET
+      SHOPIFY_TOKEN_SECRET        NRP_SHOPIFY_ACCESS_TOKEN
+    """
+    gc = build_gc(console_gsheet_sa_b64)
+    sh = gc.open_by_url(console_core_url)
+    ws = sh.worksheet(cfg_account_tab)
+    values = ws.get_all_values()
+
+    cfg: Dict[str, str] = {}
+    for row in values:
+        if not row:
+            continue
+        key = str(row[0]).strip() if len(row) >= 1 else ""
+        val = str(row[1]).strip() if len(row) >= 2 else ""
+        if not key:
+            continue
+        if key.lower() in {"key", "config_key", "field", "name"}:
+            continue
+        cfg[key] = val
+    return cfg
+
+
+def require_account_cfg(account_cfg: Dict[str, str], keys: List[str]) -> Dict[str, str]:
+    missing = [k for k in keys if not str(account_cfg.get(k, "")).strip()]
+    if missing:
+        raise ValueError(f"Cfg__account_id missing required config values: {missing}")
+    return {k: str(account_cfg.get(k, "")).strip() for k in keys}
+
+
+def resolve_secret_value(secret_name: str) -> str:
+    """
+    Resolve a secret by name.
+
+    In Colab, this reads google.colab.userdata.
+    Outside Colab, this falls back to environment variables.
+    """
+    name = str(secret_name or "").strip()
+    if not name:
+        return ""
+
+    try:
+        from google.colab import userdata  # type: ignore
+        val = userdata.get(name)
+        if val:
+            return val
+    except Exception:
+        pass
+
+    return os.environ.get(name, "")
+
+
+def run_from_console_core(
+    *,
+    site_code: str,
+    console_core_url: str,
+    console_gsheet_sa_b64: str,
+    cfg_account_tab: str = "Cfg__account_id",
+    cfg_sites_tab: str = "Cfg__Sites",
+    label_edit: str = "edit",
+    label_config: str = "config",
+    label_runlog: str = "runlog_sheet",
+    tab_edit_update: str = "Edit__Entries_Update",
+    tab_cfg_fields: str = "Cfg__Fields",
+    tab_runlog: str = "Ops__RunLog",
+    dry_run: bool = True,
+    confirmed: bool = False,
+    default_mode: str = "LOOSE",
+    empty_means_clear: bool = True,
+    tz_name: str = "Asia/Shanghai",
+    job_name: str = "edit_entries_update",
+    run_id: Optional[str] = None,
+    job_chunk_size: int = 25,
+    preview_limit: int = 20,
+    detail_limit_per_error: int = 2,
+) -> Dict[str, Any]:
+    """
+    Console-Core routed entrypoint.
+
+    Cell 1 should only provide the Console Core URL and bootstrap Google Sheets secret value.
+    Site-level config is loaded from Cfg__account_id.
+    Sheet routing is loaded from Cfg__Sites.
+    """
+    account_cfg = load_account_config_from_console(
+        console_core_url=console_core_url,
+        console_gsheet_sa_b64=console_gsheet_sa_b64,
+        cfg_account_tab=cfg_account_tab,
+    )
+
+    required = require_account_cfg(
+        account_cfg,
+        [
+            "SHOP_DOMAIN",
+            "GSHEET_SA_B64_SECRET",
+            "SHOPIFY_TOKEN_SECRET",
+        ],
+    )
+
+    shop_domain = required["SHOP_DOMAIN"]
+    api_version = str(
+        account_cfg.get("SHOPIFY_API_VERSION")
+        or account_cfg.get("API_VERSION")
+        or "2026-04"
+    ).strip()
+
+    gsheet_secret_name = required["GSHEET_SA_B64_SECRET"]
+    shopify_token_secret_name = required["SHOPIFY_TOKEN_SECRET"]
+
+    gsheet_sa_b64 = resolve_secret_value(gsheet_secret_name)
+    shopify_token = resolve_secret_value(shopify_token_secret_name)
+
+    if not gsheet_sa_b64:
+        raise ValueError(f"Missing secret value: {gsheet_secret_name}")
+    if not shopify_token:
+        raise ValueError(f"Missing secret value: {shopify_token_secret_name}")
+
+    result = run(
+        site_code=site_code,
+        gsheet_sa_b64=gsheet_sa_b64,
+        shopify_token=shopify_token,
+        shop_domain=shop_domain,
+        api_version=api_version,
+        cfg_sites_url=console_core_url,
+        cfg_sites_tab=cfg_sites_tab,
+        label_edit=label_edit,
+        label_config=label_config,
+        label_runlog=label_runlog,
+        tab_edit_update=tab_edit_update,
+        tab_cfg_fields=tab_cfg_fields,
+        tab_runlog=tab_runlog,
+        dry_run=dry_run,
+        confirmed=confirmed,
+        default_mode=default_mode,
+        empty_means_clear=empty_means_clear,
+        tz_name=tz_name,
+        job_name=job_name,
+        run_id=run_id,
+        job_chunk_size=job_chunk_size,
+        preview_limit=preview_limit,
+        detail_limit_per_error=detail_limit_per_error,
+    )
+
+    result.setdefault("runtime_config", {})
+    result["runtime_config"].update({
+        "config_source": f"{cfg_account_tab} + {cfg_sites_tab}",
+        "shop_domain": shop_domain,
+        "api_version": api_version,
+        "gsheet_sa_b64_secret": gsheet_secret_name,
+        "shopify_token_secret": shopify_token_secret_name,
+        "console_core_url": console_core_url,
+    })
+    return result
 
 
 class ShopifyClient:
