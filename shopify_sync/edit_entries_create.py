@@ -580,15 +580,87 @@ class EntriesCreatePlanner:
         return gid
 
 
+
+def load_account_config_from_console(
+    *,
+    console_core_url: str,
+    console_gsheet_sa_b64: str,
+    account_config_tab: str = "Cfg__account_id",
+) -> Dict[str, str]:
+    """Read site/account runtime config from Console Core.
+
+    Expected worksheet format supports either:
+    - two-column key/value rows without a header, or
+    - a header row containing key/value-like column names.
+    """
+    if not console_gsheet_sa_b64:
+        raise ValueError("Missing console_gsheet_sa_b64. Check CONSOLE_GSHEET_SA_B64_SECRET in Colab Secrets.")
+    gc = _build_gspread_client(console_gsheet_sa_b64)
+    sh_console = _gs_open_by_url(gc, console_core_url)
+    return _read_account_config(sh_console, account_config_tab)
+
+
+def _read_account_config(sh_console, account_config_tab: str = "Cfg__account_id") -> Dict[str, str]:
+    ws = _gs_retry(lambda: sh_console.worksheet(account_config_tab))
+    values = _gs_retry(lambda: ws.get_all_values())
+    if not values:
+        raise ValueError(f"{account_config_tab} is empty")
+
+    rows = [[str(c).strip() for c in row] for row in values]
+    first = [c.lower() for c in (rows[0] + [""] * 2)[:2]]
+
+    # Header mode: key/value, config_key/config_value, name/value, etc.
+    header_key_names = {"key", "config_key", "field", "name", "setting"}
+    header_val_names = {"value", "config_value", "val"}
+    has_header = first[0] in header_key_names and first[1] in header_val_names
+
+    data_rows = rows[1:] if has_header else rows
+    out: Dict[str, str] = {}
+    for row in data_rows:
+        if not row:
+            continue
+        key = str(row[0]).strip() if len(row) >= 1 else ""
+        val = str(row[1]).strip() if len(row) >= 2 else ""
+        if not key:
+            continue
+        out[key] = val
+
+    if not out:
+        raise ValueError(f"{account_config_tab} has no key/value rows")
+    return out
+
+
+def _cfg_get(account_config: Optional[Dict[str, Any]], key: str, fallback: Optional[str] = None) -> str:
+    if account_config and str(account_config.get(key, "")).strip() != "":
+        return str(account_config.get(key, "")).strip()
+    return str(fallback or "").strip()
+
+
+def _require_account_value(account_config: Dict[str, Any], key: str) -> str:
+    val = _cfg_get(account_config, key)
+    if not val:
+        raise ValueError(f"Cfg__account_id missing required key/value: {key}")
+    return val
+
 def run(
     *,
     site_code: str,
     job_name: str,
     console_core_url: str,
-    gsheet_sa_b64: str,
-    shopify_access_token: str,
-    shop_domain: str,
-    api_version: str = "2026-01",
+    # Bootstrap SA is only for opening Console Core.
+    # Site/account configs are read from Cfg__account_id.
+    console_gsheet_sa_b64: Optional[str] = None,
+    account_config_tab: str = "Cfg__account_id",
+    account_config: Optional[Dict[str, Any]] = None,
+
+    # Resolved secret values. Keep these out of Cell 1.
+    # In Colab, resolve them from the secret names stored in Cfg__account_id.
+    gsheet_sa_b64: Optional[str] = None,
+    shopify_access_token: Optional[str] = None,
+
+    # Legacy direct overrides. Normally leave blank so Cfg__account_id is source of truth.
+    shop_domain: Optional[str] = None,
+    api_version: Optional[str] = None,
     dry_run: bool = True,
     confirmed: bool = False,
     tz_name: str = "Asia/Shanghai",
@@ -618,15 +690,47 @@ def run(
 
     run_id = _gen_run_id(job_name=job_name, tz_name=tz_name)
 
+    # 1) Open Console Core with bootstrap SA and read account config.
+    bootstrap_sa_b64 = console_gsheet_sa_b64 or gsheet_sa_b64
+    if not bootstrap_sa_b64:
+        raise ValueError(
+            "Missing console_gsheet_sa_b64. Cell 1 should provide CONSOLE_GSHEET_SA_B64_SECRET, "
+            "and Cell 2 should resolve it from Colab Secrets."
+        )
+
+    gc_console = _build_gspread_client(bootstrap_sa_b64)
+    sh_console = _gs_open_by_url(gc_console, console_core_url)
+
+    if account_config is None:
+        account_config = _read_account_config(sh_console, account_config_tab)
+    else:
+        account_config = {str(k).strip(): "" if v is None else str(v).strip() for k, v in dict(account_config).items()}
+
+    resolved_shop_domain = _cfg_get(account_config, "SHOP_DOMAIN", shop_domain)
+    resolved_api_version = _cfg_get(account_config, "SHOPIFY_API_VERSION", api_version) or "2026-04"
+
+    if not resolved_shop_domain:
+        raise ValueError("Missing SHOP_DOMAIN. Add it to Cfg__account_id or pass shop_domain explicitly.")
+    if not gsheet_sa_b64:
+        raise ValueError(
+            "Missing resolved Google Sheets SA secret value. "
+            "Read GSHEET_SA_B64_SECRET from Cfg__account_id, then resolve it from Colab Secrets in Cell 2."
+        )
+    if not shopify_access_token:
+        raise ValueError(
+            "Missing resolved Shopify token secret value. "
+            "Read SHOPIFY_TOKEN_SECRET from Cfg__account_id, then resolve it from Colab Secrets in Cell 2."
+        )
+
+    # 2) Use site/account SA for business sheets. Console Core was already opened above.
     gc = _build_gspread_client(gsheet_sa_b64)
     gql_client = ShopifyGraphQLClient(
-        shop_domain=shop_domain,
+        shop_domain=resolved_shop_domain,
         access_token=shopify_access_token,
-        api_version=api_version,
+        api_version=resolved_api_version,
         timeout=request_timeout,
     )
 
-    sh_console = _gs_open_by_url(gc, console_core_url)
     cfg_sites_df = _read_worksheet_df(sh_console, cfg_sites_tab)
 
     edit_sheet_url = _lookup_sheet_url(cfg_sites_df, site_code, edit_sheet_label)
@@ -663,7 +767,9 @@ def run(
 
     print("=" * 72)
     print(f"{job_name} | site={site_code} | phase={phase} | run_id={run_id}")
-    print(f"shop_domain={shop_domain}")
+    print(f"shop_domain={resolved_shop_domain}")
+    print(f"api_version={resolved_api_version}")
+    print(f"account_config_tab={account_config_tab}")
     print(f"edit_tab={edit_tab_name} | cfg_fields_tab={cfg_fields_tab} | runlog_tab={runlog_tab_name}")
     print("=" * 72)
 
