@@ -1,4 +1,4 @@
-# shopify_export/export_collections.py
+# shopify_export/export_collections_consolecore_v20260526.py
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ RUNLOG_TAB_NAME = "Ops__RunLog"
 EXPORT_LABEL_DEFAULT = "export_other"
 EXPORT_TAB_DEFAULT = "Collections"
 CFG_SITES_TAB = "Cfg__Sites"
+CFG_ACCOUNT_TAB = "Cfg__account_id"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -207,35 +208,164 @@ def build_gspread_client(gsheet_sa_b64: str):
     return gspread.authorize(creds)
 
 
-def gs_url_to_csv_export(url: str, sheet_name: str) -> str:
-    m = requests.utils.urlparse(url)
-    path = m.path
-    if "/edit" in path:
-        base = f"{m.scheme}://{m.netloc}{path.split('/edit')[0]}"
-    else:
-        base = f"{m.scheme}://{m.netloc}{path}"
-    return f"{base}/gviz/tq?tqx=out:csv&sheet={requests.utils.quote(sheet_name)}"
+def _clean_header_row(headers: List[str]) -> List[str]:
+    return [(h or "").strip() for h in headers]
 
 
-def read_sheet_csv_by_title(sheet_url: str, worksheet_title: str, timeout: int = 60) -> List[Dict[str, str]]:
-    export_url = gs_url_to_csv_export(sheet_url, worksheet_title)
-    r = requests.get(export_url, timeout=timeout)
-    r.raise_for_status()
-    text = r.text
-    f = io.StringIO(text)
-    rows = list(csv.DictReader(f))
-    return [{(k or "").strip(): (v or "").strip() for k, v in row.items()} for row in rows]
+def _records_from_values(values: List[List[Any]]) -> List[Dict[str, str]]:
+    """
+    Convert worksheet values into records without using get_all_records().
+    This avoids gspread duplicate-header crashes and gives a clearer error.
+    """
+    if not values:
+        return []
+
+    headers = _clean_header_row([safe_str(x) for x in values[0]])
+    if not any(headers):
+        return []
+
+    dupes = sorted({h for h in headers if h and headers.count(h) > 1})
+    if dupes:
+        raise RuntimeError(f"Worksheet header row contains duplicate columns: {dupes}")
+
+    out: List[Dict[str, str]] = []
+    for raw in values[1:]:
+        row = list(raw) + [""] * max(0, len(headers) - len(raw))
+        rec = {headers[i]: safe_str(row[i]).strip() for i in range(len(headers)) if headers[i]}
+        if any(v != "" for v in rec.values()):
+            out.append(rec)
+    return out
 
 
-def find_site_label_url(console_core_url: str, site_code: str, label: str) -> str:
-    rows = read_sheet_csv_by_title(console_core_url, CFG_SITES_TAB)
+def read_worksheet_records_by_title(gc, sheet_url: str, worksheet_title: str) -> List[Dict[str, str]]:
+    """
+    Authorized Google Sheets read.
+    Do not use /gviz/tq?tqx=out:csv because private sheets return 401.
+    """
+    book = gc.open_by_url(sheet_url)
+    ws = book.worksheet(worksheet_title)
+    return _records_from_values(ws.get_all_values())
+
+
+def read_worksheet_values_by_title(gc, sheet_url: str, worksheet_title: str) -> List[List[str]]:
+    book = gc.open_by_url(sheet_url)
+    ws = book.worksheet(worksheet_title)
+    return ws.get_all_values()
+
+
+def find_site_label_url(gc, console_core_url: str, site_code: str, label: str) -> str:
+    rows = read_worksheet_records_by_title(gc, console_core_url, CFG_SITES_TAB)
     site_code = (site_code or "").strip().upper()
     label = (label or "").strip()
 
     for row in rows:
         if (row.get("site_code", "") or "").strip().upper() == site_code and (row.get("label", "") or "").strip() == label:
-            return strip_url(row.get("sheet_url", ""))
+            url = strip_url(row.get("sheet_url", ""))
+            if not url:
+                raise RuntimeError(f"Cfg__Sites 找到行但 sheet_url 为空: site_code={site_code}, label={label}")
+            return url
+
     raise RuntimeError(f"Cfg__Sites 未找到 sheet_url: site_code={site_code}, label={label}")
+
+
+def _looks_like_header(row: List[str]) -> bool:
+    normalized = {(x or "").strip().lower() for x in row}
+    key_names = {"key", "config_key", "field_key", "name", "setting", "account_key"}
+    value_names = {"value", "config_value", "field_value", "setting_value", "account_value"}
+    return bool(normalized & key_names) and bool(normalized & value_names)
+
+
+def _first_existing_key(d: Dict[str, str], keys: List[str]) -> str:
+    for k in keys:
+        if k in d:
+            return k
+    return ""
+
+
+def parse_cfg_account_values(values: List[List[str]], site_code: str = "") -> Dict[str, str]:
+    """
+    Supports both common Cfg__account_id shapes:
+    1) key/value without header:
+       SHOP_DOMAIN | aeqjdw-r1.myshopify.com
+    2) table with header:
+       site_code | config_key | config_value
+       NRP       | SHOP_DOMAIN | ...
+    """
+    rows = [[safe_str(c).strip() for c in r] for r in values if any(safe_str(c).strip() for c in r)]
+    if not rows:
+        raise RuntimeError(f"{CFG_ACCOUNT_TAB} 为空")
+
+    site_code_norm = (site_code or "").strip().upper()
+
+    # Header table mode.
+    if _looks_like_header(rows[0]):
+        headers = _clean_header_row(rows[0])
+        dupes = sorted({h for h in headers if h and headers.count(h) > 1})
+        if dupes:
+            raise RuntimeError(f"{CFG_ACCOUNT_TAB} 表头重复: {dupes}")
+
+        records = _records_from_values(rows)
+        key_col = ""
+        value_col = ""
+        site_col = ""
+
+        lower_to_header = {h.lower(): h for h in headers if h}
+        for x in ["key", "config_key", "field_key", "name", "setting", "account_key"]:
+            if x in lower_to_header:
+                key_col = lower_to_header[x]
+                break
+        for x in ["value", "config_value", "field_value", "setting_value", "account_value"]:
+            if x in lower_to_header:
+                value_col = lower_to_header[x]
+                break
+        for x in ["site_code", "account_id", "site"]:
+            if x in lower_to_header:
+                site_col = lower_to_header[x]
+                break
+
+        if not key_col or not value_col:
+            raise RuntimeError(f"{CFG_ACCOUNT_TAB} 表头模式下必须包含 key/value 类字段")
+
+        cfg: Dict[str, str] = {}
+        for rec in records:
+            if site_col:
+                row_site = (rec.get(site_col, "") or "").strip().upper()
+                if row_site and site_code_norm and row_site != site_code_norm:
+                    continue
+            k = (rec.get(key_col, "") or "").strip()
+            v = (rec.get(value_col, "") or "").strip()
+            if k:
+                cfg[k] = v
+        return cfg
+
+    # Simple key/value mode.
+    cfg = {}
+    for row in rows:
+        if len(row) < 2:
+            continue
+        k = (row[0] or "").strip()
+        v = (row[1] or "").strip()
+        if k:
+            cfg[k] = v
+    return cfg
+
+
+def resolve_account_config(gc, console_core_url: str, site_code: str) -> Dict[str, str]:
+    values = read_worksheet_values_by_title(gc, console_core_url, CFG_ACCOUNT_TAB)
+    cfg = parse_cfg_account_values(values, site_code=site_code)
+
+    required = [
+        "SHOP_DOMAIN",
+        "SHOPIFY_API_VERSION",
+        "STOREFRONT_BASE_URL",
+        "GSHEET_SA_B64_SECRET",
+        "SHOPIFY_TOKEN_SECRET",
+    ]
+    missing = [k for k in required if not (cfg.get(k) or "").strip()]
+    if missing:
+        raise RuntimeError(f"{CFG_ACCOUNT_TAB} 缺少必填配置: {missing}")
+
+    return cfg
 
 
 def ensure_tab(ws_book, tab_name: str):
@@ -630,12 +760,12 @@ def write_export_sheet(ws, header: List[str], data_rows: List[List[Any]], write_
 def run(
     *,
     site_code: str,
-    shop_domain: str,
-    api_version: str,
-    storefront_base_url: str,
     console_core_url: str,
     gsheet_sa_b64: str,
     shopify_token: str,
+    shop_domain: str,
+    api_version: str,
+    storefront_base_url: str,
     export_label: str = EXPORT_LABEL_DEFAULT,
     export_tab_name: str = EXPORT_TAB_DEFAULT,
     runlog_label: str = "runlog_sheet",
@@ -704,10 +834,10 @@ def run(
     )
     print("✅ Shopify client ready")
 
-    export_sheet_url = find_site_label_url(cfg.console_core_url, cfg.site_code, cfg.export_label)
+    export_sheet_url = find_site_label_url(gc, cfg.console_core_url, cfg.site_code, cfg.export_label)
     print(f"✅ export_sheet_url: {export_sheet_url}")
 
-    runlog_sheet_url = find_site_label_url(cfg.console_core_url, cfg.site_code, cfg.runlog_label)
+    runlog_sheet_url = find_site_label_url(gc, cfg.console_core_url, cfg.site_code, cfg.runlog_label)
     print(f"✅ runlog_sheet_url: {runlog_sheet_url}")
 
     pub_id, pubs = resolve_online_store_publication_id(client, cfg)
