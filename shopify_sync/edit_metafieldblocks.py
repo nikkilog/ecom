@@ -983,6 +983,18 @@ def build_rich_text_bullet(items: list[str]) -> str:
 
 
 def build_rich_text_feature(rows: list[dict[str, Any]]) -> str:
+    """
+    Build a Shopify rich_text_field value for title/body feature blocks.
+
+    Display rule:
+      title + body -> "Title: Body" in the same paragraph.
+      title only    -> bold title only.
+      body only     -> body only.
+
+    Input sheet stays unchanged:
+      title column = heading text
+      body column  = paragraph text
+    """
     children = []
 
     for r in rows:
@@ -992,10 +1004,14 @@ def build_rich_text_feature(rows: list[dict[str, Any]]) -> str:
             continue
 
         paragraph_children = []
+
         if title:
             paragraph_children.append({"type": "text", "value": title, "bold": True})
-        if body:
-            paragraph_children.append({"type": "text", "value": f"\n{body}" if title else body})
+
+        if title and body:
+            paragraph_children.append({"type": "text", "value": f": {body}"})
+        elif body:
+            paragraph_children.append({"type": "text", "value": body})
 
         children.append({"type": "paragraph", "children": paragraph_children})
 
@@ -1003,6 +1019,14 @@ def build_rich_text_feature(rows: list[dict[str, Any]]) -> str:
 
 
 def build_rich_text_paragraph(rows: list[dict[str, Any]]) -> str:
+    """
+    Build a Shopify rich_text_field value for paragraph blocks.
+
+    Display rule:
+      title + body/value -> "Title: Body" in the same paragraph.
+      title only         -> bold title only.
+      body/value only    -> body/value only.
+    """
     children = []
 
     for r in rows:
@@ -1012,10 +1036,14 @@ def build_rich_text_paragraph(rows: list[dict[str, Any]]) -> str:
             continue
 
         paragraph_children = []
+
         if title:
             paragraph_children.append({"type": "text", "value": title, "bold": True})
-        if body:
-            paragraph_children.append({"type": "text", "value": f"\n{body}" if title else body})
+
+        if title and body:
+            paragraph_children.append({"type": "text", "value": f": {body}"})
+        elif body:
+            paragraph_children.append({"type": "text", "value": body})
 
         children.append({"type": "paragraph", "children": paragraph_children})
 
