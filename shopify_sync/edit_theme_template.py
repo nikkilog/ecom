@@ -4,6 +4,9 @@ shopify_sync.edit_theme_template
 
 Batch update Shopify theme template suffix for PRODUCT / COLLECTION / PAGE from Google Sheets.
 
+Root-fix version: Cfg__account_id is parsed from raw two-column values so both headerless
+and headered key/value config tabs are supported safely.
+
 Input worksheet:
   Edit__ThemeTemplate
 
@@ -171,23 +174,154 @@ def _worksheet_to_df(ws: gspread.Worksheet) -> pd.DataFrame:
     values = ws.get_all_values()
     if not values:
         return pd.DataFrame()
-    headers = [h.strip() for h in values[0]]
+    headers = [_as_str(h) for h in values[0]]
     rows = values[1:]
-    df = pd.DataFrame(rows, columns=headers)
+
+    # Make duplicate/blank headers safe for pandas/gspread tables.
+    safe_headers: List[str] = []
+    seen: Dict[str, int] = {}
+    for i, h in enumerate(headers):
+        base = h or f"__blank_col_{i + 1}"
+        if base in seen:
+            seen[base] += 1
+            safe_headers.append(f"{base}__dup{seen[base]}")
+        else:
+            seen[base] = 0
+            safe_headers.append(base)
+
+    width = len(safe_headers)
+    normalized_rows = []
+    for row in rows:
+        row = list(row[:width]) + [""] * max(0, width - len(row))
+        normalized_rows.append(row)
+
+    df = pd.DataFrame(normalized_rows, columns=safe_headers)
     # Drop fully blank rows.
     if len(df):
         df = df.loc[~df.apply(lambda r: all(_as_str(x) == "" for x in r), axis=1)].copy()
     return df
 
 
+def _norm_config_key(v: Any) -> str:
+    """Normalize config keys so Cfg__account_id is not fragile."""
+    s = _as_str(v)
+    s = s.replace("﻿", "")
+    s = s.replace("：", ":")
+    s = re.sub(r"\s+", "", s)
+    return s.upper()
+
+
+def _looks_like_config_header(key: str, value: str) -> bool:
+    k = _norm_config_key(key).lower()
+    v = _norm_config_key(value).lower()
+    header_keys = {
+        "key", "configkey", "config_key", "settingkey", "setting_key",
+        "name", "fieldkey", "field_key", "accountkey", "account_key",
+        "配置项", "配置键", "字段", "字段名",
+    }
+    header_values = {
+        "value", "configvalue", "config_value", "settingvalue", "setting_value",
+        "val", "fieldvalue", "field_value", "accountvalue", "account_value",
+        "配置值", "值",
+    }
+    return k in header_keys and v in header_values
+
+
+def _worksheet_to_key_value_config(
+    ws: gspread.Worksheet,
+    *,
+    tab_name: str = "Cfg__account_id",
+    strict_duplicates: bool = True,
+) -> Dict[str, str]:
+    """
+    Read a 2-column key/value config worksheet directly from raw values.
+
+    This intentionally does NOT go through _worksheet_to_df(), because config tabs
+    are often headerless. A headerless sheet like this is valid:
+
+        SHOP_DOMAIN              | aeqjdw-r1.myshopify.com
+        SHOPIFY_API_VERSION      | 2026-01
+        SHOPIFY_TOKEN_SECRET     | NRP_SHOPIFY_ACCESS_TOKEN
+
+    A headered version is also valid:
+
+        config_key               | config_value
+        SHOP_DOMAIN              | aeqjdw-r1.myshopify.com
+
+    Rules:
+      - first two columns are used; extra columns are ignored
+      - fully blank rows are ignored
+      - keys are normalized to uppercase, whitespace-free form
+      - duplicate keys with different values are blocked
+      - duplicate keys with the same value are harmless
+    """
+    values = ws.get_all_values()
+    if not values:
+        raise ValueError(f"{tab_name} is empty.")
+
+    out: Dict[str, str] = {}
+    raw_seen: Dict[str, str] = {}
+    duplicate_conflicts: List[str] = []
+
+    for row_idx, row in enumerate(values, start=1):
+        row = list(row)
+        key_raw = _as_str(row[0] if len(row) >= 1 else "")
+        val_raw = _as_str(row[1] if len(row) >= 2 else "")
+
+        if not key_raw and not val_raw:
+            continue
+
+        # Skip a real header row only when both columns look like headers.
+        if row_idx == 1 and _looks_like_config_header(key_raw, val_raw):
+            continue
+
+        key_norm = _norm_config_key(key_raw)
+        if not key_norm:
+            continue
+
+        if key_norm in out:
+            if out[key_norm] != val_raw:
+                duplicate_conflicts.append(
+                    f"row {row_idx}: {key_raw} duplicates {raw_seen.get(key_norm, key_norm)} with different values"
+                )
+            continue
+
+        out[key_norm] = val_raw
+        raw_seen[key_norm] = key_raw
+
+    if strict_duplicates and duplicate_conflicts:
+        raise ValueError(
+            f"{tab_name} has duplicate config keys with different values: "
+            + "; ".join(duplicate_conflicts[:10])
+        )
+
+    if not out:
+        raise ValueError(
+            f"{tab_name} did not produce any config key/value pairs. "
+            "Expected first two columns to be config key and config value."
+        )
+
+    return out
+
+
 def _dict_from_two_col_df(df: pd.DataFrame) -> Dict[str, str]:
+    """Backward-compatible parser for existing callers. Prefer _worksheet_to_key_value_config for config tabs."""
     if df.empty or df.shape[1] < 2:
         return {}
+
     key_col = df.columns[0]
     val_col = df.columns[1]
-    out = {}
+    out: Dict[str, str] = {}
+
+    # If df came from a headerless two-column sheet, pandas consumed the first config row as headers.
+    # Put it back unless those headers look like real key/value headers.
+    if not _looks_like_config_header(key_col, val_col):
+        k0 = _norm_config_key(key_col)
+        if k0:
+            out[k0] = _as_str(val_col)
+
     for _, row in df.iterrows():
-        k = _as_str(row.get(key_col))
+        k = _norm_config_key(row.get(key_col))
         if not k:
             continue
         out[k] = _as_str(row.get(val_col))
@@ -216,9 +350,14 @@ def _find_site_route(cfg_sites: pd.DataFrame, site_code: str, label: str) -> Dic
 
 
 def _pick_config(account_cfg: Dict[str, str], key: str, required: bool = True, default: str = "") -> str:
-    val = _as_str(account_cfg.get(key, default))
+    key_norm = _norm_config_key(key)
+    val = _as_str(account_cfg.get(key_norm, default))
     if required and not val:
-        raise ValueError(f"Cfg__account_id missing required config: {key}")
+        available = ", ".join(sorted(account_cfg.keys())) or "<none>"
+        raise ValueError(
+            f"Cfg__account_id missing required config: {key}. "
+            f"Available keys read from Cfg__account_id: {available}"
+        )
     return val
 
 
@@ -645,7 +784,7 @@ def run(
     cfg_sites_df = _worksheet_to_df(cfg_sites_ws)
 
     account_ws = console_sh.worksheet(cfg_account_tab)
-    account_cfg = _dict_from_two_col_df(_worksheet_to_df(account_ws))
+    account_cfg = _worksheet_to_key_value_config(account_ws, tab_name=cfg_account_tab)
 
     input_route = _find_site_route(cfg_sites_df, site_code, input_sheet_label)
     runlog_route = _find_site_route(cfg_sites_df, site_code, runlog_sheet_label)
