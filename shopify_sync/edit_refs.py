@@ -179,6 +179,50 @@ def find_sheet_url_by_label(gc, console_core_url: str, site_code: str, label: st
     return url
 
 
+
+
+def read_account_config_from_console_core(
+    gc,
+    console_core_url: str,
+    account_tab: str = "Cfg__account_id",
+) -> Dict[str, str]:
+    """
+    读取 Console Core 内的 Cfg__account_id。
+
+    约定结构：
+      A列 = config key
+      B列 = config value
+
+    不依赖表头；会自动跳过空 key。
+    """
+    sh = gc.open_by_url(console_core_url)
+    ws = sh.worksheet(account_tab)
+    rows = ws.get_all_values()
+
+    out: Dict[str, str] = {}
+    for row in rows:
+        if not row:
+            continue
+        k = _norm_str(row[0]) if len(row) >= 1 else ""
+        v = _norm_str(row[1]) if len(row) >= 2 else ""
+        if not k:
+            continue
+        # 兼容万一未来加了表头
+        if k.lower() in {"key", "config_key", "field_key", "name"}:
+            continue
+        out[k] = v
+
+    return out
+
+
+def require_account_config(cfg: Dict[str, str], keys: List[str]) -> Dict[str, str]:
+    """校验必需配置存在且非空。"""
+    missing = [k for k in keys if not _norm_str(cfg.get(k, ""))]
+    if missing:
+        raise RuntimeError(f"Cfg__account_id missing required keys or values: {missing}")
+    return {k: _norm_str(cfg.get(k, "")) for k in keys}
+
+
 def build_type_map_from_cfg(cfg_df: pd.DataFrame) -> Dict[str, str]:
     def normalize_mf_type(data_type: str) -> str:
         t = _norm_str(data_type).lower()
