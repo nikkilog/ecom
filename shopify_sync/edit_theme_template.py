@@ -288,6 +288,53 @@ def _load_account_config(df: pd.DataFrame, site_code: str) -> Dict[str, str]:
     return {}
 
 
+
+def _load_account_config_from_worksheet(ws: gspread.Worksheet, site_code: str) -> Dict[str, str]:
+    """
+    Load Cfg__account_id directly from raw worksheet values.
+
+    Important: Cfg__account_id is often a no-header two-column table:
+      A1=SHOP_DOMAIN, B1=xxx.myshopify.com
+    A generic header-based DataFrame loader would treat row 1 as headers and lose SHOP_DOMAIN.
+    This function preserves row 1 and supports:
+      - no-header two-column key/value
+      - headered key/value
+      - headered site_code + key + value
+      - headered one-row-per-site wide config
+    """
+    values = ws.get_all_values()
+    values = [row for row in values if any(_as_str(x) for x in row)]
+    if not values:
+        return {}
+
+    site_code_norm = _as_str(site_code).upper()
+
+    # Case A: no-header key/value table. This is the Console Core style shown in the screenshot.
+    # Preserve A1/B1 as a real config row.
+    if len(values[0]) >= 2 and _looks_like_cfg_key(values[0][0]) and _as_str(values[0][0]).upper() not in {
+        "KEY", "CONFIG_KEY", "CFG_KEY", "FIELD_KEY", "NAME", "SETTING", "SITE_CODE", "ACCOUNT_ID"
+    }:
+        out: Dict[str, str] = {}
+        for row in values:
+            if len(row) < 2:
+                continue
+            k = _as_str(row[0])
+            if not k:
+                continue
+            out[k] = _as_str(row[1])
+        return out
+
+    # Headered shapes.
+    headers = [_as_str(h) for h in values[0]]
+    rows = values[1:]
+    if not rows:
+        return {}
+    max_len = max(len(headers), max((len(r) for r in rows), default=0))
+    headers = headers + [f"__extra_{i}" for i in range(len(headers), max_len)]
+    norm_rows = [r + [""] * (max_len - len(r)) for r in rows]
+    df = pd.DataFrame(norm_rows, columns=headers)
+    return _load_account_config(df, site_code_norm)
+
 def _find_site_route(cfg_sites: pd.DataFrame, site_code: str, label: str) -> Dict[str, str]:
     required = {"site_code", "label"}
     missing = required - set(cfg_sites.columns)
@@ -309,10 +356,52 @@ def _find_site_route(cfg_sites: pd.DataFrame, site_code: str, label: str) -> Dic
     return {k: _as_str(v) for k, v in row.items() if not k.startswith("_")}
 
 
+
+
+def _derive_shop_domain_from_admin_base_url(admin_base_url: str) -> str:
+    """
+    Derive Shopify myshopify domain from Admin URL.
+
+    Example:
+      https://admin.shopify.com/store/aeqjdw-r1/ -> aeqjdw-r1.myshopify.com
+
+    This is a safe fallback for Console Core setups that store ADMIN_BASE_URL
+    but omit SHOP_DOMAIN.
+    """
+    u = _as_str(admin_base_url)
+    if not u:
+        return ""
+    m = re.search(r"admin\.shopify\.com/store/([^/?#]+)", u)
+    if not m:
+        return ""
+    store_handle = m.group(1).strip().strip("/")
+    if not store_handle:
+        return ""
+    return f"{store_handle}.myshopify.com"
+
+
+def _normalize_account_config(account_cfg: Dict[str, str]) -> Dict[str, str]:
+    """
+    Fill safe derived runtime config values without silently inventing business config.
+    """
+    out = dict(account_cfg or {})
+
+    if not _as_str(out.get("SHOP_DOMAIN")):
+        derived = _derive_shop_domain_from_admin_base_url(out.get("ADMIN_BASE_URL", ""))
+        if derived:
+            out["SHOP_DOMAIN"] = derived
+            out["__SHOP_DOMAIN_SOURCE"] = "derived_from_ADMIN_BASE_URL"
+
+    return out
+
 def _pick_config(account_cfg: Dict[str, str], key: str, required: bool = True, default: str = "") -> str:
     val = _as_str(account_cfg.get(key, default))
     if required and not val:
-        raise ValueError(f"Cfg__account_id missing required config: {key}")
+        available = sorted([k for k in (account_cfg or {}).keys() if not str(k).startswith("__")])
+        hint = ""
+        if key == "SHOP_DOMAIN" and _as_str((account_cfg or {}).get("ADMIN_BASE_URL")):
+            hint = " | ADMIN_BASE_URL exists but SHOP_DOMAIN could not be derived; expected format like https://admin.shopify.com/store/<store-handle>/"
+        raise ValueError(f"Cfg__account_id missing required config: {key}. available_keys={available}{hint}")
     return val
 
 
@@ -798,12 +887,15 @@ def run(
     cfg_sites_df = _worksheet_to_df(cfg_sites_ws)
 
     account_ws = console_sh.worksheet(cfg_account_tab)
-    account_df = _worksheet_to_df(account_ws)
-    account_cfg = _load_account_config(account_df, site_code)
+    account_cfg = _load_account_config_from_worksheet(account_ws, site_code)
+    account_cfg = _normalize_account_config(account_cfg)
 
     # Fail early with visible diagnostics if required account config is not loaded.
     # Do not print secret values. Only print loaded keys.
-    print("ACCOUNT_CONFIG_KEYS     =", sorted(account_cfg.keys()))
+    print("ACCOUNT_CONFIG_KEYS     =", sorted([k for k in account_cfg.keys() if not k.startswith("__")]))
+    if account_cfg.get("__SHOP_DOMAIN_SOURCE"):
+        print("SHOP_DOMAIN_SOURCE      =", account_cfg.get("__SHOP_DOMAIN_SOURCE"))
+        print("SHOP_DOMAIN             =", account_cfg.get("SHOP_DOMAIN"))
 
     input_route = _find_site_route(cfg_sites_df, site_code, input_sheet_label)
     runlog_route = _find_site_route(cfg_sites_df, site_code, runlog_sheet_label)
