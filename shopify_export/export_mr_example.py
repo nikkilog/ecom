@@ -220,6 +220,17 @@ def write_df_to_ws(ws, df: pd.DataFrame, clear_first: bool = True):
 # =========================================================
 
 def get_site_targets(df_sites: pd.DataFrame, site_code: str) -> Dict[str, str]:
+    """
+    Resolve sheet routing from Cfg__Sites.
+
+    Console Core standard:
+    - Cfg__Sites controls label -> sheet_url routing.
+    - Shopify runtime values such as SHOP_DOMAIN normally live in Cfg__account_id.
+
+    Older versions incorrectly required shop_domain directly in Cfg__Sites.
+    This function now keeps shop_domain optional and lets run() resolve it from
+    Cfg__account_id when it is not present in Cfg__Sites.
+    """
     df = _normalize_headers(df_sites)
 
     col_site = _pick_first_existing_col(df, ["site_code", "site", "code"])
@@ -259,19 +270,97 @@ def get_site_targets(df_sites: pd.DataFrame, site_code: str) -> Dict[str, str]:
     if miss:
         raise RuntimeError(f"Cfg__Sites 缺少这些 label 对应的 sheet_url：{miss}")
 
-    if _is_blank(shop_domain):
-        raise RuntimeError("Cfg__Sites 缺少 shop_domain / myshopify_domain 字段或值，无法访问 Shopify")
-
-    if ".myshopify.com" not in shop_domain:
-        shop_domain = f"{shop_domain}.myshopify.com"
-
     return {
         "site_url": site_url,
-        "shop_domain": shop_domain,
+        "shop_domain": normalize_shop_domain(shop_domain) if not _is_blank(shop_domain) else "",
         "config_url": targets["config"],
         "export_other_url": targets["export_other"],
         "runlog_url": targets["runlog_sheet"],
     }
+
+
+def normalize_shop_domain(value: str) -> str:
+    """Normalize Shopify shop domain to xxx.myshopify.com."""
+    s = _norm(value)
+    if not s:
+        return ""
+
+    s = re.sub(r"^https?://", "", s, flags=re.I).strip()
+
+    # Allow an Admin URL such as admin.shopify.com/store/apollolift-us/ if it is
+    # accidentally supplied instead of the pure myshopify domain.
+    m = re.search(r"admin\.shopify\.com/store/([^/?#]+)", s, flags=re.I)
+    if m:
+        s = m.group(1)
+    else:
+        s = s.split("/", 1)[0]
+
+    s = s.strip().strip("/")
+    if not s:
+        return ""
+
+    if ".myshopify.com" not in s.lower():
+        s = f"{s}.myshopify.com"
+    return s
+
+
+def read_key_value_config_ws(ws) -> Dict[str, str]:
+    """Read a two-column key/value worksheet such as Cfg__account_id."""
+    rows = ws.get_all_values()
+    cfg = {}
+    for row in rows:
+        if not row:
+            continue
+        key = _norm(row[0])
+        val = _norm(row[1]) if len(row) > 1 else ""
+        if not key:
+            continue
+        # Keep the first nonblank value if duplicate keys exist.
+        if key not in cfg or _is_blank(cfg.get(key)):
+            cfg[key] = val
+    return cfg
+
+
+def resolve_shopify_runtime_config(
+    *,
+    targets: Dict[str, str],
+    account_cfg: Dict[str, str],
+    shopify_api_version: str,
+) -> Tuple[str, str]:
+    """
+    Resolve Shopify runtime values from the correct config source.
+
+    Priority:
+    1. shop_domain in Cfg__Sites, if present for backward compatibility.
+    2. SHOP_DOMAIN / MYSHOPIFY_DOMAIN / SHOPIFY_DOMAIN in Cfg__account_id.
+
+    API version keeps the explicit Colab parameter first, then falls back to
+    Cfg__account_id.SHOPIFY_API_VERSION.
+    """
+    shop_domain = _norm(targets.get("shop_domain"))
+    if _is_blank(shop_domain):
+        shop_domain = (
+            account_cfg.get("SHOP_DOMAIN")
+            or account_cfg.get("MYSHOPIFY_DOMAIN")
+            or account_cfg.get("SHOPIFY_DOMAIN")
+            or account_cfg.get("shop_domain")
+            or account_cfg.get("myshopify_domain")
+            or account_cfg.get("shopify_domain")
+            or ""
+        )
+
+    shop_domain = normalize_shop_domain(shop_domain)
+    if _is_blank(shop_domain):
+        raise RuntimeError(
+            "无法解析 Shopify 店铺域名：Cfg__Sites 没有 shop_domain，且 Cfg__account_id 没有 SHOP_DOMAIN / MYSHOPIFY_DOMAIN / SHOPIFY_DOMAIN"
+        )
+
+    api_version = _norm(shopify_api_version) or _norm(account_cfg.get("SHOPIFY_API_VERSION"))
+    if _is_blank(api_version):
+        raise RuntimeError("缺少 Shopify API Version：请在 Cell 1 或 Cfg__account_id.SHOPIFY_API_VERSION 配置")
+
+    targets["shop_domain"] = shop_domain
+    return shop_domain, api_version
 
 
 def parse_metafield_key(metafield_key: str) -> Tuple[str, str]:
@@ -1003,6 +1092,7 @@ def run(
     metaobject_type: str,
     metafield_key: str,
     cfg_sites_tab: str = "Cfg__Sites",
+    cfg_account_id_tab: str = "Cfg__account_id",
     cfg_fields_tab: str = "Cfg__Fields",
     export_tab: str = "MR-Example",
     runlog_tab: str = "Ops__RunLog",
@@ -1037,7 +1127,17 @@ def run(
 
     targets = get_site_targets(df_sites=df_sites, site_code=site_code)
 
-    # 2) config -> Cfg__Fields
+    # 2) config -> Cfg__account_id
+    #    Shopify runtime config belongs here under the multi-site Console Core standard.
+    ws_account = open_ws_by_url_and_title(gc, targets["config_url"], cfg_account_id_tab)
+    account_cfg = read_key_value_config_ws(ws_account)
+    shop_domain, resolved_api_version = resolve_shopify_runtime_config(
+        targets=targets,
+        account_cfg=account_cfg,
+        shopify_api_version=shopify_api_version,
+    )
+
+    # 3) config -> Cfg__Fields
     ws_fields = open_ws_by_url_and_title(gc, targets["config_url"], cfg_fields_tab)
     df_fields = ws_records(ws_fields)
     if df_fields.empty:
@@ -1054,12 +1154,12 @@ def run(
     key = cfg["key"]
     field_order = cfg["field_order"]
 
-    # 3) Shopify pull
+    # 4) Shopify pull
     owner_nodes = list(
         iter_owner_nodes(
             owner_entity_type=owner,
-            shop_domain=targets["shop_domain"],
-            api_version=shopify_api_version,
+            shop_domain=shop_domain,
+            api_version=resolved_api_version,
             token=shopify_token,
             namespace=namespace,
             key=key,
@@ -1070,7 +1170,7 @@ def run(
         )
     )
 
-    # 4) build output
+    # 5) build output
     df_out, stats, detail_errors = build_output_df(
         owner_entity_type=owner,
         owner_nodes=owner_nodes,
@@ -1079,11 +1179,11 @@ def run(
         list_join_sep=list_join_sep,
     )
 
-    # 5) write export sheet
+    # 6) write export sheet
     ws_export = open_ws_by_url_and_title(gc, targets["export_other_url"], export_tab)
     write_df_to_ws(ws_export, df_out, clear_first=overwrite_export_sheet)
 
-    # 6) runlog
+    # 7) runlog
     summary_status = "SUCCESS"
     summary_error_reason = ""
     summary_message = (
@@ -1128,7 +1228,8 @@ def run(
         "owner_entity_type": owner,
         "metaobject_type": metaobject_type,
         "metafield_key": metafield_key,
-        "shop_domain": targets["shop_domain"],
+        "shop_domain": shop_domain,
+        "shopify_api_version": resolved_api_version,
         "targets": targets,
         "summary": {
             "owners_scanned": stats["owners_scanned"],
