@@ -18,6 +18,14 @@ ALLOWED_OPS = {"LINK", "UNLINK", "REPLACE_ALL"}
 SUPPORTED_ENTITY_TYPES = {"PRODUCT", "COLLECTION", "PAGE"}
 OPTIONAL_ENTITY_TYPES = {"ORDER"}  # 预留，不默认启用
 
+# Supported Shopify metafield reference types for this job.
+# list.mixed_reference is used by Shopify when a reference list can point to
+# metaobjects from multiple definitions. It must be written back with the exact
+# definition type; writing list.metaobject_reference will fail with INVALID_TYPE.
+SINGLE_REFERENCE_TYPES = {"metaobject_reference", "mixed_reference"}
+LIST_REFERENCE_TYPES = {"list.metaobject_reference", "list.mixed_reference"}
+SUPPORTED_REFERENCE_TYPES = SINGLE_REFERENCE_TYPES | LIST_REFERENCE_TYPES
+
 RUNLOG_HEADERS = [
     "run_id",
     "ts_cn",
@@ -225,17 +233,20 @@ def require_account_config(cfg: Dict[str, str], keys: List[str]) -> Dict[str, st
 
 def build_type_map_from_cfg(cfg_df: pd.DataFrame) -> Dict[str, str]:
     def normalize_mf_type(data_type: str) -> str:
-        t = _norm_str(data_type).lower()
-        if t in {"reference", "metaobject_reference"}:
-            return "metaobject_reference"
-        if t in {"list.reference", "list.metaobject_reference"}:
-            return "list.metaobject_reference"
+        t = _norm_str(data_type).lower().replace("_", ".").replace("-", ".")
 
-        t2 = t.replace("_", ".").replace("-", ".")
-        if t2 == "reference":
+        # Keep Shopify's exact definition type. Do not collapse
+        # list.mixed_reference into list.metaobject_reference.
+        if t in {"reference", "metaobject.reference"}:
             return "metaobject_reference"
-        if t2.startswith("list.") and "reference" in t2:
+        if t in {"metaobject_reference", "metaobject.reference"}:
+            return "metaobject_reference"
+        if t == "mixed.reference" or t == "mixed_reference":
+            return "mixed_reference"
+        if t in {"list.reference", "list.metaobject.reference", "list.metaobject_reference"}:
             return "list.metaobject_reference"
+        if t in {"list.mixed.reference", "list.mixed_reference"}:
+            return "list.mixed_reference"
         return ""
 
     if "data_type" not in cfg_df.columns:
@@ -364,7 +375,7 @@ def infer_missing_metafield_type(
     if not fb:
         return ""
 
-    if fb in {"metaobject_reference", "list.metaobject_reference"}:
+    if fb in SUPPORTED_REFERENCE_TYPES:
         return fb
 
     return _norm_str(type_map.get(fb, ""))
@@ -395,10 +406,10 @@ def validate_metaobject_gid_list(gids: List[str]) -> List[str]:
 def decode_value(mf_type: str, value_str: Any):
     t = _norm_str(mf_type)
 
-    if t == "metaobject_reference":
+    if t in SINGLE_REFERENCE_TYPES:
         return _norm_str(value_str)
 
-    if t == "list.metaobject_reference":
+    if t in LIST_REFERENCE_TYPES:
         s = _norm_str(value_str)
         if not s:
             return []
@@ -416,10 +427,10 @@ def decode_value(mf_type: str, value_str: Any):
 def encode_value(mf_type: str, py_val: Any) -> str:
     t = _norm_str(mf_type)
 
-    if t == "metaobject_reference":
+    if t in SINGLE_REFERENCE_TYPES:
         return _norm_str(py_val)
 
-    if t == "list.metaobject_reference":
+    if t in LIST_REFERENCE_TYPES:
         arr = py_val if isinstance(py_val, list) else ([] if py_val in (None, "") else [str(py_val)])
         arr = _dedupe_keep_order([str(v) for v in arr])
         return json.dumps(arr, ensure_ascii=False)
@@ -536,7 +547,7 @@ def set_metafield(
     mf_type: str,
     value_str: str,
 ):
-    if _norm_str(mf_type) not in {"metaobject_reference", "list.metaobject_reference"}:
+    if _norm_str(mf_type) not in SUPPORTED_REFERENCE_TYPES:
         raise RuntimeError(f"unsupported metafield type for write: {mf_type}")
 
     m = """
@@ -575,7 +586,7 @@ def apply_op(mf_type: str, cur_val: Any, op: str, targets: List[str]):
     op = _norm_str(op).upper()
     targets = _dedupe_keep_order(targets)
 
-    if t == "metaobject_reference":
+    if t in SINGLE_REFERENCE_TYPES:
         cur = _norm_str(cur_val)
         if op == "REPLACE_ALL":
             return targets[0] if targets else ""
@@ -585,7 +596,7 @@ def apply_op(mf_type: str, cur_val: Any, op: str, targets: List[str]):
             return "" if cur and cur in set(targets) else cur
         raise ValueError(f"unsupported op for {t}: {op}")
 
-    if t == "list.metaobject_reference":
+    if t in LIST_REFERENCE_TYPES:
         cur_list = cur_val if isinstance(cur_val, list) else parse_gid_list(cur_val)
         cur_list = _dedupe_keep_order(cur_list)
 
@@ -613,7 +624,7 @@ def apply_op(mf_type: str, cur_val: Any, op: str, targets: List[str]):
 def calc_change_type(mf_type: str, cur_val: Any, new_val: Any) -> str:
     t = _norm_str(mf_type)
 
-    if t == "metaobject_reference":
+    if t in SINGLE_REFERENCE_TYPES:
         cur = _norm_str(cur_val)
         new = _norm_str(new_val)
         if cur == new:
@@ -624,7 +635,7 @@ def calc_change_type(mf_type: str, cur_val: Any, new_val: Any) -> str:
             return "CLEAR"
         return "REPLACE"
 
-    if t == "list.metaobject_reference":
+    if t in LIST_REFERENCE_TYPES:
         cur = _dedupe_keep_order(cur_val if isinstance(cur_val, list) else parse_gid_list(cur_val))
         new = _dedupe_keep_order(new_val if isinstance(new_val, list) else parse_gid_list(new_val))
         if cur == new:
@@ -676,7 +687,7 @@ def validate_row_logic(
     if bad_gids:
         return f"invalid_metaobject_gid_count={len(bad_gids)}"
 
-    if mf_type == "metaobject_reference":
+    if mf_type in SINGLE_REFERENCE_TYPES:
         if op in {"LINK", "REPLACE_ALL"} and len(targets) > 1:
             return "single_reference_cannot_accept_multiple_targets"
 
