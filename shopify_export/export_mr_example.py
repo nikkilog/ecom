@@ -151,6 +151,35 @@ def open_ws_by_url_and_title(gc, spreadsheet_url: str, worksheet_title: str):
     return ss.worksheet(worksheet_title)
 
 
+def open_first_existing_ws_by_urls_and_title(gc, spreadsheet_urls: List[str], worksheet_title: str):
+    """Open a worksheet title from the first spreadsheet URL that contains it.
+
+    This is used for Console Core runtime tabs that may live either in the
+    Console Core itself or in the sheet routed by Cfg__Sites label=config.
+    """
+    checked = []
+    seen = set()
+    for url in spreadsheet_urls:
+        url = _norm(url)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        checked.append(url)
+        try:
+            return open_ws_by_url_and_title(gc, url, worksheet_title)
+        except Exception as e:
+            # gspread raises WorksheetNotFound when the spreadsheet exists but
+            # the requested tab is absent. Continue to the next candidate URL.
+            if e.__class__.__name__ == "WorksheetNotFound":
+                continue
+            raise
+
+    raise RuntimeError(
+        f"找不到 worksheet={worksheet_title}；已检查 spreadsheet 数量={len(checked)}。"
+        "请确认该 tab 在 Console Core 或 config label 指向的表内。"
+    )
+
+
 def open_ss_by_url(gc, spreadsheet_url: str):
     return gc.open_by_url(spreadsheet_url)
 
@@ -1127,9 +1156,14 @@ def run(
 
     targets = get_site_targets(df_sites=df_sites, site_code=site_code)
 
-    # 2) config -> Cfg__account_id
-    #    Shopify runtime config belongs here under the multi-site Console Core standard.
-    ws_account = open_ws_by_url_and_title(gc, targets["config_url"], cfg_account_id_tab)
+    # 2) Console Core/config -> Cfg__account_id
+    #    Shopify runtime config normally lives in Console Core. Some older
+    #    setups may keep it in the sheet routed by label=config, so check both.
+    ws_account = open_first_existing_ws_by_urls_and_title(
+        gc,
+        [console_core_url, targets["config_url"]],
+        cfg_account_id_tab,
+    )
     account_cfg = read_key_value_config_ws(ws_account)
     shop_domain, resolved_api_version = resolve_shopify_runtime_config(
         targets=targets,
