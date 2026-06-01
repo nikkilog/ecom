@@ -161,6 +161,125 @@ def open_ws_by_label_and_title(
     return sh, ws, sheet_url
 
 
+def open_ws_optional_by_label_and_title(
+    gc: gspread.Client,
+    console_core_url: str,
+    site_code: str,
+    label: str,
+    worksheet_title: str,
+    cfg_sites_tab: str = CFG_SITES_TAB_DEFAULT,
+):
+    sheet_url = get_sheet_url_by_label(
+        gc=gc,
+        console_core_url=console_core_url,
+        site_code=site_code,
+        label=label,
+        cfg_sites_tab=cfg_sites_tab,
+    )
+    sh = gc.open_by_url(sheet_url)
+    try:
+        ws = sh.worksheet(worksheet_title)
+    except Exception as e:
+        raise ValueError(f"Cannot open Cfg__Fields worksheet: label={label}, title={worksheet_title}") from e
+    return sh, ws, sheet_url
+
+
+def load_cfg_fields(ws_cfg_fields) -> pd.DataFrame:
+    rows = ws_cfg_fields.get_all_records()
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise ValueError("Cfg__Fields is empty")
+
+    required = ["field_id", "field_key"]
+    for c in required:
+        if c not in df.columns:
+            raise ValueError(f"Cfg__Fields missing required column: {c}")
+
+    for c in ["field_id", "field_key", "field_handle", "display_name", "entity_type", "source_type", "namespace", "key"]:
+        if c not in df.columns:
+            df[c] = ""
+        df[c] = df[c].map(_norm_str)
+
+    df = df[df["field_id"] != ""].copy()
+    return df
+
+
+def _norm_lookup_key(x: Any) -> str:
+    s = _norm_str(x).lower()
+    s = s.replace("｜", "|").replace("–", "-").replace("—", "-")
+    s = " ".join(s.split())
+    return s
+
+
+def build_cfg_fields_lookup(cfg_fields_df: pd.DataFrame, entity_type: str = "METAOBJECT_ENTRY") -> dict[str, str]:
+    df = cfg_fields_df.copy()
+    if entity_type:
+        m = df["entity_type"].map(_norm_str).str.upper() == entity_type.strip().upper()
+        if m.any():
+            df = df[m].copy()
+
+    lookup: dict[str, str] = {}
+    collisions: dict[str, set[str]] = defaultdict(set)
+
+    candidate_cols = ["field_id", "field_key", "field_handle", "display_name", "key"]
+    for _, r in df.iterrows():
+        fid = _norm_str(r.get("field_id"))
+        if not fid:
+            continue
+        for c in candidate_cols:
+            k = _norm_lookup_key(r.get(c))
+            if not k:
+                continue
+            if k in lookup and lookup[k] != fid:
+                collisions[k].update([lookup[k], fid])
+            else:
+                lookup[k] = fid
+
+    for k in collisions:
+        lookup.pop(k, None)
+
+    return lookup
+
+
+def resolve_blank_field_id_row_from_cfg_fields(
+    *,
+    header_row: list[str],
+    field_id_row: list[str],
+    cfg_fields_df: pd.DataFrame,
+    value_start_col_idx: int = 4,
+    entity_type: str = "METAOBJECT_ENTRY",
+) -> tuple[list[str], list[dict[str, Any]]]:
+    max_cols = max(len(header_row), len(field_id_row))
+    headers = header_row + [""] * (max_cols - len(header_row))
+    field_ids = field_id_row + [""] * (max_cols - len(field_id_row))
+
+    lookup = build_cfg_fields_lookup(cfg_fields_df, entity_type=entity_type)
+    errors: list[dict[str, Any]] = []
+
+    for col_idx in range(value_start_col_idx, max_cols):
+        existing_fid = _norm_str(field_ids[col_idx])
+        if existing_fid:
+            continue
+
+        header = _norm_str(headers[col_idx])
+        if not header:
+            continue
+
+        matched = lookup.get(_norm_lookup_key(header))
+        if matched:
+            field_ids[col_idx] = matched
+        else:
+            errors.append({
+                "entity_type": entity_type,
+                "gid": "",
+                "field_key": header,
+                "error_reason": "unmatched_field_header",
+                "message": f"col={col_idx + 1} | header={header} | cannot match Cfg__Fields by field_id/field_key/field_handle/display_name/key",
+            })
+
+    return field_ids, errors
+
+
 # =========================================================
 # Runlog
 # =========================================================
@@ -308,15 +427,15 @@ def load_wide_sheet(ws_wide) -> tuple[list[list[Any]], list[str], list[str], lis
     if not values:
         raise ValueError("❌ Wide sheet is empty")
     if len(values) < 2:
-        raise ValueError("❌ Wide sheet must have at least 2 rows (header row + field_id row)")
+        raise ValueError("❌ Wide sheet must have at least 2 rows (header row + optional field_id row)")
 
     row1 = values[0]
     row2 = values[1]
     if not _row_has_any_value(row1):
         raise ValueError("❌ Wide 第1行为空")
-    if not _row_has_any_value(row2):
-        raise ValueError("❌ Wide 第2行(field_id row)为空")
 
+    # Row 2 is allowed to be blank.
+    # When blank, run() will resolve field_id from Cfg__Fields using Row 1 headers.
     max_cols = max(len(r) for r in values)
     padded = [r + [""] * (max_cols - len(r)) for r in values]
 
@@ -446,6 +565,10 @@ def run(
     runlog_sheet_label: str = "runlog_sheet",
     runlog_tab_name: str = "Ops__RunLog",
 
+    cfg_fields_sheet_label: str = "config",
+    cfg_fields_worksheet_title: str = "Cfg__Fields",
+    cfg_field_match_entity_type: str = "METAOBJECT_ENTRY",
+
     cfg_sites_tab: str = CFG_SITES_TAB_DEFAULT,
     run_id: Optional[str] = None,
     detail_max_per_reason: int = 2,
@@ -480,6 +603,16 @@ def run(
         cfg_sites_tab=cfg_sites_tab,
     )
 
+    _, ws_cfg_fields, cfg_fields_sheet_url = open_ws_optional_by_label_and_title(
+        gc=gc,
+        console_core_url=console_core_url,
+        site_code=site_code,
+        label=cfg_fields_sheet_label,
+        worksheet_title=cfg_fields_worksheet_title,
+        cfg_sites_tab=cfg_sites_tab,
+    )
+    cfg_fields_df = load_cfg_fields(ws_cfg_fields)
+
     logger = RunLogger(
         gc=gc,
         runlog_sheet_url=runlog_sheet_url,
@@ -490,6 +623,73 @@ def run(
     )
 
     padded, header_row, field_id_row, data_rows = load_wide_sheet(ws_wide)
+
+    if not _row_has_any_value(field_id_row):
+        field_id_row, header_match_errors = resolve_blank_field_id_row_from_cfg_fields(
+            header_row=header_row,
+            field_id_row=field_id_row,
+            cfg_fields_df=cfg_fields_df,
+            value_start_col_idx=4,
+            entity_type=cfg_field_match_entity_type,
+        )
+        if header_match_errors:
+            logger.log_row(
+                phase="header_match",
+                log_type="summary",
+                status="ERROR",
+                rows_loaded=0,
+                rows_pending=0,
+                rows_recognized=0,
+                rows_planned=0,
+                rows_written=0,
+                rows_skipped=len(header_match_errors),
+                message=f"Header to Cfg__Fields match failed | errors={len(header_match_errors)}",
+                error_reason="unmatched_field_header",
+            )
+            log_grouped_details(
+                logger,
+                phase="header_match",
+                status="FAIL",
+                rows_loaded=0,
+                rows_pending=0,
+                rows_recognized=0,
+                rows_planned=0,
+                rows_written=0,
+                rows_skipped=len(header_match_errors),
+                detail_rows=header_match_errors,
+                max_per_reason=detail_max_per_reason,
+            )
+            logger.flush()
+            return {
+                "status": "ERROR",
+                "summary": {
+                    "rows_loaded": 0,
+                    "rows_pending": 0,
+                    "rows_recognized": 0,
+                    "rows_planned": 0,
+                    "rows_written": 0,
+                    "rows_skipped": len(header_match_errors),
+                    "error_count": len(header_match_errors),
+                },
+                "warnings": [
+                    {
+                        "type": "unmatched_field_header",
+                        "count": len(header_match_errors),
+                        "examples": header_match_errors[: min(20, len(header_match_errors))],
+                    }
+                ],
+                "preview": [],
+                "meta": {
+                    "site_code": site_code,
+                    "job_name": job_name,
+                    "run_id": run_id,
+                    "wide_sheet_url": wide_sheet_url,
+                    "long_sheet_url": long_sheet_url,
+                    "runlog_sheet_url": runlog_sheet_url,
+                    "cfg_fields_sheet_url": cfg_fields_sheet_url,
+                },
+            }
+
     effective_rows = find_effective_data_rows(data_rows)
 
     rows_loaded = len(effective_rows)
@@ -561,6 +761,7 @@ def run(
                 "wide_sheet_url": wide_sheet_url,
                 "long_sheet_url": long_sheet_url,
                 "runlog_sheet_url": runlog_sheet_url,
+                "cfg_fields_sheet_url": cfg_fields_sheet_url,
             },
         }
 
