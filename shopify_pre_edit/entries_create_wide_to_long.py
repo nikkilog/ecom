@@ -180,7 +180,7 @@ def open_ws_optional_by_label_and_title(
     try:
         ws = sh.worksheet(worksheet_title)
     except Exception as e:
-        raise ValueError(f"Cannot open Cfg__Fields worksheet: label={label}, title={worksheet_title}") from e
+        raise ValueError(f"Cannot open config worksheet: label={label}, title={worksheet_title}") from e
     return sh, ws, sheet_url
 
 
@@ -241,6 +241,74 @@ def build_cfg_fields_lookup(cfg_fields_df: pd.DataFrame, entity_type: str = "MET
     return lookup
 
 
+def load_cfg_metaobject_defs(ws_cfg_metaobject_defs) -> pd.DataFrame:
+    rows = ws_cfg_metaobject_defs.get_all_records()
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise ValueError("Cfg__MetaobjectDefs is empty")
+
+    required = ["type", "field_key"]
+    for c in required:
+        if c not in df.columns:
+            raise ValueError(f"Cfg__MetaobjectDefs missing required column: {c}")
+
+    for c in ["type", "type_name", "field_key", "field_name", "field_type", "gid"]:
+        if c not in df.columns:
+            df[c] = ""
+        df[c] = df[c].map(_norm_str)
+
+    df = df[(df["type"] != "") & (df["field_key"] != "")].copy()
+    return df
+
+
+def build_cfg_metaobject_defs_lookup(
+    cfg_metaobject_defs_df: pd.DataFrame,
+    entity_type: str = "METAOBJECT_ENTRY",
+) -> dict[str, str]:
+    """
+    Build row-level lookup for metaobject entry fields.
+
+    Key format: normalized metaobject_type + "|" + normalized header candidate.
+    Value format: METAOBJECT_ENTRY|mo.{type}.{field_key}
+
+    Example:
+      type=card_spec, field_key=icon
+      card_spec|icon -> METAOBJECT_ENTRY|mo.card_spec.icon
+    """
+    lookup: dict[str, str] = {}
+    collisions: dict[str, set[str]] = defaultdict(set)
+
+    df = cfg_metaobject_defs_df.copy()
+    for _, r in df.iterrows():
+        mo_type = _norm_str(r.get("type"))
+        field_key = _norm_str(r.get("field_key"))
+        if not mo_type or not field_key:
+            continue
+
+        fid = f"{entity_type}|mo.{mo_type}.{field_key}"
+        candidates = [
+            field_key,
+            r.get("field_name"),
+            f"mo.{mo_type}.{field_key}",
+            fid,
+        ]
+
+        for cand in candidates:
+            ck = _norm_lookup_key(cand)
+            if not ck:
+                continue
+            lk = f"{_norm_lookup_key(mo_type)}|{ck}"
+            if lk in lookup and lookup[lk] != fid:
+                collisions[lk].update([lookup[lk], fid])
+            else:
+                lookup[lk] = fid
+
+    for k in collisions:
+        lookup.pop(k, None)
+
+    return lookup
+
+
 def resolve_blank_field_id_row_from_cfg_fields(
     *,
     header_row: list[str],
@@ -248,13 +316,18 @@ def resolve_blank_field_id_row_from_cfg_fields(
     cfg_fields_df: pd.DataFrame,
     value_start_col_idx: int = 4,
     entity_type: str = "METAOBJECT_ENTRY",
-) -> tuple[list[str], list[dict[str, Any]]]:
+) -> list[str]:
+    """
+    Resolve only globally unique/full headers from Cfg__Fields.
+
+    Ambiguous short headers such as icon/label/value are intentionally left blank here.
+    They are resolved row-by-row later using entry_type + Cfg__MetaobjectDefs.
+    """
     max_cols = max(len(header_row), len(field_id_row))
     headers = header_row + [""] * (max_cols - len(header_row))
     field_ids = field_id_row + [""] * (max_cols - len(field_id_row))
 
     lookup = build_cfg_fields_lookup(cfg_fields_df, entity_type=entity_type)
-    errors: list[dict[str, Any]] = []
 
     for col_idx in range(value_start_col_idx, max_cols):
         existing_fid = _norm_str(field_ids[col_idx])
@@ -268,16 +341,92 @@ def resolve_blank_field_id_row_from_cfg_fields(
         matched = lookup.get(_norm_lookup_key(header))
         if matched:
             field_ids[col_idx] = matched
-        else:
-            errors.append({
-                "entity_type": entity_type,
-                "gid": "",
-                "field_key": header,
-                "error_reason": "unmatched_field_header",
-                "message": f"col={col_idx + 1} | header={header} | cannot match Cfg__Fields by field_id/field_key/field_handle/display_name/key",
-            })
 
-    return field_ids, errors
+    return field_ids
+
+
+def resolve_field_id_for_cell(
+    *,
+    header: Any,
+    entry_type: Any,
+    existing_field_id: Any,
+    cfg_metaobject_lookup: dict[str, str],
+    entity_type: str = "METAOBJECT_ENTRY",
+) -> str:
+    existing = _norm_str(existing_field_id)
+    if existing:
+        return existing
+
+    h = _norm_str(header)
+    et = _norm_str(entry_type)
+    if not h or not et:
+        return ""
+
+    # First use explicit Cfg__MetaobjectDefs lookup.
+    lk = f"{_norm_lookup_key(et)}|{_norm_lookup_key(h)}"
+    matched = cfg_metaobject_lookup.get(lk, "")
+    if matched:
+        return matched
+
+    # Safe deterministic fallback only for simple field keys.
+    # This keeps the job usable when Cfg__MetaobjectDefs has not yet synced a newly-created field,
+    # while still avoiding display-name guesses with spaces or punctuation.
+    simple = _norm_str(h)
+    if simple and all(ch.isalnum() or ch == "_" for ch in simple):
+        return f"{entity_type}|mo.{et}.{simple}"
+
+    return ""
+
+
+def validate_resolved_field_ids_for_values(
+    *,
+    effective_rows: list[tuple[int, list[Any]]],
+    header_row: list[str],
+    field_id_row: list[str],
+    cfg_metaobject_lookup: dict[str, str],
+    value_start_col_idx: int = 4,
+    entity_type: str = "METAOBJECT_ENTRY",
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+
+    max_cols = max(
+        len(header_row),
+        len(field_id_row),
+        max((len(r) for _, r in effective_rows), default=0),
+    )
+    headers = header_row + [""] * (max_cols - len(header_row))
+    field_ids = field_id_row + [""] * (max_cols - len(field_id_row))
+
+    for sheet_row, row in effective_rows:
+        row_pad = row + [""] * (max_cols - len(row))
+        entry_type = _norm_str(row_pad[1]) if max_cols > 1 else ""
+        for col_idx in range(value_start_col_idx, max_cols):
+            value = _norm_str(row_pad[col_idx])
+            if value == "":
+                continue
+
+            header = _norm_str(headers[col_idx])
+            fid = resolve_field_id_for_cell(
+                header=header,
+                entry_type=entry_type,
+                existing_field_id=field_ids[col_idx],
+                cfg_metaobject_lookup=cfg_metaobject_lookup,
+                entity_type=entity_type,
+            )
+            if not fid:
+                errors.append({
+                    "entity_type": entity_type,
+                    "gid": "",
+                    "field_key": header,
+                    "error_reason": "unmatched_field_header",
+                    "message": (
+                        f"sheet_row={sheet_row} | col={col_idx + 1} | "
+                        f"entry_type={entry_type} | header={header} | "
+                        f"cannot resolve field_id from row2 / Cfg__Fields / Cfg__MetaobjectDefs"
+                    ),
+                })
+
+    return errors
 
 
 # =========================================================
@@ -482,13 +631,21 @@ def validate_field_id_row(
 
 def transform_wide_to_long(
     effective_rows: list[tuple[int, list[Any]]],
+    header_row: list[str],
     field_id_row: list[str],
+    cfg_metaobject_lookup: dict[str, str],
     value_start_col_idx: int = 4,
+    entity_type: str = "METAOBJECT_ENTRY",
 ) -> tuple[pd.DataFrame, int]:
     records = []
     input_value_cells = 0
 
-    max_cols = max(len(field_id_row), max((len(r) for _, r in effective_rows), default=0))
+    max_cols = max(
+        len(header_row),
+        len(field_id_row),
+        max((len(r) for _, r in effective_rows), default=0),
+    )
+    headers = header_row + [""] * (max_cols - len(header_row))
     field_ids = field_id_row + [""] * (max_cols - len(field_id_row))
 
     for sheet_row, row in effective_rows:
@@ -501,10 +658,16 @@ def transform_wide_to_long(
 
         for col_idx in range(value_start_col_idx, max_cols):
             value = _norm_str(row_pad[col_idx])
-            field_id = _norm_str(field_ids[col_idx])
-
             if value == "":
                 continue
+
+            field_id = resolve_field_id_for_cell(
+                header=headers[col_idx],
+                entry_type=entry_type,
+                existing_field_id=field_ids[col_idx],
+                cfg_metaobject_lookup=cfg_metaobject_lookup,
+                entity_type=entity_type,
+            )
 
             input_value_cells += 1
             records.append({
@@ -569,6 +732,9 @@ def run(
     cfg_fields_worksheet_title: str = "Cfg__Fields",
     cfg_field_match_entity_type: str = "METAOBJECT_ENTRY",
 
+    cfg_metaobject_defs_sheet_label: str = "config",
+    cfg_metaobject_defs_worksheet_title: str = "Cfg__MetaobjectDefs",
+
     cfg_sites_tab: str = CFG_SITES_TAB_DEFAULT,
     run_id: Optional[str] = None,
     detail_max_per_reason: int = 2,
@@ -613,6 +779,20 @@ def run(
     )
     cfg_fields_df = load_cfg_fields(ws_cfg_fields)
 
+    _, ws_cfg_metaobject_defs, cfg_metaobject_defs_sheet_url = open_ws_optional_by_label_and_title(
+        gc=gc,
+        console_core_url=console_core_url,
+        site_code=site_code,
+        label=cfg_metaobject_defs_sheet_label,
+        worksheet_title=cfg_metaobject_defs_worksheet_title,
+        cfg_sites_tab=cfg_sites_tab,
+    )
+    cfg_metaobject_defs_df = load_cfg_metaobject_defs(ws_cfg_metaobject_defs)
+    cfg_metaobject_lookup = build_cfg_metaobject_defs_lookup(
+        cfg_metaobject_defs_df,
+        entity_type=cfg_field_match_entity_type,
+    )
+
     logger = RunLogger(
         gc=gc,
         runlog_sheet_url=runlog_sheet_url,
@@ -625,80 +805,26 @@ def run(
     padded, header_row, field_id_row, data_rows = load_wide_sheet(ws_wide)
 
     if not _row_has_any_value(field_id_row):
-        field_id_row, header_match_errors = resolve_blank_field_id_row_from_cfg_fields(
+        field_id_row = resolve_blank_field_id_row_from_cfg_fields(
             header_row=header_row,
             field_id_row=field_id_row,
             cfg_fields_df=cfg_fields_df,
             value_start_col_idx=4,
             entity_type=cfg_field_match_entity_type,
         )
-        if header_match_errors:
-            logger.log_row(
-                phase="header_match",
-                log_type="summary",
-                status="ERROR",
-                rows_loaded=0,
-                rows_pending=0,
-                rows_recognized=0,
-                rows_planned=0,
-                rows_written=0,
-                rows_skipped=len(header_match_errors),
-                message=f"Header to Cfg__Fields match failed | errors={len(header_match_errors)}",
-                error_reason="unmatched_field_header",
-            )
-            log_grouped_details(
-                logger,
-                phase="header_match",
-                status="FAIL",
-                rows_loaded=0,
-                rows_pending=0,
-                rows_recognized=0,
-                rows_planned=0,
-                rows_written=0,
-                rows_skipped=len(header_match_errors),
-                detail_rows=header_match_errors,
-                max_per_reason=detail_max_per_reason,
-            )
-            logger.flush()
-            return {
-                "status": "ERROR",
-                "summary": {
-                    "rows_loaded": 0,
-                    "rows_pending": 0,
-                    "rows_recognized": 0,
-                    "rows_planned": 0,
-                    "rows_written": 0,
-                    "rows_skipped": len(header_match_errors),
-                    "error_count": len(header_match_errors),
-                },
-                "warnings": [
-                    {
-                        "type": "unmatched_field_header",
-                        "count": len(header_match_errors),
-                        "examples": header_match_errors[: min(20, len(header_match_errors))],
-                    }
-                ],
-                "preview": [],
-                "meta": {
-                    "site_code": site_code,
-                    "job_name": job_name,
-                    "run_id": run_id,
-                    "wide_sheet_url": wide_sheet_url,
-                    "long_sheet_url": long_sheet_url,
-                    "runlog_sheet_url": runlog_sheet_url,
-                    "cfg_fields_sheet_url": cfg_fields_sheet_url,
-                },
-            }
 
     effective_rows = find_effective_data_rows(data_rows)
 
     rows_loaded = len(effective_rows)
     rows_pending = rows_loaded
 
-    field_id_errors = validate_field_id_row(
+    field_id_errors = validate_resolved_field_ids_for_values(
         effective_rows=effective_rows,
+        header_row=header_row,
         field_id_row=field_id_row,
+        cfg_metaobject_lookup=cfg_metaobject_lookup,
         value_start_col_idx=4,
+        entity_type=cfg_field_match_entity_type,
     )
 
     if field_id_errors:
@@ -718,7 +844,7 @@ def run(
             rows_written=rows_written,
             rows_skipped=rows_skipped,
             message=f"Field_id validation failed | errors={len(field_id_errors)}",
-            error_reason="missing_field_id",
+            error_reason="unmatched_field_header",
         )
         log_grouped_details(
             logger,
@@ -748,7 +874,7 @@ def run(
             },
             "warnings": [
                 {
-                    "type": "missing_field_id",
+                    "type": "unmatched_field_header",
                     "count": len(field_id_errors),
                     "examples": field_id_errors[: min(10, len(field_id_errors))],
                 }
@@ -762,13 +888,17 @@ def run(
                 "long_sheet_url": long_sheet_url,
                 "runlog_sheet_url": runlog_sheet_url,
                 "cfg_fields_sheet_url": cfg_fields_sheet_url,
+                "cfg_metaobject_defs_sheet_url": cfg_metaobject_defs_sheet_url,
             },
         }
 
     df_long, input_value_cells = transform_wide_to_long(
         effective_rows=effective_rows,
+        header_row=header_row,
         field_id_row=field_id_row,
+        cfg_metaobject_lookup=cfg_metaobject_lookup,
         value_start_col_idx=4,
+        entity_type=cfg_field_match_entity_type,
     )
 
     rows_recognized = rows_loaded
