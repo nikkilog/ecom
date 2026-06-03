@@ -93,6 +93,15 @@ mutation setMf($metafields: [MetafieldsSetInput!]!) {
 }
 """
 
+M_DELETE = """
+mutation deleteMf($metafields: [MetafieldIdentifierInput!]!) {
+  metafieldsDelete(metafields: $metafields) {
+    deletedMetafields { ownerId namespace key }
+    userErrors { field message code }
+  }
+}
+"""
+
 
 # =========================================================
 # Small data objects
@@ -908,13 +917,23 @@ def build_plan(
     reference_default_kind: str,
     type_override_by_field_key: Optional[dict[str, str]],
 ) -> dict[str, Any]:
+    """
+    Build write plan.
+
+    SET rows use Shopify metafieldsSet.
+    CLEAR rows use Shopify metafieldsDelete by ownerId + namespace + key.
+    This is intentional: writing an empty string through metafieldsSet is not a reliable clear/delete operation
+    for Shopify metafields, especially when definitions or validations exist.
+    """
     df_apply = df_ready[df_ready["_skip_reason"].eq("")].copy()
     cfg_by_keyonly = build_cfg_keyonly_map(cfg_type_map)
 
-    set_inputs = []
-    meta_rows = []
-    preview_rows = []
-    invalid_rows = []
+    set_inputs: list[dict[str, Any]] = []
+    set_meta_rows: list[dict[str, Any]] = []
+    delete_inputs: list[dict[str, Any]] = []
+    delete_meta_rows: list[dict[str, Any]] = []
+    preview_rows: list[dict[str, Any]] = []
+    invalid_rows: list[dict[str, Any]] = []
     missing_cfg_type = 0
 
     for r in df_apply.itertuples(index=False):
@@ -932,6 +951,9 @@ def build_plan(
 
         et = getattr(r, "entity_type", "")
         fk = getattr(r, "field_key", "")
+        owner_id = getattr(r, "owner_id", "")
+        namespace = getattr(r, "namespace", "")
+        key = getattr(r, "key", "")
 
         cfg_dt = resolve_cfg_data_type(et, fk, cfg_type_map, cfg_by_keyonly)
         has_ov = isinstance(type_override_by_field_key, dict) and bool(type_override_by_field_key.get(_norm_str(fk)))
@@ -948,6 +970,36 @@ def build_plan(
             type_override_by_field_key=type_override_by_field_key,
         )
 
+        meta_row = {
+            "sheet_row": getattr(r, "sheet_row", None),
+            "entity_type": et,
+            "owner_id": owner_id,
+            "field_key": fk,
+            "namespace": namespace,
+            "key": key,
+        }
+
+        if action == "CLEAR":
+            # Real clear/delete: remove the metafield itself. Do NOT write empty string via metafieldsSet.
+            item = {
+                "ownerId": owner_id,
+                "namespace": namespace,
+                "key": key,
+            }
+            delete_inputs.append(item)
+            delete_meta_rows.append(meta_row)
+
+            preview_rows.append({
+                "sheet_row": getattr(r, "sheet_row", None),
+                "entity_type": et,
+                "owner_id": owner_id,
+                "field_key": fk,
+                "action": action,
+                "mf_type": mf_type,
+                "value_preview": "<DELETE metafield>",
+            })
+            continue
+
         desired = _norm_str(getattr(r, "desired_value", ""))
         try:
             value_to_write = value_for_shopify(mf_type, desired, action)
@@ -963,25 +1015,19 @@ def build_plan(
             continue
 
         item = {
-            "ownerId": getattr(r, "owner_id"),
-            "namespace": getattr(r, "namespace"),
-            "key": getattr(r, "key"),
+            "ownerId": owner_id,
+            "namespace": namespace,
+            "key": key,
             "type": mf_type,
             "value": str(value_to_write),
         }
         set_inputs.append(item)
-
-        meta_rows.append({
-            "sheet_row": getattr(r, "sheet_row", None),
-            "entity_type": et,
-            "owner_id": getattr(r, "owner_id", ""),
-            "field_key": fk,
-        })
+        set_meta_rows.append(meta_row)
 
         preview_rows.append({
             "sheet_row": getattr(r, "sheet_row", None),
             "entity_type": et,
-            "owner_id": getattr(r, "owner_id", ""),
+            "owner_id": owner_id,
             "field_key": fk,
             "action": action,
             "mf_type": mf_type,
@@ -989,11 +1035,16 @@ def build_plan(
         })
 
     rows_skipped_total = _safe_int((df_ready["_skip_reason"] != "").sum()) + len(invalid_rows)
+    rows_planned_set = len(set_inputs)
+    rows_planned_delete = len(delete_inputs)
+    rows_planned_total = rows_planned_set + rows_planned_delete
 
     summary = {
         "rows_recognized": int(len(df_ready)),
         "rows_resolvable": int(len(df_apply)),
-        "rows_planned_set": int(len(set_inputs)),
+        "rows_planned_set": int(rows_planned_set),
+        "rows_planned_delete": int(rows_planned_delete),
+        "rows_planned_total": int(rows_planned_total),
         "rows_skipped_unresolvable": int((df_ready["_skip_reason"] != "").sum()),
         "rows_skipped_invalid": int(len(invalid_rows)),
         "rows_skipped_total": int(rows_skipped_total),
@@ -1003,7 +1054,11 @@ def build_plan(
     return {
         "summary": summary,
         "set_inputs": set_inputs,
-        "meta_rows": meta_rows,
+        "set_meta_rows": set_meta_rows,
+        "delete_inputs": delete_inputs,
+        "delete_meta_rows": delete_meta_rows,
+        # Backward-compatible aliases for old callers/debug cells.
+        "meta_rows": set_meta_rows,
         "preview_rows": preview_rows,
         "invalid_rows": invalid_rows,
         "df_apply": df_apply,
@@ -1069,131 +1124,239 @@ def parse_error_index(field_path):
 def apply_plan(
     client: ShopifyClient,
     set_inputs: list[dict[str, Any]],
-    meta_rows: list[dict[str, Any]],
+    set_meta_rows: list[dict[str, Any]],
     set_batch_size: int,
+    delete_inputs: Optional[list[dict[str, Any]]] = None,
+    delete_meta_rows: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
-    total = len(set_inputs)
-    if total == 0:
-        print("=== Applying metafieldsSet === total=0, batches=0, batch_size=0")
-        return {
-            "ok_count": 0,
-            "fail_count": 0,
-            "total": 0,
-            "detail_fail_rows": [],
-        }
+    delete_inputs = delete_inputs or []
+    delete_meta_rows = delete_meta_rows or []
 
-    total_batches = (total + set_batch_size - 1) // set_batch_size
-    print(f"=== Applying metafieldsSet === total={total}, batches={total_batches}, batch_size={set_batch_size}")
+    set_total = len(set_inputs)
+    delete_total = len(delete_inputs)
+    total = set_total + delete_total
 
     ok_count = 0
     fail_count = 0
-    detail_fail_rows = []
+    detail_fail_rows: list[dict[str, Any]] = []
 
-    for batch_no, (start_idx, batch) in enumerate(_chunk_list(set_inputs, set_batch_size), start=1):
-        meta_batch = meta_rows[start_idx:start_idx + len(batch)]
+    # -----------------------------
+    # 1) Apply SET rows via metafieldsSet
+    # -----------------------------
+    if set_total == 0:
+        print("=== Applying metafieldsSet === total=0, batches=0, batch_size=0")
+    else:
+        total_batches = (set_total + set_batch_size - 1) // set_batch_size
+        print(f"=== Applying metafieldsSet === total={set_total}, batches={total_batches}, batch_size={set_batch_size}")
 
-        print(f"Batch {batch_no}/{total_batches}: {len(batch)} items ... ", end="", flush=True)
+        for batch_no, (start_idx, batch) in enumerate(_chunk_list(set_inputs, set_batch_size), start=1):
+            meta_batch = set_meta_rows[start_idx:start_idx + len(batch)]
+            print(f"SET Batch {batch_no}/{total_batches}: {len(batch)} items ... ", end="", flush=True)
 
-        try:
-            data = gql(client, M_SET, {"metafields": batch})
-            resp = data["metafieldsSet"]
-            user_errors = resp.get("userErrors") or []
+            try:
+                data = gql(client, M_SET, {"metafields": batch})
+                resp = data["metafieldsSet"]
+                user_errors = resp.get("userErrors") or []
 
-            if not user_errors:
-                ok_count += len(batch)
-                print("OK", flush=True)
-                continue
-
-            err_by_i = {}
-            non_indexed_errors = []
-
-            for e in user_errors:
-                idx = parse_error_index(e.get("field"))
-                if idx is None:
-                    non_indexed_errors.append(e)
-                else:
-                    err_by_i.setdefault(idx, []).append(e)
-
-            fail_items = 0
-
-            for idx, errs in err_by_i.items():
-                if not (0 <= idx < len(meta_batch)):
+                if not user_errors:
+                    ok_count += len(batch)
+                    print("OK", flush=True)
                     continue
 
-                fail_items += 1
-                r = meta_batch[idx]
-                inp = batch[idx]
-                detail_fail_rows.append({
-                    "entity_type": r.get("entity_type", ""),
-                    "owner_id": r.get("owner_id", ""),
-                    "field_key": r.get("field_key", ""),
-                    "error_reason": "shopify_user_error",
-                    "message": (
-                        f"sheet_row={r.get('sheet_row')} | "
-                        f"code={errs[0].get('code', '')} | "
-                        f"msg={errs[0].get('message', '')} | "
-                        f"field={errs[0].get('field')} | "
-                        f"ns={inp.get('namespace')} key={inp.get('key')} "
-                        f"type={inp.get('type')} value={str(inp.get('value'))[:120]}"
-                    ),
-                })
+                err_by_i = {}
+                non_indexed_errors = []
 
-            # Shopify 返回了 userErrors，但没有给出可定位到某一项的 index
-            if fail_items == 0:
-                fail_count += len(batch)
-                print(f"FAILED (fail={len(batch)})", flush=True)
+                for e in user_errors:
+                    idx = parse_error_index(e.get("field"))
+                    if idx is None:
+                        non_indexed_errors.append(e)
+                    else:
+                        err_by_i.setdefault(idx, []).append(e)
 
-                detail_fail_rows.append({
-                    "entity_type": "",
-                    "owner_id": "",
-                    "field_key": "",
-                    "error_reason": "shopify_batch_error",
-                    "message": (
-                        f"batch_error start={start_idx} size={len(batch)} | "
-                        f"no per-item index returned | "
-                        f"user_errors={json.dumps(non_indexed_errors, ensure_ascii=False)[:500]}"
-                    ),
-                })
-            else:
-                batch_ok = len(batch) - fail_items
-                ok_count += batch_ok
-                fail_count += fail_items
+                fail_items = 0
 
-                print(f"PARTIAL_FAIL (ok={batch_ok}, fail={fail_items})", flush=True)
+                for idx, errs in err_by_i.items():
+                    if not (0 <= idx < len(meta_batch)):
+                        continue
 
-                for e in non_indexed_errors[:3]:
+                    fail_items += 1
+                    r = meta_batch[idx]
+                    inp = batch[idx]
+                    detail_fail_rows.append({
+                        "entity_type": r.get("entity_type", ""),
+                        "owner_id": r.get("owner_id", ""),
+                        "field_key": r.get("field_key", ""),
+                        "error_reason": "shopify_user_error",
+                        "message": (
+                            f"sheet_row={r.get('sheet_row')} | action=SET | "
+                            f"code={errs[0].get('code', '')} | "
+                            f"msg={errs[0].get('message', '')} | "
+                            f"field={errs[0].get('field')} | "
+                            f"ns={inp.get('namespace')} key={inp.get('key')} "
+                            f"type={inp.get('type')} value={str(inp.get('value'))[:120]}"
+                        ),
+                    })
+
+                if fail_items == 0:
+                    fail_count += len(batch)
+                    print(f"FAILED (fail={len(batch)})", flush=True)
                     detail_fail_rows.append({
                         "entity_type": "",
                         "owner_id": "",
                         "field_key": "",
                         "error_reason": "shopify_batch_error",
                         "message": (
-                            f"batch_error start={start_idx} size={len(batch)} | "
-                            f"code={e.get('code', '')} | "
-                            f"msg={e.get('message', '')} | "
-                            f"field={e.get('field')}"
+                            f"SET batch_error start={start_idx} size={len(batch)} | "
+                            f"no per-item index returned | "
+                            f"user_errors={json.dumps(non_indexed_errors, ensure_ascii=False)[:500]}"
+                        ),
+                    })
+                else:
+                    batch_ok = len(batch) - fail_items
+                    ok_count += batch_ok
+                    fail_count += fail_items
+                    print(f"PARTIAL_FAIL (ok={batch_ok}, fail={fail_items})", flush=True)
+
+                    for e in non_indexed_errors[:3]:
+                        detail_fail_rows.append({
+                            "entity_type": "",
+                            "owner_id": "",
+                            "field_key": "",
+                            "error_reason": "shopify_batch_error",
+                            "message": (
+                                f"SET batch_error start={start_idx} size={len(batch)} | "
+                                f"code={e.get('code', '')} | "
+                                f"msg={e.get('message', '')} | "
+                                f"field={e.get('field')}"
+                            ),
+                        })
+
+            except Exception as e:
+                fail_count += len(batch)
+                print("FAILED", flush=True)
+                print(f"  exception: {e}", flush=True)
+
+                for r, inp in zip(meta_batch, batch):
+                    detail_fail_rows.append({
+                        "entity_type": r.get("entity_type", ""),
+                        "owner_id": r.get("owner_id", ""),
+                        "field_key": r.get("field_key", ""),
+                        "error_reason": "batch_exception",
+                        "message": (
+                            f"sheet_row={r.get('sheet_row')} | action=SET | exception: {e} | "
+                            f"ns={inp.get('namespace')} key={inp.get('key')} type={inp.get('type')}"
                         ),
                     })
 
-        except Exception as e:
-            fail_count += len(batch)
-            print("FAILED", flush=True)
-            print(f"  exception: {e}", flush=True)
+    # -----------------------------
+    # 2) Apply CLEAR rows via metafieldsDelete
+    # -----------------------------
+    if delete_total == 0:
+        print("=== Applying metafieldsDelete === total=0, batches=0, batch_size=0")
+    else:
+        total_batches = (delete_total + set_batch_size - 1) // set_batch_size
+        print(f"=== Applying metafieldsDelete === total={delete_total}, batches={total_batches}, batch_size={set_batch_size}")
 
-            for r, inp in zip(meta_batch, batch):
-                detail_fail_rows.append({
-                    "entity_type": r.get("entity_type", ""),
-                    "owner_id": r.get("owner_id", ""),
-                    "field_key": r.get("field_key", ""),
-                    "error_reason": "batch_exception",
-                    "message": (
-                        f"sheet_row={r.get('sheet_row')} | exception: {e} | "
-                        f"ns={inp.get('namespace')} key={inp.get('key')} type={inp.get('type')}"
-                    ),
-                })
+        for batch_no, (start_idx, batch) in enumerate(_chunk_list(delete_inputs, set_batch_size), start=1):
+            meta_batch = delete_meta_rows[start_idx:start_idx + len(batch)]
+            print(f"DELETE Batch {batch_no}/{total_batches}: {len(batch)} items ... ", end="", flush=True)
+
+            try:
+                data = gql(client, M_DELETE, {"metafields": batch})
+                resp = data["metafieldsDelete"]
+                user_errors = resp.get("userErrors") or []
+
+                if not user_errors:
+                    ok_count += len(batch)
+                    print("OK", flush=True)
+                    continue
+
+                err_by_i = {}
+                non_indexed_errors = []
+
+                for e in user_errors:
+                    idx = parse_error_index(e.get("field"))
+                    if idx is None:
+                        non_indexed_errors.append(e)
+                    else:
+                        err_by_i.setdefault(idx, []).append(e)
+
+                fail_items = 0
+
+                for idx, errs in err_by_i.items():
+                    if not (0 <= idx < len(meta_batch)):
+                        continue
+
+                    fail_items += 1
+                    r = meta_batch[idx]
+                    inp = batch[idx]
+                    detail_fail_rows.append({
+                        "entity_type": r.get("entity_type", ""),
+                        "owner_id": r.get("owner_id", ""),
+                        "field_key": r.get("field_key", ""),
+                        "error_reason": "shopify_user_error",
+                        "message": (
+                            f"sheet_row={r.get('sheet_row')} | action=CLEAR_DELETE | "
+                            f"code={errs[0].get('code', '')} | "
+                            f"msg={errs[0].get('message', '')} | "
+                            f"field={errs[0].get('field')} | "
+                            f"ownerId={inp.get('ownerId')} ns={inp.get('namespace')} key={inp.get('key')}"
+                        ),
+                    })
+
+                if fail_items == 0:
+                    fail_count += len(batch)
+                    print(f"FAILED (fail={len(batch)})", flush=True)
+                    detail_fail_rows.append({
+                        "entity_type": "",
+                        "owner_id": "",
+                        "field_key": "",
+                        "error_reason": "shopify_batch_error",
+                        "message": (
+                            f"DELETE batch_error start={start_idx} size={len(batch)} | "
+                            f"no per-item index returned | "
+                            f"user_errors={json.dumps(non_indexed_errors, ensure_ascii=False)[:500]}"
+                        ),
+                    })
+                else:
+                    batch_ok = len(batch) - fail_items
+                    ok_count += batch_ok
+                    fail_count += fail_items
+                    print(f"PARTIAL_FAIL (ok={batch_ok}, fail={fail_items})", flush=True)
+
+                    for e in non_indexed_errors[:3]:
+                        detail_fail_rows.append({
+                            "entity_type": "",
+                            "owner_id": "",
+                            "field_key": "",
+                            "error_reason": "shopify_batch_error",
+                            "message": (
+                                f"DELETE batch_error start={start_idx} size={len(batch)} | "
+                                f"code={e.get('code', '')} | "
+                                f"msg={e.get('message', '')} | "
+                                f"field={e.get('field')}"
+                            ),
+                        })
+
+            except Exception as e:
+                fail_count += len(batch)
+                print("FAILED", flush=True)
+                print(f"  exception: {e}", flush=True)
+
+                for r, inp in zip(meta_batch, batch):
+                    detail_fail_rows.append({
+                        "entity_type": r.get("entity_type", ""),
+                        "owner_id": r.get("owner_id", ""),
+                        "field_key": r.get("field_key", ""),
+                        "error_reason": "batch_exception",
+                        "message": (
+                            f"sheet_row={r.get('sheet_row')} | action=CLEAR_DELETE | exception: {e} | "
+                            f"ownerId={inp.get('ownerId')} ns={inp.get('namespace')} key={inp.get('key')}"
+                        ),
+                    })
 
     print(
-        f"=== Apply done === total={total}, ok={ok_count}, fail={fail_count}",
+        f"=== Apply done === total={total}, ok={ok_count}, fail={fail_count}, set={set_total}, delete={delete_total}",
         flush=True,
     )
 
@@ -1201,6 +1364,8 @@ def apply_plan(
         "ok_count": ok_count,
         "fail_count": fail_count,
         "total": total,
+        "set_total": set_total,
+        "delete_total": delete_total,
         "detail_fail_rows": detail_fail_rows,
     }
 
@@ -1469,7 +1634,7 @@ def run(
         type_override_by_field_key=type_override_by_field_key,
     )
 
-    rows_planned = int(plan["summary"]["rows_planned_set"])
+    rows_planned = int(plan["summary"].get("rows_planned_total", plan["summary"].get("rows_planned_set", 0)))
     rows_skipped = int(plan["summary"]["rows_skipped_total"])
 
     warnings = []
@@ -1640,8 +1805,10 @@ def run(
     apply_result = apply_plan(
         client=shopify,
         set_inputs=plan["set_inputs"],
-        meta_rows=plan["meta_rows"],
+        set_meta_rows=plan["set_meta_rows"],
         set_batch_size=set_batch_size,
+        delete_inputs=plan["delete_inputs"],
+        delete_meta_rows=plan["delete_meta_rows"],
     )
 
     rows_written = int(apply_result["ok_count"])
