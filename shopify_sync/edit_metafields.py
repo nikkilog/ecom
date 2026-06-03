@@ -88,7 +88,7 @@ M_SET = """
 mutation setMf($metafields: [MetafieldsSetInput!]!) {
   metafieldsSet(metafields: $metafields) {
     metafields { id namespace key type value }
-    userErrors { field message code }
+    userErrors { field message }
   }
 }
 """
@@ -97,7 +97,7 @@ M_DELETE = """
 mutation deleteMf($metafields: [MetafieldIdentifierInput!]!) {
   metafieldsDelete(metafields: $metafields) {
     deletedMetafields { ownerId namespace key }
-    userErrors { field message code }
+    userErrors { field message }
   }
 }
 """
@@ -1189,7 +1189,7 @@ def apply_plan(
                         "error_reason": "shopify_user_error",
                         "message": (
                             f"sheet_row={r.get('sheet_row')} | action=SET | "
-                            f"code={errs[0].get('code', '')} | "
+                            f""
                             f"msg={errs[0].get('message', '')} | "
                             f"field={errs[0].get('field')} | "
                             f"ns={inp.get('namespace')} key={inp.get('key')} "
@@ -1225,7 +1225,7 @@ def apply_plan(
                             "error_reason": "shopify_batch_error",
                             "message": (
                                 f"SET batch_error start={start_idx} size={len(batch)} | "
-                                f"code={e.get('code', '')} | "
+                                f""
                                 f"msg={e.get('message', '')} | "
                                 f"field={e.get('field')}"
                             ),
@@ -1297,7 +1297,7 @@ def apply_plan(
                         "error_reason": "shopify_user_error",
                         "message": (
                             f"sheet_row={r.get('sheet_row')} | action=CLEAR_DELETE | "
-                            f"code={errs[0].get('code', '')} | "
+                            f""
                             f"msg={errs[0].get('message', '')} | "
                             f"field={errs[0].get('field')} | "
                             f"ownerId={inp.get('ownerId')} ns={inp.get('namespace')} key={inp.get('key')}"
@@ -1332,7 +1332,7 @@ def apply_plan(
                             "error_reason": "shopify_batch_error",
                             "message": (
                                 f"DELETE batch_error start={start_idx} size={len(batch)} | "
-                                f"code={e.get('code', '')} | "
+                                f""
                                 f"msg={e.get('message', '')} | "
                                 f"field={e.get('field')}"
                             ),
