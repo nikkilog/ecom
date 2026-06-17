@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# v2: owner-aware Cfg__Fields filtering + zero-row SUCCESS guard
+SCRIPT_BUILD = "2026-06-17-owner-header-authoritative"
 
 import base64
 import json
@@ -71,12 +71,11 @@ OWNER_HEADER_TO_KEY = {
     "PAGE": "page_id",
 }
 
-OWNER_KEY_TO_ENTITY = {owner_key: entity for entity, owner_key in OWNER_HEADER_TO_KEY.items()}
-OWNER_KEY_LABEL = {
-    "product_id": "Product ID / GID / Legacy ID / Numeric ID",
-    "variant_id": "Variant ID / GID / Legacy ID / Numeric ID",
-    "collection_id": "Collection ID / GID / Legacy ID / Numeric ID",
-    "page_id": "Page ID / GID / Legacy ID / Numeric ID",
+OWNER_KEY_TO_ENTITY = {
+    "product_id": "PRODUCT",
+    "variant_id": "VARIANT",
+    "collection_id": "COLLECTION",
+    "page_id": "PAGE",
 }
 
 OWNER_TYPE_WORDS = {
@@ -636,16 +635,7 @@ def build_cfg_maps(
     cfg_match_column_candidates: list[str],
     cfg_key_column_candidates: list[str],
     cfg_entity_column_candidates: list[str],
-    allowed_entities: Optional[set[str]] = None,
-) -> tuple[dict[str, str], dict[str, str], dict[str, dict[str, str]], dict[str, Any]]:
-    """
-    Build Cfg__Fields lookup maps for only the owner entity types present in Wide.
-
-    Cfg__Fields may legitimately contain the same display_name or field_key for
-    different owner types. A flat, unfiltered map silently lets the last row win,
-    which can turn a PRODUCT field into a VARIANT/COLLECTION/PAGE field. This
-    function filters first, then rejects any remaining ambiguity.
-    """
+) -> tuple[dict[str, str], dict[str, str], dict[str, dict[str, str]], dict[str, str]]:
     values = ws_cfg.get_all_values()
     if not values or len(values) < 2:
         raise ValueError("❌ Cfg__Fields 为空或不可读")
@@ -669,76 +659,26 @@ def build_cfg_maps(
         "purpose": pick_col_index(header, CFG_PURPOSE_COLUMN_CANDIDATES_DEFAULT),
     }
 
-    allowed_entities_n: Optional[set[str]] = None
-    if allowed_entities is not None:
-        allowed_entities_n = {
-            normalize_entity_type(x)
-            for x in allowed_entities
-            if not _is_blank(x)
-        }
-        if not allowed_entities_n:
-            raise ValueError("❌ Wide owner 上下文为空，无法按 entity_type 过滤 Cfg__Fields")
-
     map_name_to_key: dict[str, str] = {}
     map_key_to_entity: dict[str, str] = {}
     map_key_meta: dict[str, dict[str, str]] = {}
 
-    filtered_rows = 0
-    ignored_other_entity_rows = 0
-    name_conflicts: list[dict[str, str]] = []
-    key_conflicts: list[dict[str, str]] = []
-
-    for row_num, r in enumerate(values[1:], start=2):
+    for r in values[1:]:
         key = r[key_idx].strip() if key_idx < len(r) else ""
         if _is_blank(key):
             continue
 
         entity = normalize_entity_type(r[entity_idx] if entity_idx < len(r) else "")
-        if allowed_entities_n is not None and entity not in allowed_entities_n:
-            ignored_other_entity_rows += 1
-            continue
-
-        filtered_rows += 1
         name = r[match_idx] if match_idx < len(r) else ""
-        name_norm = norm_header(name)
-        key_norm_as_header = norm_header(key)
 
-        existing_entity = map_key_to_entity.get(key)
-        if existing_entity and existing_entity != entity:
-            key_conflicts.append({
-                "field_key": key,
-                "existing_entity": existing_entity,
-                "new_entity": entity,
-                "cfg_row": str(row_num),
-            })
-        elif not _is_blank(entity):
+        if not _is_blank(name):
+            map_name_to_key[norm_header(name)] = key
+
+        # Also allow header to be the field_key directly.
+        map_name_to_key[norm_header(key)] = key
+
+        if not _is_blank(entity):
             map_key_to_entity[key] = entity
-
-        if name_norm:
-            existing_key = map_name_to_key.get(name_norm)
-            if existing_key and existing_key != key:
-                name_conflicts.append({
-                    "display_name": str(name).strip(),
-                    "existing_field_key": existing_key,
-                    "new_field_key": key,
-                    "entity_type": entity,
-                    "cfg_row": str(row_num),
-                })
-            else:
-                map_name_to_key[name_norm] = key
-
-        # Also allow Wide row 1 to contain the field_key directly.
-        existing_direct = map_name_to_key.get(key_norm_as_header)
-        if existing_direct and existing_direct != key:
-            name_conflicts.append({
-                "display_name": key,
-                "existing_field_key": existing_direct,
-                "new_field_key": key,
-                "entity_type": entity,
-                "cfg_row": str(row_num),
-            })
-        else:
-            map_name_to_key[key_norm_as_header] = key
 
         meta = {
             "field_key": key,
@@ -747,43 +687,17 @@ def build_cfg_maps(
         }
         for meta_name, idx in optional_idxs.items():
             meta[meta_name] = r[idx].strip() if idx is not None and idx < len(r) else ""
+        map_key_meta[key] = meta
 
-        existing_meta = map_key_meta.get(key)
-        if existing_meta and normalize_entity_type(existing_meta.get("entity_type", "")) != entity:
-            # Keep the first row; the conflict is reported below and execution stops.
-            pass
-        else:
-            map_key_meta[key] = meta
-
-    if key_conflicts or name_conflicts:
-        raise ValueError(
-            "❌ Cfg__Fields 在当前 Wide owner 范围内存在歧义，不能安全生成 Long。\n"
-            f"allowed_entities={sorted(allowed_entities_n or set())}\n"
-            f"field_key entity 冲突示例={key_conflicts[:20]}\n"
-            f"display_name field_key 冲突示例={name_conflicts[:20]}"
-        )
-
-    if not map_key_to_entity:
-        raise ValueError(
-            "❌ 按 Wide owner 类型过滤后，Cfg__Fields 没有可用字段。\n"
-            f"allowed_entities={sorted(allowed_entities_n or set())}"
-        )
-
-    cfg_meta: dict[str, Any] = {
+    cfg_meta = {
         "match_col": header[match_idx],
         "key_col": header[key_idx],
         "entity_col": header[entity_idx],
-        "allowed_entities": sorted(allowed_entities_n or set()),
-        "filtered_rows": filtered_rows,
-        "ignored_other_entity_rows": ignored_other_entity_rows,
     }
 
     print(
         "✅ CFG maps loaded:"
-        f" allowed_entities={cfg_meta['allowed_entities']}"
-        f" | filtered_rows={filtered_rows}"
-        f" | ignored_other_entities={ignored_other_entity_rows}"
-        f" | name/key->field_key={len(map_name_to_key)}"
+        f" name/key->field_key={len(map_name_to_key)}"
         f" | field_key->entity={len(map_key_to_entity)}"
         f" | match_col={cfg_meta['match_col']}"
         f" | key_col={cfg_meta['key_col']}"
@@ -791,6 +705,7 @@ def build_cfg_maps(
     )
 
     return map_name_to_key, map_key_to_entity, map_key_meta, cfg_meta
+
 
 def should_output_field(field_key: str, meta: dict[str, str], *, exclude_display_only: bool = True) -> bool:
     k = str(field_key or "").strip().lower()
@@ -968,10 +883,25 @@ def build_long_rows(
     include_empty: bool,
     dedup_output: bool,
     exclude_display_only: bool,
-    fail_on_empty_output: bool = True,
 ) -> tuple[list[list[str]], dict[str, Any]]:
+    """
+    Convert Wide to Long.
+
+    Important rule:
+    The owner identity column in Wide is authoritative.
+
+    Example:
+        Product ID (numeric) => PRODUCT / product_id
+
+    When Wide contains exactly one owner identity column, every editable field
+    in that Wide sheet is written against that owner type. Cfg__Fields may
+    still provide field metadata, but it is not allowed to redirect a PRODUCT
+    Wide sheet to VARIANT / COLLECTION / PAGE.
+    """
     if len(values_2d) < 3:
-        raise ValueError("❌ 宽表至少需要：第1行(header) + 第2行(field_key) + 第3行起(数据)")
+        raise ValueError(
+            "❌ 宽表至少需要：第1行(header) + 第2行(field_key) + 第3行起(数据)"
+        )
 
     header1 = values_2d[0]
     key_row = values_2d[1]
@@ -996,17 +926,48 @@ def build_long_rows(
             " 和 ID 类型词(ID/GID/Legacy ID/Numeric ID)。"
         )
 
+    # Print exactly what the Python file recognized from row 1.
+    for owner_id_key, col_idx in owner_cols.items():
+        recognized_entity = OWNER_KEY_TO_ENTITY.get(owner_id_key, "")
+        original_header = header1[col_idx] if col_idx < len(header1) else ""
+        print(
+            "✅ Owner header recognized:"
+            f" column={col_idx + 1}"
+            f" | header={original_header!r}"
+            f" | entity_type={recognized_entity}"
+            f" | owner_key={owner_id_key}"
+        )
+
+    single_owner_mode = len(owner_cols) == 1
+    forced_owner_id_key = ""
+    forced_entity = ""
+
+    if single_owner_mode:
+        forced_owner_id_key = next(iter(owner_cols))
+        forced_entity = OWNER_KEY_TO_ENTITY.get(forced_owner_id_key, "")
+        if not forced_entity:
+            raise ValueError(
+                f"❌ 无法把 owner_key={forced_owner_id_key} 转换成 entity_type"
+            )
+        print(
+            "✅ Single-owner mode:"
+            f" Wide row 1 is authoritative"
+            f" | entity_type={forced_entity}"
+            f" | owner_key={forced_owner_id_key}"
+        )
+
     out: list[list[str]] = []
     seen = set() if dedup_output else None
+
     skipped_missing_owner = 0
     skipped_empty_value = 0
     skipped_excluded_field = 0
     skipped_blank_key = 0
     planned_fields = 0
-    source_values_considered = 0
+    nonblank_source_values = 0
 
     field_cols: list[dict[str, Any]] = []
-    unresolved_entities: list[dict[str, Any]] = []
+    entity_overrides: list[dict[str, str]] = []
 
     for col_idx in range(last_col):
         if col_idx in owner_col_indexes:
@@ -1017,59 +978,100 @@ def build_long_rows(
             skipped_blank_key += 1
             continue
 
-        meta = map_key_meta.get(k, {"field_key": k, "entity_type": map_key_to_entity.get(k, "")})
-        if not should_output_field(k, meta, exclude_display_only=exclude_display_only):
+        meta = map_key_meta.get(
+            k,
+            {
+                "field_key": k,
+                "entity_type": map_key_to_entity.get(k, ""),
+            },
+        )
+
+        if not should_output_field(
+            k,
+            meta,
+            exclude_display_only=exclude_display_only,
+        ):
             skipped_excluded_field += 1
             continue
 
-        entity = normalize_entity_type(map_key_to_entity.get(k, meta.get("entity_type", "")))
-        owner_id_key = OWNER_ID_KEYS.get(entity)
-        if not owner_id_key:
-            unresolved_entities.append({
-                "col_num": col_idx + 1,
-                "header": header1[col_idx],
+        cfg_entity = normalize_entity_type(
+            map_key_to_entity.get(k, meta.get("entity_type", ""))
+        )
+
+        if single_owner_mode:
+            # The Wide owner header wins. This is the key fix.
+            entity = forced_entity
+            owner_id_key = forced_owner_id_key
+
+            if cfg_entity and cfg_entity != forced_entity:
+                entity_overrides.append(
+                    {
+                        "field_key": k,
+                        "cfg_entity": cfg_entity,
+                        "wide_entity": forced_entity,
+                    }
+                )
+        else:
+            # Multiple owner columns: Cfg__Fields must tell us which owner to use.
+            entity = cfg_entity
+            owner_id_key = OWNER_ID_KEYS.get(entity, "")
+
+            if not owner_id_key:
+                raise ValueError(
+                    "❌ Wide 同时有多个 owner 身份列，但字段无法确定 owner。\n"
+                    f"column={col_idx + 1}"
+                    f" | header={header1[col_idx]!r}"
+                    f" | field_key={k!r}"
+                    f" | cfg_entity={cfg_entity!r}"
+                )
+
+            if owner_id_key not in owner_cols:
+                raise ValueError(
+                    "❌ 字段要求的 owner 身份列不在 Wide 中。\n"
+                    f"column={col_idx + 1}"
+                    f" | header={header1[col_idx]!r}"
+                    f" | field_key={k!r}"
+                    f" | cfg_entity={cfg_entity!r}"
+                    f" | required_owner_key={owner_id_key!r}"
+                    f" | available_owner_keys={sorted(owner_cols)}"
+                )
+
+        field_cols.append(
+            {
+                "col_idx": col_idx,
                 "field_key": k,
                 "entity_type": entity,
-            })
-            continue
-
-        field_cols.append({
-            "col_idx": col_idx,
-            "header": header1[col_idx],
-            "field_key": k,
-            "entity_type": entity,
-            "owner_id_key": owner_id_key,
-        })
+                "owner_id_key": owner_id_key,
+            }
+        )
         planned_fields += 1
 
-    if unresolved_entities:
-        raise ValueError(
-            "❌ Wide 第2行存在无法解析 entity_type 的字段，不能安全生成 Long。\n"
-            f"示例={unresolved_entities[:20]}"
+    if entity_overrides:
+        print(
+            "⚠️ Cfg entity overridden by Wide owner header:"
+            f" count={len(entity_overrides)}"
         )
+        for item in entity_overrides[:20]:
+            print(
+                "   "
+                f"field_key={item['field_key']}"
+                f" | cfg_entity={item['cfg_entity']}"
+                f" | using_wide_entity={item['wide_entity']}"
+            )
 
     if not field_cols:
-        raise ValueError("❌ 没有可输出字段列。请检查 Wide 第2行 field_key 或 Cfg__Fields。")
-
-    owner_requirement_mismatches = []
-    for fc in field_cols:
-        if fc["owner_id_key"] not in owner_cols:
-            owner_requirement_mismatches.append({
-                "col_num": fc["col_idx"] + 1,
-                "header": fc["header"],
-                "field_key": fc["field_key"],
-                "entity_type": fc["entity_type"],
-                "required_owner": OWNER_KEY_LABEL.get(fc["owner_id_key"], fc["owner_id_key"]),
-                "available_owner_columns": sorted(owner_cols.keys()),
-            })
-
-    if owner_requirement_mismatches:
         raise ValueError(
-            "❌ 字段 entity_type 与 Wide owner 身份列不匹配；已停止，Long 不会被清空。\n"
-            f"示例={owner_requirement_mismatches[:20]}"
+            "❌ 没有可输出字段列。请检查 Wide 第2行 field_key 或 Cfg__Fields。"
         )
 
-    def emit(entity: str, owner_id: Any, field_key: str, value: Any, note: str = "", error_reason: str = ""):
+    def emit(
+        entity: str,
+        owner_id: Any,
+        field_key: str,
+        value: Any,
+        note: str = "",
+        error_reason: str = "",
+    ):
         row = [
             entity,
             str(owner_id).strip(),
@@ -1079,65 +1081,79 @@ def build_long_rows(
             error_reason,
         ]
         if seen is not None:
-            t = tuple(row)
-            if t in seen:
+            row_key = tuple(row)
+            if row_key in seen:
                 return
-            seen.add(t)
+            seen.add(row_key)
         out.append(row)
 
-    for r in data_rows:
+    for source_row_num, r in enumerate(data_rows, start=3):
         if not r:
             continue
+
         if len(r) < last_col:
             r = r + [""] * (last_col - len(r))
 
         row_owner_values: dict[str, str] = {}
         for owner_id_key, col_idx in owner_cols.items():
-            row_owner_values[owner_id_key] = str(r[col_idx]).strip() if col_idx < len(r) else ""
+            row_owner_values[owner_id_key] = (
+                str(r[col_idx]).strip() if col_idx < len(r) else ""
+            )
 
         for fc in field_cols:
             v = r[fc["col_idx"]] if fc["col_idx"] < len(r) else ""
+
             if (not include_empty) and _is_blank(v):
                 skipped_empty_value += 1
                 continue
 
-            source_values_considered += 1
+            if not _is_blank(v):
+                nonblank_source_values += 1
+
             owner_id_key = fc["owner_id_key"]
             owner_id = row_owner_values.get(owner_id_key, "")
 
             if _is_blank(owner_id):
                 skipped_missing_owner += 1
+                print(
+                    "⚠️ Missing owner value:"
+                    f" source_row={source_row_num}"
+                    f" | owner_key={owner_id_key}"
+                    f" | entity_type={fc['entity_type']}"
+                    f" | field_key={fc['field_key']}"
+                )
                 continue
 
-            emit(fc["entity_type"], owner_id, fc["field_key"], v)
+            emit(
+                fc["entity_type"],
+                owner_id,
+                fc["field_key"],
+                v,
+            )
 
-    if fail_on_empty_output and len(out) == 0:
+    # A populated Wide sheet is never allowed to silently become an empty Long.
+    if data_rows and nonblank_source_values > 0 and len(out) == 0:
         raise ValueError(
-            "❌ Wide 有数据，但最终可写 Long 行数为 0；已停止，Long 不会被清空。\n"
+            "❌ Wide 有非空目标值，但 Long 结果为 0 行；不允许记录 SUCCESS，"
+            "并且不会清空原 Long。\n"
             f"data_rows={len(data_rows)}"
             f" | planned_fields={planned_fields}"
-            f" | source_values_considered={source_values_considered}"
-            f" | skipped_empty_value={skipped_empty_value}"
+            f" | nonblank_source_values={nonblank_source_values}"
             f" | skipped_missing_owner={skipped_missing_owner}"
+            f" | skipped_empty_value={skipped_empty_value}"
         )
 
     meta = {
-        "mode": "OWNER_HEADER",
+        "mode": "OWNER_HEADER_AUTHORITATIVE",
         "last_col": last_col,
         "owner_cols": {k: v + 1 for k, v in owner_cols.items()},
-        "owner_entities": sorted(OWNER_KEY_TO_ENTITY[k] for k in owner_cols if k in OWNER_KEY_TO_ENTITY),
+        "single_owner_mode": single_owner_mode,
+        "forced_entity": forced_entity,
+        "forced_owner_id_key": forced_owner_id_key,
+        "entity_override_count": len(entity_overrides),
+        "entity_overrides": entity_overrides[:100],
         "planned_fields": planned_fields,
-        "field_bindings": [
-            {
-                "col_num": fc["col_idx"] + 1,
-                "header": fc["header"],
-                "field_key": fc["field_key"],
-                "entity_type": fc["entity_type"],
-                "owner_id_key": fc["owner_id_key"],
-            }
-            for fc in field_cols
-        ],
-        "source_values_considered": source_values_considered,
+        "nonblank_source_values": nonblank_source_values,
         "skipped_missing_owner": skipped_missing_owner,
         "skipped_empty_value": skipped_empty_value,
         "skipped_excluded_field": skipped_excluded_field,
@@ -1188,7 +1204,6 @@ def run(
     write_runlog_enabled: bool = True,
     dedup_output: bool = True,
     exclude_display_only: bool = True,
-    fail_on_empty_output: bool = True,
     out_chunk_rows: int = 20000,
     wide_header_row: int = WIDE_HEADER_ROW_DEFAULT,
     wide_write_row: int = WIDE_WRITE_ROW_DEFAULT,
@@ -1287,6 +1302,7 @@ def run(
             )
 
         print("✅ Runtime config ready")
+        print("  script_build:", SCRIPT_BUILD)
         print("  site_code :", site_code_final)
         print("  job_name  :", job_name_final)
         print("  config    : Cfg__account_id not used by this job")
@@ -1302,43 +1318,11 @@ def run(
         map_key_meta: dict[str, dict[str, str]] = {}
 
         if do_write_wide_keys or do_build_long:
-            wide_header_values = ws_wide.row_values(wide_header_row)
-            if not wide_header_values:
-                raise ValueError(f"❌ Wide 第{wide_header_row}行为空")
-
-            last_header_col = 0
-            for i, value in enumerate(wide_header_values):
-                if not _is_blank(value):
-                    last_header_col = i + 1
-            if last_header_col == 0:
-                raise ValueError(f"❌ Wide 第{wide_header_row}行没有任何字段名")
-
-            owner_cols_for_cfg = scan_owner_columns(
-                wide_header_values,
-                last_col=last_header_col,
-            )
-            if not owner_cols_for_cfg:
-                raise ValueError(
-                    "❌ Wide 没有识别到 owner 身份列，无法按 entity_type 过滤 Cfg__Fields"
-                )
-
-            allowed_entities = {
-                OWNER_KEY_TO_ENTITY[owner_key]
-                for owner_key in owner_cols_for_cfg
-                if owner_key in OWNER_KEY_TO_ENTITY
-            }
-            print(
-                "✅ Wide owner context:"
-                f" owner_cols={{{', '.join(f'{k}: {v + 1}' for k, v in owner_cols_for_cfg.items())}}}"
-                f" | allowed_entities={sorted(allowed_entities)}"
-            )
-
             map_name_to_key, map_key_to_entity, map_key_meta, cfg_meta = build_cfg_maps(
                 ws_cfg,
                 cfg_match_column_candidates=cfg_match_column_candidates,
                 cfg_key_column_candidates=cfg_key_column_candidates,
                 cfg_entity_column_candidates=cfg_entity_column_candidates,
-                allowed_entities=allowed_entities,
             )
 
         if do_write_wide_keys:
@@ -1365,15 +1349,9 @@ def run(
                 include_empty=include_empty,
                 dedup_output=dedup_output,
                 exclude_display_only=exclude_display_only,
-                fail_on_empty_output=fail_on_empty_output,
             )
             rows_planned = len(long_rows)
-            rows_skipped = (
-                int(long_meta.get("skipped_missing_owner", 0) or 0)
-                + int(long_meta.get("skipped_empty_value", 0) or 0)
-                + int(long_meta.get("skipped_excluded_field", 0) or 0)
-                + int(long_meta.get("skipped_blank_key", 0) or 0)
-            )
+            rows_skipped = int(long_meta.get("skipped_missing_owner", 0) or 0) + int(long_meta.get("skipped_empty_value", 0) or 0)
 
             print(
                 f"✅ Mode={long_meta.get('mode')}"
@@ -1459,12 +1437,14 @@ def run(
 
             if rows_written != rows_planned:
                 raise RuntimeError(
-                    "❌ Long 写入数量校验失败："
-                    f" rows_planned={rows_planned}, rows_written={rows_written}"
+                    "❌ Long 写入数量与计划数量不一致："
+                    f" rows_planned={rows_planned}"
+                    f" | rows_written={rows_written}"
                 )
-            if fail_on_empty_output and rows_written == 0:
+
+            if rows_read > 0 and rows_written == 0:
                 raise RuntimeError(
-                    "❌ Long 实际写入 0 行，不允许记录 SUCCESS"
+                    "❌ Wide 有数据但 Long 实际写入 0 行；不允许记录 SUCCESS"
                 )
 
             dt = time.time() - t0
@@ -1502,6 +1482,7 @@ def run(
 
         return {
             "status": "SUCCESS",
+            "script_build": SCRIPT_BUILD,
             "run_id": actual_run_id,
             "ts_cn": ts_cn,
             "job_name": job_name_final,
@@ -1522,7 +1503,6 @@ def run(
                 "do_build_long": do_build_long,
                 "dedup_output": dedup_output,
                 "exclude_display_only": exclude_display_only,
-                "fail_on_empty_output": fail_on_empty_output,
             },
             "preview": preview,
             "meta": {
