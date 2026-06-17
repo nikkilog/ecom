@@ -860,36 +860,31 @@ def build_fields_for_entry(
             out.append({"key": key, "value": json.dumps(vals, ensure_ascii=False)})
             continue
 
-        # scalar
-        last_nonempty = ""
-        for r in sorted(items, key=lambda x: int(x.get("_sheet_row", 10 ** 9))):
-            raw = str(r.get("value", "")).strip()
-            if raw != "":
-                last_nonempty = raw
+        # scalar: the last sheet row is authoritative.
+        # When EMPTY_MEANS_CLEAR=True, a blank value explicitly clears the field,
+        # including single collection_reference and metaobject_reference fields.
+        items_sorted = sorted(items, key=lambda x: int(x.get("_sheet_row", 10 ** 9)))
+        final_raw = str(items_sorted[-1].get("value", "")).strip()
 
-        if last_nonempty == "":
+        if final_raw == "":
             if not empty_means_clear:
-                continue
-            if "collection_reference" in data_type or "metaobject_reference" in data_type:
-                # 单值 reference 清空行为先不做隐式清空，避免误写
-                warnings.append(f"reference clear skipped: {field_id}")
                 continue
             out.append({"key": key, "value": ""})
             continue
 
         if "collection_reference" in data_type:
-            gid = resolver.to_gid_collection(last_nonempty)
+            gid = resolver.to_gid_collection(final_raw)
             if not gid:
-                raise ValueError(f"collection_reference parse failed: {last_nonempty}")
+                raise ValueError(f"collection_reference parse failed: {final_raw}")
             out.append({"key": key, "value": gid})
             continue
 
         if "metaobject_reference" in data_type:
-            gid = resolver.to_gid_metaobject(last_nonempty, current_entry_type=entry_type, strict=strict)
+            gid = resolver.to_gid_metaobject(final_raw, current_entry_type=entry_type, strict=strict)
             out.append({"key": key, "value": gid})
             continue
 
-        out.append({"key": key, "value": last_nonempty})
+        out.append({"key": key, "value": final_raw})
 
     return out, warnings
 
