@@ -1,4 +1,4 @@
-# shopify_pre_edit/entries_update_wide_to_long.py
+# shopify_pre_edit/entries_update_wide_to_long_v2.py
 
 from __future__ import annotations
 
@@ -78,6 +78,11 @@ CONTROL_COLUMN_NAMES = {
     "new_handle",
     *OWNER_COLUMN_CANDIDATES,
 }
+
+# Columns such as collection_link__handle and parent_node__handle are
+# helper/fallback values for the corresponding reference field. They are not
+# standalone Shopify fields and must never be converted into their own field_id.
+AUXILIARY_HANDLE_SUFFIX = "__handle"
 
 
 # =========================================================
@@ -599,15 +604,50 @@ def detect_layout(header_row: list[str]) -> dict[str, Any]:
         indexes = positions.get(name, [])
         fixed_indexes.update(indexes)
 
+    # Detect helper columns such as collection_link__handle. A helper column is
+    # excluded from field_id resolution and is used only when its main field is
+    # blank on the same row.
+    auxiliary_handle_indexes: set[int] = set()
+    field_handle_fallbacks: dict[int, int] = {}
+    auxiliary_columns: list[str] = []
+
+    for idx, header in enumerate(header_row):
+        normalized = _norm_header(header)
+        if not normalized.endswith(AUXILIARY_HANDLE_SUFFIX):
+            continue
+
+        base_header = normalized[: -len(AUXILIARY_HANDLE_SUFFIX)]
+        base_indexes = positions.get(base_header, [])
+        if not base_indexes:
+            raise ValueError(
+                "❌ 辅助 handle 列缺少对应主字段列: "
+                f"{header} -> expected main column {base_header}"
+            )
+
+        base_idx = base_indexes[0]
+        if base_idx in fixed_indexes:
+            raise ValueError(
+                "❌ 辅助 handle 列不能对应控制列: "
+                f"{header} -> {base_header}"
+            )
+
+        auxiliary_handle_indexes.add(idx)
+        field_handle_fallbacks[base_idx] = idx
+        auxiliary_columns.append(_norm_str(header))
+
     field_col_indexes = [
         idx
         for idx, header in enumerate(header_row)
-        if _norm_str(header) != "" and idx not in fixed_indexes
+        if (
+            _norm_str(header) != ""
+            and idx not in fixed_indexes
+            and idx not in auxiliary_handle_indexes
+        )
     ]
 
     if not field_col_indexes:
         raise ValueError(
-            "❌ 未找到可转成长表的字段列。控制列之外至少需要一个字段列"
+            "❌ 未找到可转成长表的字段列。控制列和辅助列之外至少需要一个字段列"
         )
 
     return {
@@ -627,6 +667,9 @@ def detect_layout(header_row: list[str]) -> dict[str, Any]:
         "new_handle_idx": positions.get("new_handle", [None])[0],
         "fixed_indexes": fixed_indexes,
         "field_col_indexes": field_col_indexes,
+        "auxiliary_handle_indexes": auxiliary_handle_indexes,
+        "field_handle_fallbacks": field_handle_fallbacks,
+        "auxiliary_columns": auxiliary_columns,
     }
 
 
@@ -933,7 +976,14 @@ def validate_and_transform(
         generated_for_row: list[dict[str, Any]] = []
 
         for col_idx in layout["field_col_indexes"]:
-            desired_value = _norm_str(row[col_idx])
+            # Prefer the actual field value (usually a GID). When it is blank,
+            # accept the paired __handle helper as a fallback value. The helper
+            # column itself never becomes an output row or field_id.
+            main_value = _norm_str(row[col_idx])
+            helper_idx = layout["field_handle_fallbacks"].get(col_idx)
+            helper_value = _safe_cell(row, helper_idx)
+            desired_value = main_value or helper_value
+
             if desired_value == "" and not include_empty:
                 continue
 
@@ -1247,9 +1297,18 @@ def run(
         layout = detect_layout(header_row)
         effective_rows = find_effective_data_rows(data_rows)
 
+        # Auxiliary __handle columns are not real fields. Keep/restore their
+        # Row-2 field_id cells as blank even if an older run wrote a synthetic ID.
+        cleaned_field_id_row = _pad_row(
+            original_field_id_row,
+            max(len(header_row), len(original_field_id_row)),
+        )
+        for helper_idx in layout["auxiliary_handle_indexes"]:
+            cleaned_field_id_row[helper_idx] = ""
+
         resolved_field_id_row = resolve_blank_field_id_row_from_cfg_fields(
             header_row=header_row,
-            field_id_row=original_field_id_row,
+            field_id_row=cleaned_field_id_row,
             cfg_fields_df=cfg_fields_df,
             field_col_indexes=layout["field_col_indexes"],
             entity_type=cfg_field_match_entity_type,
@@ -1339,6 +1398,7 @@ def run(
                     "op_input_columns": layout["op_input_columns"],
                     "owner_col": layout["owner_col"],
                     "owner_columns": [name for name, _ in layout["owner_columns"]],
+                    "auxiliary_columns": layout["auxiliary_columns"],
                     "field_id_row_written": 0,
                 },
             }
@@ -1402,6 +1462,7 @@ def run(
                 "op_input_columns": layout["op_input_columns"],
                 "owner_col": layout["owner_col"],
                 "owner_columns": [name for name, _ in layout["owner_columns"]],
+                "auxiliary_columns": layout["auxiliary_columns"],
                 "field_id_row_written": field_id_row_written,
                 "output_columns": OUTPUT_HEADER,
             },
