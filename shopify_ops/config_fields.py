@@ -5,6 +5,7 @@ module_path: shopify_ops/config_fields.py
 
 Multi-site Console Core version.
 Gold standard: PBS Cfg__Fields notebook logic.
+Collection-view support: dynamic Collection core/derived field registry.
 """
 
 from __future__ import annotations
@@ -97,6 +98,114 @@ CORE_FIXED = [{'display_name': 'Collection GID',
   'field_type': 'RAW',
   'data_type': 'string',
   'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Theme Template',
+  'entity_type': 'COLLECTION',
+  'field_key': 'core.template_suffix',
+  'expr': 'collection.templateSuffix',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Updated At',
+  'entity_type': 'COLLECTION',
+  'field_key': 'core.updated_at',
+  'expr': 'collection.updatedAt',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Storefront URL',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.storefront_url',
+  'expr': '=IF(LEN({COLLECTION|core.handle}&"")=0,"","{STOREFRONT_COLLECTION_BASE_URL}"&{COLLECTION|core.handle})',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Admin URL',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.admin_url',
+  'expr': '=IF(LEN({COLLECTION|core.legacy_id}&"")=0,"","{ADMIN_COLLECTION_BASE_URL}"&{COLLECTION|core.legacy_id})',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Type',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.collection_type',
+  'expr': 'IF_NOT_NULL(collection.ruleSet,"SMART","MANUAL")',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Rule Logic',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.rule_logic',
+  'expr': 'IF(collection.ruleSet.appliedDisjunctively,"any","all")',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Rule 1',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.rule_1',
+  'expr': 'COLLECTION_RULE_TEXT(collection.ruleSet.rules[0])',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Rule 2',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.rule_2',
+  'expr': 'COLLECTION_RULE_TEXT(collection.ruleSet.rules[1])',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Rule 3',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.rule_3',
+  'expr': 'COLLECTION_RULE_TEXT(collection.ruleSet.rules[2])',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Rule 4',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.rule_4',
+  'expr': 'COLLECTION_RULE_TEXT(collection.ruleSet.rules[3])',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Rule 5',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.rule_5',
+  'expr': 'COLLECTION_RULE_TEXT(collection.ruleSet.rules[4])',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Online Store Published',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.online_store_published',
+  'expr': 'collection.publishedOnPublication',
+  'field_type': 'CALC',
+  'data_type': 'boolean',
+  'source_type': 'DERIVED',
   'namespace': '',
   'key': ''},
  {'display_name': 'Metaobject Entry Name',
@@ -1690,11 +1799,25 @@ def _normalize_product_base_url(value: str, key_name: str) -> str:
     return v.rstrip("/") + "/"
 
 
+def _normalize_site_root_url(value: str, key_name: str) -> str:
+    """
+    Normalize a site/admin root URL without a trailing slash.
+
+    Expected examples:
+    - STOREFRONT_BASE_URL: https://www.apolloliftus.com
+    - ADMIN_BASE_URL: https://admin.shopify.com/store/apollolift-us
+    """
+    v = str(value or "").strip()
+    if not v:
+        raise ConfigFieldsError(f"Cfg__account_id missing required account config key: {key_name}")
+    return v.rstrip("/")
+
+
 def _build_core_fixed_rows(account_cfg: Dict[str, str]) -> List[Dict[str, Any]]:
     """
     Build CORE_FIXED rows with site-specific URLs from Cfg__account_id.
 
-    No storefront/admin product URL is hardcoded here.
+    No storefront/admin product or Collection URL is hardcoded here.
     """
     admin_product_base_url = _normalize_product_base_url(
         account_cfg.get("ADMIN_PRODUCT_BASE_URL", ""),
@@ -1704,10 +1827,20 @@ def _build_core_fixed_rows(account_cfg: Dict[str, str]) -> List[Dict[str, Any]]:
         account_cfg.get("STOREFRONT_PRODUCT_BASE_URL", ""),
         "STOREFRONT_PRODUCT_BASE_URL",
     )
+    admin_collection_base_url = (
+        _normalize_site_root_url(account_cfg.get("ADMIN_BASE_URL", ""), "ADMIN_BASE_URL")
+        + "/collections/"
+    )
+    storefront_collection_base_url = (
+        _normalize_site_root_url(account_cfg.get("STOREFRONT_BASE_URL", ""), "STOREFRONT_BASE_URL")
+        + "/collections/"
+    )
 
     replacements = {
         "{ADMIN_PRODUCT_BASE_URL}": admin_product_base_url,
         "{STOREFRONT_PRODUCT_BASE_URL}": storefront_product_base_url,
+        "{ADMIN_COLLECTION_BASE_URL}": admin_collection_base_url,
+        "{STOREFRONT_COLLECTION_BASE_URL}": storefront_collection_base_url,
     }
 
     out: List[Dict[str, Any]] = []
