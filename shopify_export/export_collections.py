@@ -1,902 +1,2209 @@
-# shopify_export/export_collections_consolecore_v20260526.py
+# -*- coding: utf-8 -*-
+"""
+job_name: config_fields
+module_path: shopify_ops/config_fields.py
+
+Multi-site Console Core version.
+Gold standard: PBS Cfg__Fields notebook logic.
+Collection-view support: dynamic Collection core/derived field registry.
+"""
 
 from __future__ import annotations
 
 import base64
-import csv
-import datetime as dt
-import io
 import json
-import time
-from dataclasses import dataclass
+import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-import gspread
 import requests
+import gspread
 from google.oauth2.service_account import Credentials
 from gspread.utils import rowcol_to_a1
 
 
-JOB_NAME = "export_collections"
-RUNLOG_TAB_NAME = "Ops__RunLog"
-
-EXPORT_LABEL_DEFAULT = "export_other"
-EXPORT_TAB_DEFAULT = "Collections"
-CFG_SITES_TAB = "Cfg__Sites"
-CFG_ACCOUNT_TAB = "Cfg__account_id"
-
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
+EXPECTED_HEADERS = [
+    "field_handle", "field_id", "display_name", "entity_type", "field_key",
+    "expr", "field_type", "data_type", "source_type", "namespace", "key",
+    "purpose_1", "purpose_2", "seq", "lookup_key", "join_key", "unit",
+    "suffix_role", "concept_id", "group", "applies_big_type", "applies_sub_type", "notes",
 ]
 
-MF_LIST: List[Tuple[str, str]] = [
-    ("custom", "category_name_1"),
-    ("custom", "category_name_2"),
-    ("custom", "category_name_3"),
-    ("custom", "category_name_4"),
-    ("custom", "category_id"),
-    ("custom", "collection_level"),
-    ("custom", "parent_category"),
-    ("custom", "top_category"),
-    ("custom", "breadcrumb_leaf"),
+ALLOWED_COLS = [
+    "display_name", "entity_type", "field_key", "expr", "field_type",
+    "data_type", "source_type", "namespace", "key",
 ]
 
-OUT_HEADER = [
-    "Category ID",
-    "collection_id",
-    "Category Name 1",
-    "Category Name 2",
-    "Category Name 3",
-    "Category Name 4",
-    "collection_name",
-    "handle",
-    "StoreFront URL",
-    "Admin URL",
-    "Theme template name（templateSuffix）",
-    "image url",
-    "Collection level",
-    "Parent Category",
-    "Top Category",
-    "Breadcrumb Leaf",
-    "SMART/MANUAL",
-    "all/any（对应 AND/OR）",
-    "规则1（column relation condition）",
-    "规则2",
-    "规则3",
-    "规则4",
-    "规则5",
-    "是否发布（Online Store）",
-    "最后两个更新时间（updatedAt）",
-]
+DEFAULT_MF_OWNER_TYPES = ["PRODUCT", "PRODUCTVARIANT", "COLLECTION", "PAGE", "ORDER", "CUSTOMER"]
+DEFAULT_PAGE_SIZE = 250
 
-RUNLOG_HEADER = [
-    "run_id",
-    "ts_cn",
-    "job_name",
-    "phase",
-    "log_type",
-    "status",
-    "site_code",
-    "entity_type",
-    "gid",
-    "field_key",
-    "rows_loaded",
-    "rows_pending",
-    "rows_recognized",
-    "rows_planned",
-    "rows_written",
-    "rows_skipped",
-    "message",
-    "error_reason",
-]
+CORE_FIXED = [{'display_name': 'Collection GID',
+  'entity_type': 'COLLECTION',
+  'field_key': 'core.gid',
+  'expr': 'collection.id',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Handle',
+  'entity_type': 'COLLECTION',
+  'field_key': 'core.handle',
+  'expr': 'collection.handle',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Image',
+  'entity_type': 'COLLECTION',
+  'field_key': 'core.image_url',
+  'expr': 'collection.image.url',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection ID (numeric)',
+  'entity_type': 'COLLECTION',
+  'field_key': 'core.legacy_id',
+  'expr': 'collection.legacyResourceId',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Name',
+  'entity_type': 'COLLECTION',
+  'field_key': 'core.title',
+  'expr': 'collection.title',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Description (HTML)',
+  'entity_type': 'COLLECTION',
+  'field_key': 'core.description_html',
+  'expr': 'collection.descriptionHtml',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Description (text)',
+  'entity_type': 'COLLECTION',
+  'field_key': 'core.description',
+  'expr': 'collection.description',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Theme Template',
+  'entity_type': 'COLLECTION',
+  'field_key': 'core.template_suffix',
+  'expr': 'collection.templateSuffix',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Updated At',
+  'entity_type': 'COLLECTION',
+  'field_key': 'core.updated_at',
+  'expr': 'collection.updatedAt',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Storefront URL',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.storefront_url',
+  'expr': '=IF(LEN({COLLECTION|core.handle}&"")=0,"","{STOREFRONT_COLLECTION_BASE_URL}"&{COLLECTION|core.handle})',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Admin URL',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.admin_url',
+  'expr': '=IF(LEN({COLLECTION|core.legacy_id}&"")=0,"","{ADMIN_COLLECTION_BASE_URL}"&{COLLECTION|core.legacy_id})',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Type',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.collection_type',
+  'expr': 'IF_NOT_NULL(collection.ruleSet,"SMART","MANUAL")',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Rule Logic',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.rule_logic',
+  'expr': 'IF(collection.ruleSet.appliedDisjunctively,"any","all")',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Rule 1',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.rule_1',
+  'expr': 'COLLECTION_RULE_TEXT(collection.ruleSet.rules[0])',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Rule 2',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.rule_2',
+  'expr': 'COLLECTION_RULE_TEXT(collection.ruleSet.rules[1])',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Rule 3',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.rule_3',
+  'expr': 'COLLECTION_RULE_TEXT(collection.ruleSet.rules[2])',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Rule 4',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.rule_4',
+  'expr': 'COLLECTION_RULE_TEXT(collection.ruleSet.rules[3])',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection Rule 5',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.rule_5',
+  'expr': 'COLLECTION_RULE_TEXT(collection.ruleSet.rules[4])',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Online Store Published',
+  'entity_type': 'COLLECTION',
+  'field_key': 'derived.online_store_published',
+  'expr': 'collection.publishedOnPublication',
+  'field_type': 'CALC',
+  'data_type': 'boolean',
+  'source_type': 'DERIVED',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Metaobject Entry Name',
+  'entity_type': 'METAOBJECT_ENTRY',
+  'field_key': 'core.display_name',
+  'expr': 'metaobject.displayName',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Metaobject Entry GID',
+  'entity_type': 'METAOBJECT_ENTRY',
+  'field_key': 'core.gid',
+  'expr': 'metaobject.id',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Metaobject Entry Handle',
+  'entity_type': 'METAOBJECT_ENTRY',
+  'field_key': 'core.handle',
+  'expr': 'metaobject.handle',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Metaobject Entry ID (numeric)',
+  'entity_type': 'METAOBJECT_ENTRY',
+  'field_key': 'core.metaobject.id_numeric',
+  'expr': 'GID_NUM({METAOBJECT_ENTRY|core.gid})',
+  'field_type': 'CALC',
+  'data_type': 'number',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Metaobject Type',
+  'entity_type': 'METAOBJECT_ENTRY',
+  'field_key': 'core.type',
+  'expr': 'metaobject.type',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Page GID',
+  'entity_type': 'PAGE',
+  'field_key': 'core.gid',
+  'expr': 'page.id',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Page Handle',
+  'entity_type': 'PAGE',
+  'field_key': 'core.handle',
+  'expr': 'page.handle',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Page ID (numeric)',
+  'entity_type': 'PAGE',
+  'field_key': 'core.page.id_numeric',
+  'expr': 'GID_NUM({PAGE|core.gid})',
+  'field_type': 'CALC',
+  'data_type': 'number',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Page Name',
+  'entity_type': 'PAGE',
+  'field_key': 'core.title',
+  'expr': 'page.title',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Page Body (HTML)',
+  'entity_type': 'PAGE',
+  'field_key': 'core.body_html',
+  'expr': 'page.body',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Created At',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.created_at',
+  'expr': 'product.createdAt',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Product GID',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.gid',
+  'expr': 'product.id',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Product Handle',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.handle',
+  'expr': 'product.handle',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Product ID (numeric)',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.legacy_id',
+  'expr': 'product.legacyResourceId',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Product Type',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.product_type',
+  'expr': 'product.productType',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Product Description (HTML)',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.description_html',
+  'expr': 'product.descriptionHtml',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Product Description (text)',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.description',
+  'expr': 'product.description',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Product SEO Title',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.seo_title',
+  'expr': 'product.seo.title',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Product SEO Description',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.seo_description',
+  'expr': 'product.seo.description',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Weight',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.weight',
+  'expr': 'variant.weight',
+  'field_type': 'RAW',
+  'data_type': 'number',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Weight Unit',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.weight_unit',
+  'expr': 'variant.weightUnit',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'P_Admin URL',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.product.admin_url',
+  'expr': '=IF(LEN({PRODUCT|core.legacy_id}&"")=0,"","{ADMIN_PRODUCT_BASE_URL}"&{PRODUCT|core.legacy_id})',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Image',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.product.image_preview',
+  'expr': '=IF(LEN({Product Image}&"")=0,"",IMAGE({Product Image}))',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Product Image',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.product.image_url',
+  'expr': 'product.media[0].preview.image.url',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+               {'display_name': 'Product Images URLs',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.product.images_urls',
+  'expr': 'product.media.nodes[].preview.image.url',
+  'field_type': 'RAW',
+  'data_type': 'list.string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Product Images JSON',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.product.images_json',
+  'expr': 'product.media.nodes[].preview.image.url',
+  'field_type': 'RAW',
+  'data_type': 'list.json',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Variant Product Images URLs',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.variant.product_images_urls',
+  'expr': 'variant.product.media.nodes[].preview.image.url',
+  'field_type': 'RAW',
+  'data_type': 'list.string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Variant Product Images JSON',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.variant.product_images_json',
+  'expr': 'variant.product.media.nodes[].preview.image.url',
+  'field_type': 'RAW',
+  'data_type': 'list.json',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Product Options (JSON)',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.product.options_json',
+  'expr': 'JSON({PRODUCT|raw.product.options})',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Storefront URL',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.product.storefront_url',
+  'expr': '=IF(LEN({PRODUCT|core.handle}&"")=0,"","{STOREFRONT_PRODUCT_BASE_URL}"&{PRODUCT|core.handle})',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Product Status',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.status',
+  'expr': 'product.status',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Synced At',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.synced_at',
+  'expr': '',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Tags',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.tags',
+  'expr': 'product.tags',
+  'field_type': 'RAW',
+  'data_type': 'list.string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Product Title',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.title',
+  'expr': 'product.title',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Updated At',
+  'entity_type': 'PRODUCT',
+  'field_key': 'core.updated_at',
+  'expr': 'product.updatedAt',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': '(raw) Product featured image url',
+  'entity_type': 'PRODUCT',
+  'field_key': 'raw.product.featured_image_url',
+  'expr': 'product.featuredImage.url',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': '(raw) Product media(0) preview url',
+  'entity_type': 'PRODUCT',
+  'field_key': 'raw.product.media0_preview_url',
+  'expr': 'product.media.nodes[0].preview.image.url',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': '(raw) Product.options',
+  'entity_type': 'PRODUCT',
+  'field_key': 'raw.product.options',
+  'expr': 'product.options',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Compare At Price',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.compare_at_price',
+  'expr': 'variant.compareAtPrice',
+  'field_type': 'RAW',
+  'data_type': 'number',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Variant Name',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.display_name',
+  'expr': 'variant.displayName',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Variant GID',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.gid',
+  'expr': 'variant.id',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Variant ID (numeric)',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.legacy_id',
+  'expr': 'variant.legacyResourceId',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Item_ID',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.item_id',
+  'expr': '="shopify_us_"&{PRODUCT|core.legacy_id}&"_"&{VARIANT|core.legacy_id}',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Price',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.price',
+  'expr': 'variant.price',
+  'field_type': 'RAW',
+  'data_type': 'number',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Product GID (parent)',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.product_gid',
+  'expr': 'variant.product.id',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Product Handle (parent)',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.product_handle',
+  'expr': 'variant.product.handle',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'SKU',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.sku',
+  'expr': 'variant.sku',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'V_Admin URL',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.variant.admin_url',
+  'expr': '=IF(LEN({VARIANT|core.legacy_id}&"")=0,"","{ADMIN_PRODUCT_BASE_URL}"&{PRODUCT|core.legacy_id}&"/variants/"&{VARIANT|core.legacy_id})',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Variant Image',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.variant.image_url',
+  'expr': 'COALESCE({VARIANT|raw.variant.image_url},{PRODUCT|core.product.image_url})',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Option1 Name',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.variant.option1_name',
+  'expr': 'GET({VARIANT|raw.variant.selected_options},1).name',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Option1 Value',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.variant.option1_value',
+  'expr': 'GET({VARIANT|raw.variant.selected_options},1).value',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Option2 Name',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.variant.option2_name',
+  'expr': 'GET({VARIANT|raw.variant.selected_options},2).name',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Option2 Value',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.variant.option2_value',
+  'expr': 'GET({VARIANT|raw.variant.selected_options},2).value',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Option3 Name',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.variant.option3_name',
+  'expr': 'GET({VARIANT|raw.variant.selected_options},3).name',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Option3 Value',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.variant.option3_value',
+  'expr': 'GET({VARIANT|raw.variant.selected_options},3).value',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Selected Options (JSON)',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.variant.selected_options_json',
+  'expr': 'JSON({VARIANT|raw.variant.selected_options})',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Storefront URL',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.variant.storefront_url',
+  'expr': '=IF(LEN({PRODUCT|core.handle}&"")=0,"","{STOREFRONT_PRODUCT_BASE_URL}"&{PRODUCT|core.handle})',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': '(raw) Variant image url',
+  'entity_type': 'VARIANT',
+  'field_key': 'raw.variant.image_url',
+  'expr': 'variant.image.url',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': '(raw) Variant media(0) preview url',
+  'entity_type': 'VARIANT',
+  'field_key': 'raw.variant.media0_preview_url',
+  'expr': 'variant.media.nodes[0].preview.image.url',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': '(raw) SelectedOptions',
+  'entity_type': 'VARIANT',
+  'field_key': 'raw.variant.selected_options',
+  'expr': 'variant.selectedOptions',
+  'field_type': 'RAW',
+  'data_type': 'list.json',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Final Price-V',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.final_price',
+  'expr': '=IF(LEN({VARIANT|v_mf.custom.sku_unit_price_v}&"")=0,"",IFERROR(ROUND(VALUE({VARIANT|v_mf.custom.sku_unit_price_v})*IF(LEN({VARIANT|v_mf.custom.settlement_quantity}&"")=0,1,VALUE({VARIANT|v_mf.custom.settlement_quantity}))*IF(LEN({VARIANT|v_mf.custom.multiplier}&"")=0,1,VALUE({VARIANT|v_mf.custom.multiplier})),2),""))',
+  'field_type': 'CALC',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Customer GID',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.gid',
+  'expr': 'customer.id',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Customer ID (numeric)',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.legacy_id',
+  'expr': 'customer.legacyResourceId',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Customer Display Name',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.display_name',
+  'expr': 'customer.displayName',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Customer First Name',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.first_name',
+  'expr': 'customer.firstName',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Customer Last Name',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.last_name',
+  'expr': 'customer.lastName',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Customer Email',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.email',
+  'expr': 'customer.defaultEmailAddress.emailAddress',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Customer Phone',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.phone',
+  'expr': 'customer.defaultPhoneNumber.phoneNumber',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Customer Tags',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.tags',
+  'expr': 'customer.tags',
+  'field_type': 'RAW',
+  'data_type': 'list.string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Customer Note',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.note',
+  'expr': 'customer.note',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Amount Spent',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.amount_spent',
+  'expr': 'customer.amountSpent.amount',
+  'field_type': 'RAW',
+  'data_type': 'number',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Amount Spent Currency',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.amount_spent_currency',
+  'expr': 'customer.amountSpent.currencyCode',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Orders Count',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.orders_count',
+  'expr': 'customer.numberOfOrders',
+  'field_type': 'RAW',
+  'data_type': 'number',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Customer Since',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.lifetime_duration',
+  'expr': 'customer.lifetimeDuration',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Customer Created At',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.created_at',
+  'expr': 'customer.createdAt',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Customer Updated At',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.updated_at',
+  'expr': 'customer.updatedAt',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Customer State',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.state',
+  'expr': 'customer.state',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Verified Email',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.verified_email',
+  'expr': 'customer.verifiedEmail',
+  'field_type': 'RAW',
+  'data_type': 'boolean',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Email Marketing State',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.email_marketing_state',
+  'expr': 'customer.defaultEmailAddress.marketingState',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'SMS Marketing State',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.sms_marketing_state',
+  'expr': 'customer.defaultPhoneNumber.marketingState',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Default Address GID',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.default_address_gid',
+  'expr': 'customer.defaultAddress.id',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Default Address Name',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.default_address_name',
+  'expr': 'customer.defaultAddress.name',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Default Address First Name',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.default_address_first_name',
+  'expr': 'customer.defaultAddress.firstName',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Default Address Last Name',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.default_address_last_name',
+  'expr': 'customer.defaultAddress.lastName',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Default Address Company',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.default_address_company',
+  'expr': 'customer.defaultAddress.company',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Default Address Line 1',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.default_address_line1',
+  'expr': 'customer.defaultAddress.address1',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Default Address Line 2',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.default_address_line2',
+  'expr': 'customer.defaultAddress.address2',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Default Address City',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.default_address_city',
+  'expr': 'customer.defaultAddress.city',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Default Address Province',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.default_address_province',
+  'expr': 'customer.defaultAddress.province',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Default Address Province Code',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.default_address_province_code',
+  'expr': 'customer.defaultAddress.provinceCode',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Default Address ZIP',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.default_address_zip',
+  'expr': 'customer.defaultAddress.zip',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Default Address Country',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.default_address_country',
+  'expr': 'customer.defaultAddress.country',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Default Address Country Code',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.default_address_country_code',
+  'expr': 'customer.defaultAddress.countryCodeV2',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Default Address Phone',
+  'entity_type': 'CUSTOMER',
+  'field_key': 'core.default_address_phone',
+  'expr': 'customer.defaultAddress.phone',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Order GID',
+  'entity_type': 'ORDER',
+  'field_key': 'core.gid',
+  'expr': 'order.id',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Order ID (numeric)',
+  'entity_type': 'ORDER',
+  'field_key': 'core.legacy_id',
+  'expr': 'order.legacyResourceId',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Order Name',
+  'entity_type': 'ORDER',
+  'field_key': 'core.name',
+  'expr': 'order.name',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Created At',
+  'entity_type': 'ORDER',
+  'field_key': 'core.created_at',
+  'expr': 'order.createdAt',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Updated At',
+  'entity_type': 'ORDER',
+  'field_key': 'core.updated_at',
+  'expr': 'order.updatedAt',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Financial Status',
+  'entity_type': 'ORDER',
+  'field_key': 'core.display_financial_status',
+  'expr': 'order.displayFinancialStatus',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Fulfillment Status',
+  'entity_type': 'ORDER',
+  'field_key': 'core.display_fulfillment_status',
+  'expr': 'order.displayFulfillmentStatus',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Currency Code',
+  'entity_type': 'ORDER',
+  'field_key': 'core.currency_code',
+  'expr': 'order.currencyCode',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Total Price',
+  'entity_type': 'ORDER',
+  'field_key': 'core.total_price_amount',
+  'expr': 'order.totalPriceSet.shopMoney.amount',
+  'field_type': 'RAW',
+  'data_type': 'number',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Subtotal Price',
+  'entity_type': 'ORDER',
+  'field_key': 'core.subtotal_price_amount',
+  'expr': 'order.subtotalPriceSet.shopMoney.amount',
+  'field_type': 'RAW',
+  'data_type': 'number',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Total Tax',
+  'entity_type': 'ORDER',
+  'field_key': 'core.total_tax_amount',
+  'expr': 'order.totalTaxSet.shopMoney.amount',
+  'field_type': 'RAW',
+  'data_type': 'number',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Total Discounts',
+  'entity_type': 'ORDER',
+  'field_key': 'core.total_discounts_amount',
+  'expr': 'order.totalDiscountsSet.shopMoney.amount',
+  'field_type': 'RAW',
+  'data_type': 'number',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Total Shipping',
+  'entity_type': 'ORDER',
+  'field_key': 'core.total_shipping_amount',
+  'expr': 'order.totalShippingPriceSet.shopMoney.amount',
+  'field_type': 'RAW',
+  'data_type': 'number',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Email',
+  'entity_type': 'ORDER',
+  'field_key': 'core.email',
+  'expr': 'order.email',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Customer Display Name',
+  'entity_type': 'ORDER',
+  'field_key': 'core.customer_display_name',
+  'expr': 'order.customer.displayName',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Tags',
+  'entity_type': 'ORDER',
+  'field_key': 'core.tags',
+  'expr': 'order.tags',
+  'field_type': 'RAW',
+  'data_type': 'list.string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Tax Lines (JSON)',
+  'entity_type': 'ORDER',
+  'field_key': 'core.tax_lines_json',
+  'expr': 'order.taxLines',
+  'field_type': 'RAW',
+  'data_type': 'list.json',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Discount Applications (JSON)',
+  'entity_type': 'ORDER',
+  'field_key': 'core.discount_applications_json',
+  'expr': 'order.discountApplications',
+  'field_type': 'RAW',
+  'data_type': 'list.json',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Lines (JSON)',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_lines_json',
+  'expr': 'order.shippingLines',
+  'field_type': 'RAW',
+  'data_type': 'list.json',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Refunds (JSON)',
+  'entity_type': 'ORDER',
+  'field_key': 'core.refunds_json',
+  'expr': 'order.refunds',
+  'field_type': 'RAW',
+  'data_type': 'list.json',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'LineItem Discount Allocations (JSON)',
+  'entity_type': 'ORDER',
+  'field_key': 'core.lineitem_discount_allocations_json',
+  'expr': 'order.lineItems[].discountAllocations',
+  'field_type': 'RAW',
+  'data_type': 'list.json',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'LineItem Discounted Total Amount',
+  'entity_type': 'ORDER',
+  'field_key': 'core.lineitem_discounted_total_amount',
+  'expr': 'order.lineItems[].discountedTotalSet.shopMoney.amount',
+  'field_type': 'RAW',
+  'data_type': 'number',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Refund RefundLineItems (JSON)',
+  'entity_type': 'ORDER',
+  'field_key': 'core.refund_refundlineitems_json',
+  'expr': 'order.refunds[].refundLineItems',
+  'field_type': 'RAW',
+  'data_type': 'list.json',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Address Name',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_address_name',
+  'expr': 'order.shippingAddress.name',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Address First Name',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_address_first_name',
+  'expr': 'order.shippingAddress.firstName',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Address Last Name',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_address_last_name',
+  'expr': 'order.shippingAddress.lastName',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Address Company',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_address_company',
+  'expr': 'order.shippingAddress.company',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Address Line 1',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_address_line1',
+  'expr': 'order.shippingAddress.address1',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Address Line 2',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_address_line2',
+  'expr': 'order.shippingAddress.address2',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Address City',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_address_city',
+  'expr': 'order.shippingAddress.city',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Address Province',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_address_province',
+  'expr': 'order.shippingAddress.province',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Address Province Code',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_address_province_code',
+  'expr': 'order.shippingAddress.provinceCode',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Address ZIP',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_address_zip',
+  'expr': 'order.shippingAddress.zip',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Address Country',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_address_country',
+  'expr': 'order.shippingAddress.country',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Address Country Code',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_address_country_code',
+  'expr': 'order.shippingAddress.countryCodeV2',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Address Phone',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_address_phone',
+  'expr': 'order.shippingAddress.phone',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Status',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_status',
+  'expr': 'order.displayFulfillmentStatus',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Fulfillments Count',
+  'entity_type': 'ORDER',
+  'field_key': 'core.fulfillments_count',
+  'expr': 'order.fulfillmentsCount.count',
+  'field_type': 'RAW',
+  'data_type': 'number',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Fulfillments (JSON)',
+  'entity_type': 'ORDER',
+  'field_key': 'core.fulfillments_json',
+  'expr': 'order.fulfillments',
+  'field_type': 'RAW',
+  'data_type': 'list.json',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Status List (Fulfillment Display Status)',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_status_list',
+  'expr': 'order.fulfillments[].displayStatus',
+  'field_type': 'RAW',
+  'data_type': 'list.string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Status Raw List',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_status_raw_list',
+  'expr': 'order.fulfillments[].status',
+  'field_type': 'RAW',
+  'data_type': 'list.string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Tracking Companies (JSON)',
+  'entity_type': 'ORDER',
+  'field_key': 'core.tracking_companies_json',
+  'expr': 'order.fulfillments[].trackingInfo[].company',
+  'field_type': 'RAW',
+  'data_type': 'list.string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Tracking Numbers (JSON)',
+  'entity_type': 'ORDER',
+  'field_key': 'core.tracking_numbers_json',
+  'expr': 'order.fulfillments[].trackingInfo[].number',
+  'field_type': 'RAW',
+  'data_type': 'list.string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Tracking URLs (JSON)',
+  'entity_type': 'ORDER',
+  'field_key': 'core.tracking_urls_json',
+  'expr': 'order.fulfillments[].trackingInfo[].url',
+  'field_type': 'RAW',
+  'data_type': 'list.string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Events (JSON)',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_events_json',
+  'expr': 'order.fulfillments[].events',
+  'field_type': 'RAW',
+  'data_type': 'list.json',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Event Status List',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_event_status_list',
+  'expr': 'order.fulfillments[].events[].status',
+  'field_type': 'RAW',
+  'data_type': 'list.string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Shipping Event Happened At List',
+  'entity_type': 'ORDER',
+  'field_key': 'core.shipping_event_happened_at_list',
+  'expr': 'order.fulfillments[].events[].happenedAt',
+  'field_type': 'RAW',
+  'data_type': 'list.string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Cost',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.cost',
+  'expr': 'variant.inventoryItem.unitCost.amount',
+  'field_type': 'RAW',
+  'data_type': 'number',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Cost Currency',
+  'entity_type': 'VARIANT',
+  'field_key': 'core.cost_currency',
+  'expr': 'variant.inventoryItem.unitCost.currencyCode',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''}]
 
 
-@dataclass
-class ExportConfig:
-    site_code: str
-    shop_domain: str
-    api_version: str
-    storefront_base_url: str
-    console_core_url: str
-    gsheet_sa_b64: str
-    shopify_token: str
-
-    export_label: str = EXPORT_LABEL_DEFAULT
-    export_tab_name: str = EXPORT_TAB_DEFAULT
-    runlog_label: str = "runlog_sheet"
-
-    write_mode: str = "REPLACE"  # REPLACE / APPEND
-    write_header_and_desc: bool = False
-
-    status_enabled: bool = True
-    online_store_publication_id: str = ""
-    auto_find_online_store_publication_id: bool = True
-
-    filter_enabled: bool = False
-    filter_namespace: str = "custom"
-    filter_key: str = "top_category"
-    filter_value: str = "PEX"
-    filter_match_mode: str = "EQUALS"  # EQUALS / CONTAINS
-
-    page_size: int = 250
-    write_chunk_rows: int = 2000
-    retry: int = 6
-    sleep_every_n_calls: int = 20
-    sleep_seconds: float = 1.0
-    request_timeout: int = 60
+class ConfigFieldsError(RuntimeError):
+    pass
 
 
-class ShopifyClient:
-    def __init__(self, shop_domain: str, api_version: str, access_token: str, retry: int = 6, timeout: int = 60):
-        self.url = f"https://{shop_domain}/admin/api/{api_version}/graphql.json"
-        self.headers = {
-            "X-Shopify-Access-Token": access_token.strip(),
-            "Content-Type": "application/json",
-        }
-        self.retry = retry
-        self.timeout = timeout
-        self.call_count = 0
-
-    def gql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        payload = {"query": query, "variables": variables or {}}
-        last_err = None
-
-        for i in range(self.retry):
-            try:
-                r = requests.post(self.url, headers=self.headers, json=payload, timeout=self.timeout)
-                if r.status_code == 429:
-                    wait_s = round(1.2 * (i + 1), 2)
-                    print(f"⚠️ Shopify 429，等待 {wait_s}s 后重试（{i + 1}/{self.retry}）")
-                    time.sleep(1.2 * (i + 1))
-                    continue
-                r.raise_for_status()
-                data = r.json()
-                if data.get("errors"):
-                    raise RuntimeError(str(data["errors"]))
-                self.call_count += 1
-                return data["data"]
-            except Exception as e:
-                last_err = e
-                wait_s = round(1.0 * (i + 1), 2)
-                print(f"⚠️ GraphQL 请求失败，{wait_s}s 后重试（{i + 1}/{self.retry}）：{e}")
-                time.sleep(1.0 * (i + 1))
-
-        raise RuntimeError(f"GraphQL failed after retries. Last error: {last_err}")
+def namespace_blocked(namespace: str) -> bool:
+    """
+    Confirmed rule:
+    If namespace contains "shopify" anywhere, case-insensitive, skip it.
+    """
+    return "shopify" in str(namespace or "").strip().lower()
 
 
-def now_cn() -> str:
-    return (dt.datetime.utcnow() + dt.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+def _now_cn_like() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def now_run_id() -> str:
-    return "export_collections_" + (dt.datetime.utcnow() + dt.timedelta(hours=8)).strftime("%Y%m%d_%H%M%S")
+def _get_colab_secret(secret_name: str) -> str:
+    if not secret_name:
+        raise ConfigFieldsError("Secret name is empty.")
+    try:
+        from google.colab import userdata
+    except Exception as e:
+        raise ConfigFieldsError(
+            "google.colab.userdata is not available. This job is designed to run in Colab with Colab Secrets."
+        ) from e
+
+    value = userdata.get(secret_name)
+    if not value:
+        raise ConfigFieldsError(f"Colab Secret not found or empty: {secret_name}")
+    return value
 
 
-def safe_str(x: Any) -> str:
-    return "" if x is None else str(x)
+def _build_gspread_client_from_b64_secret(secret_name: str) -> gspread.Client:
+    sa_b64 = _get_colab_secret(secret_name)
+    try:
+        sa_info = json.loads(base64.b64decode(sa_b64).decode("utf-8"))
+    except Exception as e:
+        raise ConfigFieldsError(f"Failed to decode Google SA base64 JSON from secret: {secret_name}") from e
 
-
-def strip_url(x: str) -> str:
-    return (x or "").strip()
-
-
-def build_admin_url(shop_domain: str, collection_id: str) -> str:
-    handle = shop_domain.split(".")[0]
-    return f"https://admin.shopify.com/store/{handle}/collections/{collection_id}"
-
-
-def build_storefront_url(base: str, handle: str) -> str:
-    return f"{base.strip().rstrip('/')}/collections/{handle}"
-
-
-def rule_logic_from_applied_disjunctively(v: Optional[bool]) -> str:
-    if v is None:
-        return ""
-    return "any" if bool(v) else "all"
-
-
-def friendly_rule(col: Any, rel: Any, cond: Any) -> str:
-    if col is None or rel is None:
-        return ""
-    return f"{str(col).lower()} {str(rel).lower()} {(cond or '').strip()}".strip()
-
-
-def build_gspread_client(gsheet_sa_b64: str):
-    sa_json = json.loads(base64.b64decode(gsheet_sa_b64).decode("utf-8"))
-    creds = Credentials.from_service_account_info(sa_json, scopes=SCOPES)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
     return gspread.authorize(creds)
 
 
-def _clean_header_row(headers: List[str]) -> List[str]:
-    return [(h or "").strip() for h in headers]
+def _require_worksheet(sh: gspread.Spreadsheet, tab_name: str):
+    try:
+        return sh.worksheet(tab_name)
+    except Exception as e:
+        raise ConfigFieldsError(f"Worksheet not found: {tab_name} in spreadsheet: {getattr(sh, 'url', '')}") from e
 
 
-def _records_from_values(values: List[List[Any]]) -> List[Dict[str, str]]:
-    """
-    Convert worksheet values into records without using get_all_records().
-    This avoids gspread duplicate-header crashes and gives a clearer error.
-    """
+def _rows_as_dicts(ws) -> List[Dict[str, str]]:
+    values = ws.get_all_values()
     if not values:
         return []
-
-    headers = _clean_header_row([safe_str(x) for x in values[0]])
-    if not any(headers):
-        return []
-
-    dupes = sorted({h for h in headers if h and headers.count(h) > 1})
-    if dupes:
-        raise RuntimeError(f"Worksheet header row contains duplicate columns: {dupes}")
-
-    out: List[Dict[str, str]] = []
+    header = [str(h or "").strip() for h in values[0]]
+    rows: List[Dict[str, str]] = []
     for raw in values[1:]:
-        row = list(raw) + [""] * max(0, len(headers) - len(raw))
-        rec = {headers[i]: safe_str(row[i]).strip() for i in range(len(headers)) if headers[i]}
-        if any(v != "" for v in rec.values()):
-            out.append(rec)
-    return out
+        row = {}
+        for i, h in enumerate(header):
+            if not h:
+                continue
+            row[h] = str(raw[i] if i < len(raw) else "").strip()
+        if any(v for v in row.values()):
+            rows.append(row)
+    return rows
 
 
-def read_worksheet_records_by_title(gc, sheet_url: str, worksheet_title: str) -> List[Dict[str, str]]:
+def _read_account_config(console_sh, tab_name: str, site_code: str) -> Dict[str, str]:
     """
-    Authorized Google Sheets read.
-    Do not use /gviz/tq?tqx=out:csv because private sheets return 401.
+    Read Cfg__account_id.
+
+    Supported Console Core shapes:
+    1) Header table: key | value
+    2) Header table: site_code | key | value
+    3) No-header two-column table: A=key, B=value
+
+    Current PBS Console Core uses shape #3.
     """
-    book = gc.open_by_url(sheet_url)
-    ws = book.worksheet(worksheet_title)
-    return _records_from_values(ws.get_all_values())
+    ws = _require_worksheet(console_sh, tab_name)
+    values = ws.get_all_values()
+    if not values:
+        raise ConfigFieldsError(f"{tab_name} is empty.")
 
+    cfg: Dict[str, str] = {}
+    header = [str(x or "").strip() for x in values[0]]
+    header_lc = [x.lower() for x in header]
 
-def read_worksheet_values_by_title(gc, sheet_url: str, worksheet_title: str) -> List[List[str]]:
-    book = gc.open_by_url(sheet_url)
-    ws = book.worksheet(worksheet_title)
-    return ws.get_all_values()
+    # Shape 1 / 2: header-based table
+    if "key" in header_lc and "value" in header_lc:
+        key_idx = header_lc.index("key")
+        value_idx = header_lc.index("value")
+        site_idx = header_lc.index("site_code") if "site_code" in header_lc else None
 
+        for raw in values[1:]:
+            if not any(str(x or "").strip() for x in raw):
+                continue
+            row = raw + [""] * max(0, len(header) - len(raw))
 
-def find_site_label_url(gc, console_core_url: str, site_code: str, label: str) -> str:
-    rows = read_worksheet_records_by_title(gc, console_core_url, CFG_SITES_TAB)
-    site_code = (site_code or "").strip().upper()
-    label = (label or "").strip()
-
-    for row in rows:
-        if (row.get("site_code", "") or "").strip().upper() == site_code and (row.get("label", "") or "").strip() == label:
-            url = strip_url(row.get("sheet_url", ""))
-            if not url:
-                raise RuntimeError(f"Cfg__Sites 找到行但 sheet_url 为空: site_code={site_code}, label={label}")
-            return url
-
-    raise RuntimeError(f"Cfg__Sites 未找到 sheet_url: site_code={site_code}, label={label}")
-
-
-def _looks_like_header(row: List[str]) -> bool:
-    normalized = {(x or "").strip().lower() for x in row}
-    key_names = {"key", "config_key", "field_key", "name", "setting", "account_key"}
-    value_names = {"value", "config_value", "field_value", "setting_value", "account_value"}
-    return bool(normalized & key_names) and bool(normalized & value_names)
-
-
-def _first_existing_key(d: Dict[str, str], keys: List[str]) -> str:
-    for k in keys:
-        if k in d:
-            return k
-    return ""
-
-
-def parse_cfg_account_values(values: List[List[str]], site_code: str = "") -> Dict[str, str]:
-    """
-    Supports both common Cfg__account_id shapes:
-    1) key/value without header:
-       SHOP_DOMAIN | aeqjdw-r1.myshopify.com
-    2) table with header:
-       site_code | config_key | config_value
-       NRP       | SHOP_DOMAIN | ...
-    """
-    rows = [[safe_str(c).strip() for c in r] for r in values if any(safe_str(c).strip() for c in r)]
-    if not rows:
-        raise RuntimeError(f"{CFG_ACCOUNT_TAB} 为空")
-
-    site_code_norm = (site_code or "").strip().upper()
-
-    # Header table mode.
-    if _looks_like_header(rows[0]):
-        headers = _clean_header_row(rows[0])
-        dupes = sorted({h for h in headers if h and headers.count(h) > 1})
-        if dupes:
-            raise RuntimeError(f"{CFG_ACCOUNT_TAB} 表头重复: {dupes}")
-
-        records = _records_from_values(rows)
-        key_col = ""
-        value_col = ""
-        site_col = ""
-
-        lower_to_header = {h.lower(): h for h in headers if h}
-        for x in ["key", "config_key", "field_key", "name", "setting", "account_key"]:
-            if x in lower_to_header:
-                key_col = lower_to_header[x]
-                break
-        for x in ["value", "config_value", "field_value", "setting_value", "account_value"]:
-            if x in lower_to_header:
-                value_col = lower_to_header[x]
-                break
-        for x in ["site_code", "account_id", "site"]:
-            if x in lower_to_header:
-                site_col = lower_to_header[x]
-                break
-
-        if not key_col or not value_col:
-            raise RuntimeError(f"{CFG_ACCOUNT_TAB} 表头模式下必须包含 key/value 类字段")
-
-        cfg: Dict[str, str] = {}
-        for rec in records:
-            if site_col:
-                row_site = (rec.get(site_col, "") or "").strip().upper()
-                if row_site and site_code_norm and row_site != site_code_norm:
+            if site_idx is not None:
+                row_site = str(row[site_idx] or "").strip()
+                if row_site and row_site.upper() != site_code.upper():
                     continue
-            k = (rec.get(key_col, "") or "").strip()
-            v = (rec.get(value_col, "") or "").strip()
+
+            k = str(row[key_idx] or "").strip()
+            v = str(row[value_idx] or "").strip()
             if k:
                 cfg[k] = v
-        return cfg
 
-    # Simple key/value mode.
-    cfg = {}
-    for row in rows:
-        if len(row) < 2:
-            continue
-        k = (row[0] or "").strip()
-        v = (row[1] or "").strip()
-        if k:
+    # Shape 3: no-header A=key, B=value
+    else:
+        for raw in values:
+            if len(raw) < 2:
+                continue
+            k = str(raw[0] or "").strip()
+            v = str(raw[1] or "").strip()
+            if not k:
+                continue
+            if k.lower() in {"key", "site_code"}:
+                continue
             cfg[k] = v
-    return cfg
-
-
-def resolve_account_config(gc, console_core_url: str, site_code: str) -> Dict[str, str]:
-    values = read_worksheet_values_by_title(gc, console_core_url, CFG_ACCOUNT_TAB)
-    cfg = parse_cfg_account_values(values, site_code=site_code)
 
     required = [
         "SHOP_DOMAIN",
         "SHOPIFY_API_VERSION",
-        "STOREFRONT_BASE_URL",
         "GSHEET_SA_B64_SECRET",
         "SHOPIFY_TOKEN_SECRET",
+        "STOREFRONT_BASE_URL",
+        "ADMIN_BASE_URL",
+        "STOREFRONT_PRODUCT_BASE_URL",
+        "ADMIN_PRODUCT_BASE_URL",
     ]
-    missing = [k for k in required if not (cfg.get(k) or "").strip()]
+    missing = [k for k in required if not cfg.get(k)]
     if missing:
-        raise RuntimeError(f"{CFG_ACCOUNT_TAB} 缺少必填配置: {missing}")
-
+        raise ConfigFieldsError(f"{tab_name} missing required account config keys: {missing}")
     return cfg
 
-
-def ensure_tab(ws_book, tab_name: str):
-    try:
-        return ws_book.worksheet(tab_name)
-    except Exception:
-        print(f"⚠️ 输出 tab 不存在，自动创建：{tab_name}")
-        return ws_book.add_worksheet(title=tab_name, rows=1000, cols=30)
-
-
-def write_table(ws, rows: List[List[Any]], write_mode: str = "REPLACE"):
-    write_mode = (write_mode or "REPLACE").upper().strip()
-    if write_mode == "REPLACE":
-        print(f"🧹 清空目标表：{ws.title}")
-        ws.clear()
-        if rows:
-            print(f"✍️ 一次性写入 {len(rows)} 行")
-            ws.update("A1", rows, value_input_option="RAW")
-    elif write_mode == "APPEND":
-        if rows:
-            print(f"➕ 追加写入 {len(rows)} 行")
-            ws.append_rows(rows, value_input_option="RAW")
-    else:
-        raise RuntimeError(f"不支持 WRITE_MODE: {write_mode}")
-
-
-def append_rows_chunked(ws, rows: List[List[Any]], chunk_size: int = 2000):
+def _read_site_route(console_sh, tab_name: str, site_code: str, label: str) -> Dict[str, str]:
+    ws = _require_worksheet(console_sh, tab_name)
+    rows = _rows_as_dicts(ws)
     if not rows:
-        print("ℹ️ 没有可追加的数据")
-        return
-    total = len(rows)
-    batch_total = (total + chunk_size - 1) // chunk_size
-    print(f"✍️ 开始分块追加：total_rows={total} | batches={batch_total} | chunk_size={chunk_size}")
-    for i in range(0, total, chunk_size):
-        chunk = rows[i:i + chunk_size]
-        batch_no = i // chunk_size + 1
-        print(f"   - append batch {batch_no}/{batch_total} | rows={len(chunk)}")
-        ws.append_rows(chunk, value_input_option="RAW")
+        raise ConfigFieldsError(f"{tab_name} is empty.")
 
+    required_cols = ["site_code", "sheet_url", "label"]
+    available = set(rows[0].keys())
+    missing_cols = [c for c in required_cols if c not in available]
+    if missing_cols:
+        raise ConfigFieldsError(f"{tab_name} missing required columns: {missing_cols}")
 
-def build_collections_query(include_status: bool, include_filter_mf: bool) -> str:
-    mf_blocks = []
-    for ns, key in MF_LIST:
-        alias = f"mf_{ns}_{key}".replace("-", "_")
-        mf_blocks.append(
-            f'{alias}: metafield(namespace: "{ns}", key: "{key}") {{ type value }}'
-        )
-
-    filter_block = ""
-    if include_filter_mf:
-        filter_block = """
-        __filter_mf: metafield(namespace: $mfNs, key: $mfKey) {
-          type
-          value
-          reference { id }
-        }
-        """.strip()
-
-    node_fields = [
-        "id",
-        "legacyResourceId",
-        "handle",
-        "title",
-        "updatedAt",
-        "templateSuffix",
-        "image { url }",
-        """
-        ruleSet {
-          appliedDisjunctively
-          rules { column relation condition }
-        }
-        """.strip(),
-        "\n".join(mf_blocks),
-        filter_block,
+    matches = [
+        r for r in rows
+        if (r.get("site_code") or "").strip().upper() == site_code.upper()
+        and (r.get("label") or "").strip() == label
     ]
+    if not matches:
+        raise ConfigFieldsError(f"{tab_name} cannot find route: site_code={site_code}, label={label}")
+    if len(matches) > 1:
+        raise ConfigFieldsError(f"{tab_name} has duplicate routes: site_code={site_code}, label={label}")
 
-    if include_status:
-        node_fields.append("publishedOnPublication(publicationId: $pubId)")
-
-    node_block = "\n".join([x for x in node_fields if x])
-
-    var_defs = ["$first: Int!", "$after: String"]
-    if include_status:
-        var_defs.append("$pubId: ID!")
-    if include_filter_mf:
-        var_defs.append("$mfNs: String!")
-        var_defs.append("$mfKey: String!")
-
-    q = (
-        "query(" + ", ".join(var_defs) + "){\n"
-        "  collections(first: $first, after: $after){\n"
-        "    edges{\n"
-        "      node{\n"
-        f"{node_block}\n"
-        "      }\n"
-        "    }\n"
-        "    pageInfo { hasNextPage endCursor }\n"
-        "  }\n"
-        "}\n"
-    )
-    return q
+    route = matches[0]
+    if not route.get("sheet_url"):
+        raise ConfigFieldsError(f"{tab_name} route has empty sheet_url: site_code={site_code}, label={label}")
+    return route
 
 
-def match_metafield(mf: Optional[Dict[str, Any]], expected: str, mode: str) -> bool:
-    if not mf:
-        return False
+def _build_shopify_client(shop_domain: str, api_version: str, token_secret_name: str):
+    token = _get_colab_secret(token_secret_name)
+    graphql_url = f"https://{shop_domain}/admin/api/{api_version}/graphql.json"
+    headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
 
-    expected = (expected or "").strip()
-    mode = (mode or "EQUALS").upper().strip()
+    def gql(query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        resp = requests.post(
+            graphql_url,
+            headers=headers,
+            json={"query": query, "variables": variables or {}},
+            timeout=60,
+        )
+        try:
+            data = resp.json()
+        except Exception as e:
+            raise ConfigFieldsError(f"Shopify GraphQL returned non-JSON response: HTTP {resp.status_code}") from e
 
-    value = (mf.get("value") or "").strip()
-    ref = mf.get("reference") or {}
-    ref_id = (ref.get("id") or "").strip()
-    candidates = [x for x in [value, ref_id] if x]
+        if resp.status_code >= 400:
+            raise ConfigFieldsError(f"Shopify GraphQL HTTP {resp.status_code}: {data}")
+        if data.get("errors"):
+            raise ConfigFieldsError(f"Shopify GraphQL errors: {data['errors']}")
+        if "data" not in data:
+            raise ConfigFieldsError(f"Shopify GraphQL response missing data: {data}")
+        return data["data"]
 
-    if mode == "CONTAINS":
-        return any(expected.lower() in x.lower() for x in candidates)
-
-    return any(x == expected for x in candidates)
-
-
-def get_mf_value(node: Dict[str, Any], ns: str, key: str) -> str:
-    alias = f"mf_{ns}_{key}".replace("-", "_")
-    mf = node.get(alias) or {}
-    return safe_str(mf.get("value"))
+    return gql
 
 
-def resolve_online_store_publication_id(client: ShopifyClient, cfg: ExportConfig) -> Tuple[str, List[Tuple[str, str]]]:
-    if not cfg.status_enabled:
-        return "", []
+Q_METAFIELD_DEFS = """
+query MetafieldDefinitions($ownerType: MetafieldOwnerType!, $first: Int!, $after: String) {
+  metafieldDefinitions(ownerType: $ownerType, first: $first, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      name
+      namespace
+      key
+      type { name }
+      ownerType
+    }
+  }
+}
+"""
 
-    q = """
-    query($first:Int!){
-      publications(first:$first){
-        edges{
-          node{
-            id
-            name
-          }
-        }
+Q_METAOBJECT_DEFS = """
+query MetaobjectDefinitions($first: Int!, $after: String) {
+  metaobjectDefinitions(first: $first, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      name
+      type
+      fieldDefinitions {
+        name
+        key
+        required
+        type { name }
       }
     }
-    """
-    data = client.gql(q, {"first": 100})
-    pubs = [(e["node"].get("id", ""), e["node"].get("name", "")) for e in data["publications"]["edges"]]
-    pub_ids = {pid for pid, _ in pubs}
-
-    picked = ""
-    for pid, name in pubs:
-        if (name or "").strip().lower() == "online store":
-            picked = pid
-            break
-
-    pub_id = (cfg.online_store_publication_id or "").strip()
-    if (not pub_id) and cfg.auto_find_online_store_publication_id:
-        pub_id = picked
-
-    if pub_id and pub_id not in pub_ids:
-        pub_id = ""
-
-    return pub_id, pubs
+  }
+}
+"""
 
 
-def export_rows(client: ShopifyClient, cfg: ExportConfig, pub_id: str) -> Dict[str, Any]:
-    include_status = bool(cfg.status_enabled and pub_id)
-    include_filter_mf = bool(cfg.filter_enabled)
-
-    q = build_collections_query(include_status=include_status, include_filter_mf=include_filter_mf)
-
-    all_rows: List[List[Any]] = []
-    preview_rows: List[List[Any]] = []
-    loaded = 0
-    kept = 0
-    skipped = 0
-    page_count = 0
+def _fetch_all_metafield_definitions(gql, owner_type: str, page_size: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
     after = None
-
-    print("🚀 开始拉取 Collections")
-    print(
-        f"   - page_size={cfg.page_size}"
-        f" | status_enabled={include_status}"
-        f" | filter_enabled={include_filter_mf}"
-    )
-    if include_filter_mf:
-        print(
-            f"   - filter: {cfg.filter_namespace}.{cfg.filter_key} "
-            f"{cfg.filter_match_mode} {cfg.filter_value}"
-        )
-
     while True:
-        variables: Dict[str, Any] = {
-            "first": int(cfg.page_size),
-            "after": after,
-        }
-        if include_status:
-            variables["pubId"] = pub_id
-        if include_filter_mf:
-            variables["mfNs"] = cfg.filter_namespace
-            variables["mfKey"] = cfg.filter_key
-
-        data = client.gql(q, variables)
-        page = data["collections"]
-        edges = page["edges"]
-        page_count += 1
-
-        page_loaded = 0
-        page_kept = 0
-        page_skipped = 0
-
-        for edge in edges:
-            node = edge["node"]
-            loaded += 1
-            page_loaded += 1
-
-            if include_filter_mf:
-                filter_mf = node.get("__filter_mf")
-                ok = match_metafield(filter_mf, cfg.filter_value, cfg.filter_match_mode)
-                if not ok:
-                    skipped += 1
-                    page_skipped += 1
-                    continue
-
-            kept += 1
-            page_kept += 1
-
-            legacy_id = safe_str(node.get("legacyResourceId"))
-            handle = safe_str(node.get("handle"))
-            title = safe_str(node.get("title"))
-            updated_at = safe_str(node.get("updatedAt"))
-            template_suffix = safe_str(node.get("templateSuffix"))
-            image_url = safe_str((node.get("image") or {}).get("url"))
-            rule_set = node.get("ruleSet") or {}
-            rules = rule_set.get("rules") or []
-
-            row = [
-                get_mf_value(node, "custom", "category_id"),
-                legacy_id,
-                get_mf_value(node, "custom", "category_name_1"),
-                get_mf_value(node, "custom", "category_name_2"),
-                get_mf_value(node, "custom", "category_name_3"),
-                get_mf_value(node, "custom", "category_name_4"),
-                title,
-                handle,
-                build_storefront_url(cfg.storefront_base_url, handle),
-                build_admin_url(cfg.shop_domain, legacy_id),
-                template_suffix,
-                image_url,
-                get_mf_value(node, "custom", "collection_level"),
-                get_mf_value(node, "custom", "parent_category"),
-                get_mf_value(node, "custom", "top_category"),
-                get_mf_value(node, "custom", "breadcrumb_leaf"),
-                "SMART" if rules else "MANUAL",
-                rule_logic_from_applied_disjunctively(rule_set.get("appliedDisjunctively")),
-                friendly_rule(*(list(rules[0].values()) if len(rules) > 0 else [None, None, None])),
-                friendly_rule(*(list(rules[1].values()) if len(rules) > 1 else [None, None, None])),
-                friendly_rule(*(list(rules[2].values()) if len(rules) > 2 else [None, None, None])),
-                friendly_rule(*(list(rules[3].values()) if len(rules) > 3 else [None, None, None])),
-                friendly_rule(*(list(rules[4].values()) if len(rules) > 4 else [None, None, None])),
-                safe_str(node.get("publishedOnPublication")) if include_status else "",
-                updated_at,
-            ]
-            all_rows.append(row)
-            if len(preview_rows) < 8:
-                preview_rows.append(row)
-
-        print(
-            f"📦 page {page_count} done"
-            f" | loaded={page_loaded}"
-            f" | kept={page_kept}"
-            f" | skipped={page_skipped}"
-            f" | total_kept={kept}"
-        )
-
-        page_info = page["pageInfo"]
-        if not page_info["hasNextPage"]:
-            print("✅ Collections 拉取完成：已到最后一页")
+        d = gql(Q_METAFIELD_DEFS, {"ownerType": owner_type, "first": page_size, "after": after})
+        conn = d["metafieldDefinitions"]
+        out.extend(conn["nodes"])
+        if not conn["pageInfo"]["hasNextPage"]:
             break
-        after = page_info["endCursor"]
+        after = conn["pageInfo"]["endCursor"]
+    return out
 
-        if cfg.sleep_every_n_calls > 0 and page_count % cfg.sleep_every_n_calls == 0:
-            print(f"😴 达到 sleep_every_n_calls={cfg.sleep_every_n_calls}，暂停 {cfg.sleep_seconds}s")
-            time.sleep(cfg.sleep_seconds)
+
+def _fetch_all_metaobject_definitions(gql, page_size: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    after = None
+    while True:
+        d = gql(Q_METAOBJECT_DEFS, {"first": page_size, "after": after})
+        conn = d["metaobjectDefinitions"]
+        out.extend(conn["nodes"])
+        if not conn["pageInfo"]["hasNextPage"]:
+            break
+        after = conn["pageInfo"]["endCursor"]
+    return out
+
+
+def _ensure_header(ws) -> List[str]:
+    vals = ws.get_all_values()
+    if not vals or len(vals[0]) == 0:
+        ws.append_row(EXPECTED_HEADERS, value_input_option="RAW")
+        return EXPECTED_HEADERS[:]
+
+    header = [str(h or "").strip() for h in vals[0]]
+    missing = [h for h in EXPECTED_HEADERS if h not in header]
+    if missing:
+        raise ConfigFieldsError(f"Cfg__Fields header missing columns: {missing}. Please fix header first.")
+    return header
+
+
+def _cfg_data_type_from_shopify_type_name(shopify_type_name: str) -> str:
+    t = (shopify_type_name or "").strip()
+    return t if t else "string"
+
+
+def _make_append_row(payload: Dict[str, Any], header: List[str], col_idx: Dict[str, int]) -> List[str]:
+    row = [""] * len(header)
+    for k, v in payload.items():
+        if k in col_idx:
+            row[col_idx[k]] = "" if v is None else str(v)
+    return row
+
+
+def _col_letter(col_num_1_based: int) -> str:
+    return rowcol_to_a1(1, col_num_1_based).replace("1", "")
+
+
+def _normalize_product_base_url(value: str, key_name: str) -> str:
+    """
+    Normalize product base URLs read from Cfg__account_id.
+
+    Expected examples:
+    - ADMIN_PRODUCT_BASE_URL: https://admin.shopify.com/store/apollolift-us/products/
+    - STOREFRONT_PRODUCT_BASE_URL: https://www.apolloliftus.com/products/
+    """
+    v = str(value or "").strip()
+    if not v:
+        raise ConfigFieldsError(f"Cfg__account_id missing required account config key: {key_name}")
+    return v.rstrip("/") + "/"
+
+
+def _normalize_site_root_url(value: str, key_name: str) -> str:
+    """
+    Normalize a site/admin root URL without a trailing slash.
+
+    Expected examples:
+    - STOREFRONT_BASE_URL: https://www.apolloliftus.com
+    - ADMIN_BASE_URL: https://admin.shopify.com/store/apollolift-us
+    """
+    v = str(value or "").strip()
+    if not v:
+        raise ConfigFieldsError(f"Cfg__account_id missing required account config key: {key_name}")
+    return v.rstrip("/")
+
+
+def _build_core_fixed_rows(account_cfg: Dict[str, str]) -> List[Dict[str, Any]]:
+    """
+    Build CORE_FIXED rows with site-specific URLs from Cfg__account_id.
+
+    No storefront/admin product or Collection URL is hardcoded here.
+    """
+    admin_product_base_url = _normalize_product_base_url(
+        account_cfg.get("ADMIN_PRODUCT_BASE_URL", ""),
+        "ADMIN_PRODUCT_BASE_URL",
+    )
+    storefront_product_base_url = _normalize_product_base_url(
+        account_cfg.get("STOREFRONT_PRODUCT_BASE_URL", ""),
+        "STOREFRONT_PRODUCT_BASE_URL",
+    )
+    admin_collection_base_url = (
+        _normalize_site_root_url(account_cfg.get("ADMIN_BASE_URL", ""), "ADMIN_BASE_URL")
+        + "/collections/"
+    )
+    storefront_collection_base_url = (
+        _normalize_site_root_url(account_cfg.get("STOREFRONT_BASE_URL", ""), "STOREFRONT_BASE_URL")
+        + "/collections/"
+    )
+
+    replacements = {
+        "{ADMIN_PRODUCT_BASE_URL}": admin_product_base_url,
+        "{STOREFRONT_PRODUCT_BASE_URL}": storefront_product_base_url,
+        "{ADMIN_COLLECTION_BASE_URL}": admin_collection_base_url,
+        "{STOREFRONT_COLLECTION_BASE_URL}": storefront_collection_base_url,
+    }
+
+    out: List[Dict[str, Any]] = []
+    for row in CORE_FIXED:
+        new_row = dict(row)
+        expr = str(new_row.get("expr", "") or "")
+        for token, value in replacements.items():
+            expr = expr.replace(token, value)
+        new_row["expr"] = expr
+        out.append(new_row)
+    return out
+
+
+def _sync_cfg_fields(ws, mf_defs: List[Dict[str, Any]], mo_defs: List[Dict[str, Any]], account_cfg: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Sync Cfg__Fields against the PBS gold standard.
+
+    Gold-standard behavior kept:
+    - CORE / METAFIELD / METAOBJECT_REF row shape follows PBS notebook.
+    - Metafield expr is MF_VALUE("namespace","key").
+    - Metafield field_type is RAW.
+    - Metafield source_type is METAFIELD.
+    - PK remains entity_type + field_key.
+    - Missing rows are appended.
+    - A/B formulas are rewritten.
+
+    Stability restore added:
+    - Existing generated rows whose ALLOWED_COLS differ from PBS gold standard are corrected in place.
+    - Existing generated metafield rows whose namespace contains "shopify" are deleted.
+    - Manual columns outside ALLOWED_COLS are not touched.
+    """
+    header = _ensure_header(ws)
+    col_idx = {h: i for i, h in enumerate(header)}
+
+    def get_cell(row_list: List[str], col_name: str) -> str:
+        i = col_idx.get(col_name)
+        if i is None or i >= len(row_list):
+            return ""
+        return str(row_list[i] or "").strip()
+
+    all_vals = ws.get_all_values()
+    existing_pks = set()
+    existing_row_by_pk: Dict[str, int] = {}
+    rows_to_delete: List[int] = []
+
+    if len(all_vals) >= 2:
+        for row_num, r in enumerate(all_vals[1:], start=2):
+            et = get_cell(r, "entity_type")
+            fk = get_cell(r, "field_key")
+            ns = get_cell(r, "namespace")
+            source_type = get_cell(r, "source_type")
+
+            # Rows generated from Shopify metafield definitions with blocked namespace
+            # must not remain in Cfg__Fields under the confirmed rule.
+            if (
+                ns
+                and namespace_blocked(ns)
+                and (fk.startswith("mf.") or fk.startswith("v_mf."))
+                and source_type in {"METAFIELD", "SHOPIFY_METAFIELD_DEFINITION", ""}
+            ):
+                rows_to_delete.append(row_num)
+                continue
+
+            if et and fk:
+                pk = f"{et}||{fk}"
+                existing_pks.add(pk)
+                # Keep the first occurrence as the canonical row; duplicate PKs are not created by this job.
+                existing_row_by_pk.setdefault(pk, row_num)
+
+    desired_by_pk: Dict[str, Dict[str, Any]] = {}
+    desired_order: List[str] = []
+
+    def add_desired(payload: Dict[str, Any]) -> None:
+        et = str(payload.get("entity_type", "") or "").strip()
+        fk = str(payload.get("field_key", "") or "").strip()
+        if not et or not fk:
+            return
+        pk = f"{et}||{fk}"
+        if pk in desired_by_pk:
+            return
+        slim = {k: payload.get(k, "") for k in ALLOWED_COLS}
+        desired_by_pk[pk] = slim
+        desired_order.append(pk)
+
+    # CORE_FIXED — PBS gold standard, with site-specific URLs from Cfg__account_id.
+    for x in _build_core_fixed_rows(account_cfg):
+        add_desired({
+            "display_name": x["display_name"],
+            "entity_type": x["entity_type"],
+            "field_key": x["field_key"],
+            "expr": x.get("expr", ""),
+            "field_type": x.get("field_type", "RAW"),
+            "data_type": x.get("data_type", "string"),
+            "source_type": "CORE",
+            "namespace": "",
+            "key": "",
+        })
+
+    owner_to_entity = {
+        "PRODUCT": "PRODUCT",
+        "PRODUCTVARIANT": "VARIANT",
+        "COLLECTION": "COLLECTION",
+        "PAGE": "PAGE",
+        "ORDER": "ORDER",
+        "CUSTOMER": "CUSTOMER",
+    }
+
+    skipped_shopify_ns = 0
+    for m in mf_defs:
+        entity = owner_to_entity.get(m.get("ownerType", ""), m.get("ownerType", ""))
+        ns = (m.get("namespace") or "").strip()
+        k = (m.get("key") or "").strip()
+
+        if namespace_blocked(ns):
+            skipped_shopify_ns += 1
+            continue
+
+        shopify_t = ((m.get("type") or {}).get("name") or "").strip()
+        internal = f"v_mf.{ns}.{k}" if entity == "VARIANT" else f"mf.{ns}.{k}"
+
+        add_desired({
+            "display_name": m.get("name") or internal,
+            "entity_type": entity,
+            "field_key": internal,
+            "expr": f'MF_VALUE("{ns}","{k}")',
+            "field_type": "RAW",
+            "data_type": _cfg_data_type_from_shopify_type_name(shopify_t),
+            "source_type": "METAFIELD",
+            "namespace": ns,
+            "key": k,
+        })
+
+    skipped_shopify_mo_type = 0
+    for d in mo_defs:
+        mo_type = (d.get("type") or "").strip()
+        mo_name = (d.get("name") or mo_type).strip()
+
+        if namespace_blocked(mo_type):
+            skipped_shopify_mo_type += 1
+            continue
+
+        for f in (d.get("fieldDefinitions") or []):
+            f_key = (f.get("key") or "").strip()
+            f_name = (f.get("name") or f_key).strip()
+            shopify_t = ((f.get("type") or {}).get("name") or "").strip()
+            internal = f"mo.{mo_type}.{f_key}"
+
+            add_desired({
+                "display_name": f"{mo_name} · {f_name}",
+                "entity_type": "METAOBJECT_ENTRY",
+                "field_key": internal,
+                "expr": f'MO_FIELD("{f_key}")',
+                "field_type": shopify_t,
+                "data_type": _cfg_data_type_from_shopify_type_name(shopify_t),
+                "source_type": "METAOBJECT_REF",
+                "namespace": mo_type,
+                "key": f_key,
+            })
+
+    # Delete blocked Shopify namespace rows first, bottom-up.
+    rows_deleted_blocked_namespace = 0
+    for row_num in sorted(rows_to_delete, reverse=True):
+        ws.delete_rows(row_num)
+        rows_deleted_blocked_namespace += 1
+
+    # Reload after deletes so row numbers are correct.
+    all_vals = ws.get_all_values()
+    existing_pks = set()
+    existing_row_by_pk = {}
+    if len(all_vals) >= 2:
+        for row_num, r in enumerate(all_vals[1:], start=2):
+            et = get_cell(r, "entity_type")
+            fk = get_cell(r, "field_key")
+            if et and fk:
+                pk = f"{et}||{fk}"
+                existing_pks.add(pk)
+                existing_row_by_pk.setdefault(pk, row_num)
+
+    rows_to_append: List[List[str]] = []
+    for pk in desired_order:
+        if pk not in existing_pks:
+            rows_to_append.append(_make_append_row(desired_by_pk[pk], header, col_idx))
+
+    # Restore existing managed rows to PBS gold shape.
+    # Only ALLOWED_COLS are touched; manual columns remain intact.
+    updates = []
+    rows_restored_gold_standard = 0
+    cells_restored_gold_standard = 0
+
+    for pk in desired_order:
+        row_num = existing_row_by_pk.get(pk)
+        if not row_num:
+            continue
+        desired = desired_by_pk[pk]
+        current = all_vals[row_num - 1] if row_num - 1 < len(all_vals) else []
+        row_changed = False
+        for col_name in ALLOWED_COLS:
+            if col_name not in col_idx:
+                continue
+            c_idx = col_idx[col_name]
+            cur = str(current[c_idx] if c_idx < len(current) else "")
+            want = "" if desired.get(col_name) is None else str(desired.get(col_name, ""))
+            if cur != want:
+                updates.append({
+                    "range": rowcol_to_a1(row_num, c_idx + 1),
+                    "values": [[want]],
+                })
+                cells_restored_gold_standard += 1
+                row_changed = True
+        if row_changed:
+            rows_restored_gold_standard += 1
+
+    print(f"Existing PKs: {len(existing_pks)}")
+    print(f"New rows to append: {len(rows_to_append)}")
+    print(f"Rows restored to PBS gold standard: {rows_restored_gold_standard}")
+    print(f"Cells restored to PBS gold standard: {cells_restored_gold_standard}")
+    print(f"Deleted existing rows due to namespace contains 'shopify': {rows_deleted_blocked_namespace}")
+    print(f"Skipped metafieldDefinitions due to namespace contains 'shopify': {skipped_shopify_ns}")
+    print(f"Skipped metaobjectDefinitions due to type contains 'shopify': {skipped_shopify_mo_type}")
+
+    if updates:
+        ws.batch_update(updates, value_input_option="RAW")
+
+    if rows_to_append:
+        ws.append_rows(rows_to_append, value_input_option="RAW", insert_data_option="INSERT_ROWS")
+
+    all_vals_after = ws.get_all_values()
+    last_row = len(all_vals_after)
+
+    if last_row >= 2:
+        col_field_handle = col_idx["field_handle"] + 1
+        col_field_id = col_idx["field_id"] + 1
+        col_entity = col_idx["entity_type"] + 1
+        col_display = col_idx["display_name"] + 1
+        col_field_key = col_idx["field_key"] + 1
+
+        l_handle = _col_letter(col_field_handle)
+        l_id = _col_letter(col_field_id)
+        l_entity = _col_letter(col_entity)
+        l_disp = _col_letter(col_display)
+        l_fk = _col_letter(col_field_key)
+
+        handle_formulas = []
+        id_formulas = []
+        for r in range(2, last_row + 1):
+            handle_formulas.append([f'={l_entity}{r}&"|"&{l_disp}{r}'])
+            id_formulas.append([f'={l_entity}{r}&"|"&{l_fk}{r}'])
+
+        ws.update(f"{l_handle}2:{l_handle}{last_row}", handle_formulas, value_input_option="USER_ENTERED")
+        ws.update(f"{l_id}2:{l_id}{last_row}", id_formulas, value_input_option="USER_ENTERED")
+
+    print(f"Done. Sheet rows now: {last_row}")
 
     return {
-        "rows": all_rows,
-        "preview_rows": preview_rows,
-        "rows_loaded": loaded,
-        "rows_written": kept,
-        "rows_skipped": skipped,
-        "page_count": page_count,
-        "pub_id_used": pub_id,
+        "existing_pks": len(existing_pks),
+        "rows_appended": len(rows_to_append),
+        "rows_restored_gold_standard": rows_restored_gold_standard,
+        "cells_restored_gold_standard": cells_restored_gold_standard,
+        "rows_deleted_blocked_namespace": rows_deleted_blocked_namespace,
+        "sheet_rows_now": last_row,
+        "skipped_metafield_definitions_shopify_namespace": skipped_shopify_ns,
+        "skipped_metaobject_definitions_shopify_type": skipped_shopify_mo_type,
     }
-
-
-def write_runlog(gc, runlog_sheet_url: str, records: List[List[Any]]):
-    if not runlog_sheet_url:
-        return
-    try:
-        book = gc.open_by_url(runlog_sheet_url)
-        ws = ensure_tab(book, RUNLOG_TAB_NAME)
-        existing = ws.row_values(1)
-        if existing != RUNLOG_HEADER:
-            print("🧾 RunLog 表头不一致，重建表头")
-            ws.clear()
-            ws.update("A1", [RUNLOG_HEADER], value_input_option="RAW")
-        if records:
-            print(f"🧾 写入 RunLog：{len(records)} 行")
-            ws.append_rows(records, value_input_option="RAW")
-    except Exception as e:
-        print(f"⚠️ RunLog 写入失败：{e}")
-
-
-def make_runlog_summary(
-    run_id: str,
-    ts_cn: str,
-    site_code: str,
-    status: str,
-    rows_loaded: int,
-    rows_written: int,
-    rows_skipped: int,
-    message: str,
-    error_reason: str = "",
-) -> List[Any]:
-    return [
-        run_id,
-        ts_cn,
-        JOB_NAME,
-        "apply",
-        "summary",
-        status,
-        site_code,
-        "COLLECTION",
-        "",
-        "",
-        rows_loaded,
-        rows_loaded,
-        rows_loaded,
-        rows_written,
-        rows_written,
-        rows_skipped,
-        message,
-        error_reason,
-    ]
-
-
-def write_export_sheet(ws, header: List[str], data_rows: List[List[Any]], write_mode: str, chunk_size: int):
-    ncols = len(header)
-    write_mode = (write_mode or "REPLACE").upper().strip()
-    total_rows = len(data_rows)
-
-    need_rows = max(ws.row_count, total_rows + 10)
-    need_cols = max(ws.col_count, ncols)
-    if need_rows != ws.row_count or need_cols != ws.col_count:
-        print(f"📐 调整 sheet 尺寸：rows {ws.row_count}->{need_rows} | cols {ws.col_count}->{need_cols}")
-        ws.resize(rows=need_rows, cols=need_cols)
-
-    existing = ws.get_all_values()
-
-    if write_mode == "REPLACE":
-        print("🧹 REPLACE 模式：清空后重写")
-        ws.clear()
-        print(f"✍️ 写入表头：1 行 × {ncols} 列")
-        ws.update(range_name="A1", values=[header], value_input_option="RAW")
-
-        if not data_rows:
-            print("ℹ️ 没有数据行，只写入表头")
-            return
-
-        batch_total = (total_rows + chunk_size - 1) // chunk_size
-        r0 = 2
-        print(f"✍️ 开始分块写入数据：total_rows={total_rows} | batches={batch_total} | chunk_size={chunk_size}")
-        for i in range(0, total_rows, chunk_size):
-            block = data_rows[i:i + chunk_size]
-            batch_no = i // chunk_size + 1
-            r1 = r0 + len(block) - 1
-            a1 = rowcol_to_a1(r0, 1)
-            b1 = rowcol_to_a1(r1, ncols)
-            rng = f"{a1}:{b1}"
-            print(f"   - write batch {batch_no}/{batch_total} | range={rng} | rows={len(block)}")
-            ws.update(range_name=rng, values=block, value_input_option="RAW")
-            r0 += len(block)
-    elif write_mode == "APPEND":
-        print("➕ APPEND 模式")
-        if not existing:
-            print("✍️ 空表，先写入表头")
-            ws.update(range_name="A1", values=[header], value_input_option="RAW")
-        append_rows_chunked(ws, data_rows, chunk_size=chunk_size)
-    else:
-        raise RuntimeError(f"不支持 WRITE_MODE: {write_mode}")
-
 
 def run(
-    *,
-    site_code: str,
-    console_core_url: str,
-    gsheet_sa_b64: str,
-    shopify_token: str,
-    shop_domain: str,
-    api_version: str,
-    storefront_base_url: str,
-    export_label: str = EXPORT_LABEL_DEFAULT,
-    export_tab_name: str = EXPORT_TAB_DEFAULT,
-    runlog_label: str = "runlog_sheet",
-    write_mode: str = "REPLACE",
-    write_header_and_desc: bool = False,
-    status_enabled: bool = True,
-    online_store_publication_id: str = "",
-    auto_find_online_store_publication_id: bool = True,
-    filter_enabled: bool = False,
-    filter_namespace: str = "custom",
-    filter_key: str = "top_category",
-    filter_value: str = "PEX",
-    filter_match_mode: str = "EQUALS",
-    page_size: int = 250,
-    write_chunk_rows: int = 2000,
-    retry: int = 6,
-    sleep_every_n_calls: int = 20,
-    sleep_seconds: float = 1.0,
-    request_timeout: int = 60,
+    SITE_CODE: str,
+    JOB_NAME: str,
+    CONSOLE_CORE_URL: str,
+    BOOTSTRAP_GSHEET_SA_B64_SECRET: str,
+    TAB_CFG_ACCOUNT_ID: str = "Cfg__account_id",
+    TAB_CFG_SITES: str = "Cfg__Sites",
+    CONFIG_SHEET_LABEL: str = "config",
+    RUNLOG_SHEET_LABEL: str = "runlog_sheet",
+    WORKSHEET_NAME: str = "Cfg__Fields",
+    MF_OWNER_TYPES: Optional[List[str]] = None,
+    TZ_NAME: str = "Asia/Shanghai",
+    RUN_ID: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if not SITE_CODE:
+        raise ConfigFieldsError("SITE_CODE is required.")
+    if JOB_NAME != "config_fields":
+        raise ConfigFieldsError(f"JOB_NAME must be config_fields, got: {JOB_NAME}")
+    if not CONSOLE_CORE_URL:
+        raise ConfigFieldsError("CONSOLE_CORE_URL is required.")
+    if not BOOTSTRAP_GSHEET_SA_B64_SECRET:
+        raise ConfigFieldsError("BOOTSTRAP_GSHEET_SA_B64_SECRET is required.")
 
-    cfg = ExportConfig(
-        site_code=(site_code or "").strip().upper(),
-        shop_domain=(shop_domain or "").strip(),
-        api_version=(api_version or "").strip(),
-        storefront_base_url=(storefront_base_url or "").strip().rstrip("/"),
-        console_core_url=(console_core_url or "").strip(),
-        gsheet_sa_b64=gsheet_sa_b64,
-        shopify_token=shopify_token,
-        export_label=(export_label or EXPORT_LABEL_DEFAULT).strip(),
-        export_tab_name=(export_tab_name or EXPORT_TAB_DEFAULT).strip(),
-        runlog_label=(runlog_label or "runlog_sheet").strip(),
-        write_mode=(write_mode or "REPLACE").strip().upper(),
-        write_header_and_desc=False,
-        status_enabled=bool(status_enabled),
-        online_store_publication_id=(online_store_publication_id or "").strip(),
-        auto_find_online_store_publication_id=bool(auto_find_online_store_publication_id),
-        filter_enabled=bool(filter_enabled),
-        filter_namespace=(filter_namespace or "").strip(),
-        filter_key=(filter_key or "").strip(),
-        filter_value=(filter_value or "").strip(),
-        filter_match_mode=(filter_match_mode or "EQUALS").strip().upper(),
-        page_size=int(page_size),
-        write_chunk_rows=int(write_chunk_rows),
-        retry=int(retry),
-        sleep_every_n_calls=int(sleep_every_n_calls),
-        sleep_seconds=float(sleep_seconds),
-        request_timeout=int(request_timeout),
-    )
+    run_id = RUN_ID or str(uuid.uuid4())
+    owner_types = MF_OWNER_TYPES or DEFAULT_MF_OWNER_TYPES[:]
 
-    run_id = now_run_id()
-    ts_cn = now_cn()
+    print(f"=== {JOB_NAME} start ===")
+    print(f"SITE_CODE={SITE_CODE}")
+    print(f"RUN_ID={run_id}")
+    print(f"CONFIG_SHEET_LABEL={CONFIG_SHEET_LABEL}")
+    print(f"WORKSHEET_NAME={WORKSHEET_NAME}")
+    print(f"MF_OWNER_TYPES={owner_types}")
 
-    print(f"========== {JOB_NAME} | start ==========")
-    print(f"site_code={cfg.site_code} | shop_domain={cfg.shop_domain} | tab={cfg.export_tab_name}")
+    gc_bootstrap = _build_gspread_client_from_b64_secret(BOOTSTRAP_GSHEET_SA_B64_SECRET)
+    console_sh = gc_bootstrap.open_by_url(CONSOLE_CORE_URL)
 
-    gc = build_gspread_client(cfg.gsheet_sa_b64)
-    print("✅ Google Sheets client ready")
-
-    client = ShopifyClient(
-        shop_domain=cfg.shop_domain,
-        api_version=cfg.api_version,
-        access_token=cfg.shopify_token,
-        retry=cfg.retry,
-        timeout=cfg.request_timeout,
-    )
-    print("✅ Shopify client ready")
-
-    export_sheet_url = find_site_label_url(gc, cfg.console_core_url, cfg.site_code, cfg.export_label)
-    print(f"✅ export_sheet_url: {export_sheet_url}")
-
-    runlog_sheet_url = find_site_label_url(gc, cfg.console_core_url, cfg.site_code, cfg.runlog_label)
-    print(f"✅ runlog_sheet_url: {runlog_sheet_url}")
-
-    pub_id, pubs = resolve_online_store_publication_id(client, cfg)
-    print(f"✅ Publications found: {len(pubs)}")
-    if cfg.status_enabled:
-        print("✅ Using publicationId:", pub_id or "(disabled → status blank)")
-    else:
-        print("✅ Status disabled")
-
-    result = export_rows(client, cfg, pub_id=pub_id)
-
-    print(f"📄 打开输出表：{cfg.export_tab_name}")
-    book = gc.open_by_url(export_sheet_url)
-    ws = ensure_tab(book, cfg.export_tab_name)
-
-    write_export_sheet(
-        ws=ws,
-        header=OUT_HEADER,
-        data_rows=result["rows"],
-        write_mode=cfg.write_mode,
-        chunk_size=cfg.write_chunk_rows,
-    )
-
-    msg = (
-        f"export ok | pages={result['page_count']} | "
-        f"loaded={result['rows_loaded']} | written={result['rows_written']} | skipped={result['rows_skipped']}"
-    )
-
-    runlog_records = [
-        make_runlog_summary(
-            run_id=run_id,
-            ts_cn=ts_cn,
-            site_code=cfg.site_code,
-            status="SUCCESS",
-            rows_loaded=result["rows_loaded"],
-            rows_written=result["rows_written"],
-            rows_skipped=result["rows_skipped"],
-            message=msg,
-            error_reason="",
+    account_cfg = _read_account_config(console_sh, TAB_CFG_ACCOUNT_ID, SITE_CODE)
+    account_secret = account_cfg["GSHEET_SA_B64_SECRET"]
+    if BOOTSTRAP_GSHEET_SA_B64_SECRET != account_secret:
+        raise ConfigFieldsError(
+            "BOOTSTRAP_GSHEET_SA_B64_SECRET mismatch: "
+            f"Cell1={BOOTSTRAP_GSHEET_SA_B64_SECRET}, "
+            f"{TAB_CFG_ACCOUNT_ID}.GSHEET_SA_B64_SECRET={account_secret}"
         )
-    ]
-    write_runlog(gc, runlog_sheet_url, runlog_records)
 
-    out = {
+    config_route = _read_site_route(console_sh, TAB_CFG_SITES, SITE_CODE, CONFIG_SHEET_LABEL)
+    config_sheet_url = config_route["sheet_url"]
+
+    print("Console Core loaded.")
+    print(f"SHOP_DOMAIN={account_cfg['SHOP_DOMAIN']}")
+    print(f"SHOPIFY_API_VERSION={account_cfg['SHOPIFY_API_VERSION']}")
+    print(f"Config sheet route: label={CONFIG_SHEET_LABEL}, url={config_sheet_url}")
+
+    gc = _build_gspread_client_from_b64_secret(account_cfg["GSHEET_SA_B64_SECRET"])
+    cfg_sh = gc.open_by_url(config_sheet_url)
+    cfg_ws = _require_worksheet(cfg_sh, WORKSHEET_NAME)
+
+    gql = _build_shopify_client(
+        shop_domain=account_cfg["SHOP_DOMAIN"],
+        api_version=account_cfg["SHOPIFY_API_VERSION"],
+        token_secret_name=account_cfg["SHOPIFY_TOKEN_SECRET"],
+    )
+
+    mf_defs: List[Dict[str, Any]] = []
+    mf_counts_by_owner = {}
+    for ot in owner_types:
+        rows = _fetch_all_metafield_definitions(gql, ot, DEFAULT_PAGE_SIZE)
+        mf_counts_by_owner[ot] = len(rows)
+        mf_defs.extend(rows)
+        print(f"metafieldDefinitions ownerType={ot}: {len(rows)}")
+
+    mo_defs = _fetch_all_metaobject_definitions(gql, DEFAULT_PAGE_SIZE)
+    print(f"metafieldDefinitions total: {len(mf_defs)}")
+    print(f"metaobjectDefinitions: {len(mo_defs)}")
+
+    sync_summary = _sync_cfg_fields(cfg_ws, mf_defs, mo_defs, account_cfg)
+
+    result = {
         "ok": True,
-        "run_id": run_id,
         "job_name": JOB_NAME,
-        "site_code": cfg.site_code,
-        "output_sheet_url": export_sheet_url,
-        "output_tab_name": cfg.export_tab_name,
-        "rows_loaded": result["rows_loaded"],
-        "rows_written": result["rows_written"],
-        "rows_skipped": result["rows_skipped"],
-        "page_count": result["page_count"],
-        "publication_id_used": result["pub_id_used"],
-        "preview_rows": result["preview_rows"],
-        "message": msg,
+        "site_code": SITE_CODE,
+        "run_id": run_id,
+        "ts": _now_cn_like(),
+        "targets": {
+            "console_core_url": CONSOLE_CORE_URL,
+            "config_sheet_url": config_sheet_url,
+            "worksheet_name": WORKSHEET_NAME,
+            "runlog_sheet_label": RUNLOG_SHEET_LABEL,
+        },
+        "summary": {
+            "metafield_definitions_total": len(mf_defs),
+            "metafield_definitions_by_owner": mf_counts_by_owner,
+            "metaobject_definitions": len(mo_defs),
+            **sync_summary,
+        },
+        "warnings": [],
     }
 
-    print("✅", msg)
-    print(f"========== {JOB_NAME} | end ==========")
-    return out
+    print("=== result summary ===")
+    print(json.dumps(result["summary"], ensure_ascii=False, indent=2))
+    print(f"=== {JOB_NAME} done ===")
+    return result
