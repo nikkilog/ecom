@@ -1,3 +1,6 @@
+# shopify_sync/edit_core.py
+# Full core/metafield/media editor. Media fields: core.product.images_urls, core.variant.image_url.
+
 from __future__ import annotations
 
 import base64
@@ -7,6 +10,7 @@ import json
 import random
 import re
 import time
+from urllib.parse import unquote, urlsplit
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -57,6 +61,12 @@ SUPPORTED_CORE_SCALAR_ACTIONS = {"SET", "CLEAR"}
 SUPPORTED_CORE_PRICE_ACTIONS = {"SET"}
 SUPPORTED_CORE_SKU_ACTIONS = {"SET"}
 SUPPORTED_CORE_COMPARE_AT_ACTIONS = {"SET", "CLEAR"}
+SUPPORTED_PRODUCT_MEDIA_ACTIONS = {"SET"}
+SUPPORTED_VARIANT_MEDIA_ACTIONS = {"SET", "CLEAR"}
+
+PRODUCT_IMAGES_FIELD_KEY = "core.product.images_urls"
+VARIANT_IMAGE_FIELD_KEY = "core.variant.image_url"
+MEDIA_CORE_KEYS = {PRODUCT_IMAGES_FIELD_KEY, VARIANT_IMAGE_FIELD_KEY}
 
 ALLOWED_PREFIXES = ("mf.", "v_mf.", "core.")
 FORBIDDEN_SHOPIFY_PREFIXES = ("mf.shopify.", "v_mf.shopify.", "v.mf.shopify.")
@@ -70,8 +80,9 @@ PRODUCT_CORE_KEYS = {
     "core.seo_title",
     "core.seo_description",
     "core.vendor",
+    PRODUCT_IMAGES_FIELD_KEY,
 }
-VARIANT_CORE_KEYS = {"core.sku", "core.weight", "core.weight_unit", "core.price", "core.compare_at_price"}
+VARIANT_CORE_KEYS = {"core.sku", "core.weight", "core.weight_unit", "core.price", "core.compare_at_price", VARIANT_IMAGE_FIELD_KEY}
 
 Q_PRODUCT_BY_HANDLE = """
 query($handle: String!) {
@@ -146,6 +157,11 @@ query($ids: [ID!]!) {
       inventoryItem {
         id
       }
+      media(first: 50) {
+        nodes {
+          id
+        }
+      }
     }
   }
 }
@@ -183,6 +199,122 @@ mutation productVariantsBulkUpdate(
     userErrors {
       field
       message
+    }
+  }
+}
+"""
+
+
+Q_PRODUCT_MEDIA_PAGE = """
+query productMediaPage($id: ID!, $first: Int!, $after: String) {
+  product(id: $id) {
+    id
+    media(first: $first, after: $after) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        id
+        mediaContentType
+        preview {
+          image {
+            url
+          }
+        }
+        ... on MediaImage {
+          image {
+            url
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+M_PRODUCT_ADD_MEDIA = """
+mutation productAddMedia($product: ProductUpdateInput!, $media: [CreateMediaInput!]) {
+  productUpdate(product: $product, media: $media) {
+    product {
+      id
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}
+"""
+
+M_PRODUCT_REORDER_MEDIA = """
+mutation productReorderMedia($id: ID!, $moves: [MoveInput!]!) {
+  productReorderMedia(id: $id, moves: $moves) {
+    job {
+      id
+      done
+    }
+    mediaUserErrors {
+      field
+      message
+      code
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}
+"""
+
+Q_JOB_STATUS = """
+query jobStatus($id: ID!) {
+  node(id: $id) {
+    ... on Job {
+      id
+      done
+    }
+  }
+}
+"""
+
+M_VARIANT_APPEND_MEDIA = """
+mutation productVariantAppendMedia(
+  $productId: ID!,
+  $variantMedia: [ProductVariantAppendMediaInput!]!
+) {
+  productVariantAppendMedia(productId: $productId, variantMedia: $variantMedia) {
+    product {
+      id
+    }
+    productVariants {
+      id
+    }
+    userErrors {
+      field
+      message
+      code
+    }
+  }
+}
+"""
+
+M_VARIANT_DETACH_MEDIA = """
+mutation productVariantDetachMedia(
+  $productId: ID!,
+  $variantMedia: [ProductVariantDetachMediaInput!]!
+) {
+  productVariantDetachMedia(productId: $productId, variantMedia: $variantMedia) {
+    product {
+      id
+    }
+    productVariants {
+      id
+    }
+    userErrors {
+      field
+      message
+      code
     }
   }
 }
@@ -260,6 +392,67 @@ def _upper_strip(s: Any) -> str:
 
 def _lower_strip(s: Any) -> str:
     return _norm_str(s).lower()
+
+
+
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for item in items:
+        value = _norm_str(item)
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _is_http_url(value: str) -> bool:
+    try:
+        parts = urlsplit(_norm_str(value))
+        return parts.scheme.lower() in {"http", "https"} and bool(parts.netloc)
+    except Exception:
+        return False
+
+
+def _normalize_media_url(value: str) -> str:
+    """Normalize Shopify CDN URLs for matching while ignoring query strings such as ?v=."""
+    s = _norm_str(value)
+    if not s:
+        return ""
+    try:
+        parts = urlsplit(s)
+        host = parts.netloc.lower()
+        path = unquote(parts.path or "").rstrip("/")
+        return f"{host}{path}".lower()
+    except Exception:
+        return s.split("?", 1)[0].split("#", 1)[0].strip().lower()
+
+
+def _media_basename_key(value: str) -> str:
+    normalized = _normalize_media_url(value)
+    return normalized.rsplit("/", 1)[-1] if normalized else ""
+
+
+def _json_array_of_urls(value: str) -> list[str]:
+    s = _norm_str(value)
+    if not s:
+        return []
+
+    try:
+        obj = json.loads(s)
+    except Exception as e:
+        raise ValueError(f"Product image list must be a JSON array: {e}")
+
+    if not isinstance(obj, list):
+        raise ValueError("Product image list must be a JSON array")
+
+    urls = _dedupe_keep_order([_norm_str(x) for x in obj])
+    invalid = [u for u in urls if not _is_http_url(u)]
+    if invalid:
+        raise ValueError(f"Invalid image URL(s): {invalid[:3]}")
+
+    return urls
 
 
 # =========================================================
@@ -548,14 +741,23 @@ def load_edit_core(ws_edit) -> pd.DataFrame:
     rows = ws_edit.get_all_records()
     df = pd.DataFrame(rows)
 
-    required_cols = ["entity_type", "gid_or_handle", "field_key", "desired_value", "action", "mode", "note", "run_id"]
+    # Long_Media uses the five required columns below. Edit__Core can additionally
+    # provide mode / note / run_id. Missing optional columns are created as blank.
+    required_cols = ["entity_type", "gid_or_handle", "field_key", "desired_value", "action"]
+    optional_cols = ["mode", "note", "run_id"]
+
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
-        raise ValueError(f"Edit__Core missing columns: {missing}")
+        raise ValueError(f"Input sheet missing required columns: {missing}")
 
+    for c in optional_cols:
+        if c not in df.columns:
+            df[c] = ""
+
+    all_cols = required_cols + optional_cols
     df["_sheet_row"] = range(2, 2 + len(df))
 
-    for c in required_cols:
+    for c in all_cols:
         df[c] = df[c].astype(str).fillna("").replace("nan", "").str.strip()
 
     return df
@@ -661,6 +863,18 @@ def validate_row(entity_type: str, field_key: str, action: str) -> tuple[bool, s
         if et != "VARIANT":
             return False, "prefix_entity_mismatch"
         if act not in SUPPORTED_METAFIELD_ACTIONS:
+            return False, "action_not_supported"
+
+    elif fk == PRODUCT_IMAGES_FIELD_KEY:
+        if et != "PRODUCT":
+            return False, "core_entity_mismatch"
+        if act not in SUPPORTED_PRODUCT_MEDIA_ACTIONS:
+            return False, "action_not_supported"
+
+    elif fk == VARIANT_IMAGE_FIELD_KEY:
+        if et != "VARIANT":
+            return False, "core_entity_mismatch"
+        if act not in SUPPORTED_VARIANT_MEDIA_ACTIONS:
             return False, "action_not_supported"
 
     elif fk == "core.tags":
@@ -771,7 +985,10 @@ def recognize_rows(df_work: pd.DataFrame, mode_default: str) -> tuple[pd.DataFra
                 })
                 continue
 
-        row_type = "core" if field_key.startswith("core.") else "metafield"
+        if field_key in MEDIA_CORE_KEYS:
+            row_type = "media"
+        else:
+            row_type = "core" if field_key.startswith("core.") else "metafield"
 
         rec = {
             "_row_index": idx,
@@ -943,10 +1160,16 @@ def get_variant_context_map(client: ShopifyClient, variant_ids: list[str], chunk
             vid = _norm_str(node.get("id"))
             product_id = _norm_str((node.get("product") or {}).get("id"))
             inventory_item_id = _norm_str((node.get("inventoryItem") or {}).get("id"))
+            media_ids = [
+                _norm_str(x.get("id"))
+                for x in ((node.get("media") or {}).get("nodes") or [])
+                if _norm_str((x or {}).get("id"))
+            ]
             if vid:
                 out[vid] = {
                     "product_id": product_id,
                     "inventory_item_id": inventory_item_id,
+                    "media_ids": media_ids,
                 }
     return out
 
@@ -1765,6 +1988,745 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
     }
 
 
+
+# =========================================================
+# Media planning
+# =========================================================
+
+def build_media_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, Any]:
+    df_media = df_ready[
+        (df_ready["_skip_reason"].eq(""))
+        & (df_ready["row_type"] == "media")
+    ].copy()
+
+    product_rows = []
+    variant_rows = []
+    preview_rows = []
+    invalid_rows = []
+
+    if df_media.empty:
+        return {
+            "product_rows": product_rows,
+            "variant_rows": variant_rows,
+            "preview_rows": preview_rows,
+            "invalid_rows": invalid_rows,
+        }
+
+    # One media instruction per owner + field in one run. Duplicate rows are
+    # ambiguous and could create accidental ordering conflicts.
+    dup_counts = (
+        df_media.groupby(["entity_type", "owner_id", "field_key"], dropna=False)
+        .size()
+        .to_dict()
+    )
+    duplicate_keys = {k for k, n in dup_counts.items() if n > 1}
+
+    variant_ids = (
+        df_media.loc[df_media["field_key"].eq(VARIANT_IMAGE_FIELD_KEY), "owner_id"]
+        .astype(str)
+        .drop_duplicates()
+        .tolist()
+    )
+    variant_context = get_variant_context_map(client, variant_ids, chunk_size=80)
+
+    for r in df_media.itertuples(index=False):
+        entity_type = _norm_str(getattr(r, "entity_type", "")).upper()
+        owner_id = _norm_str(getattr(r, "owner_id", ""))
+        field_key = _norm_str(getattr(r, "field_key", ""))
+        action = _upper_strip(getattr(r, "action", ""))
+        desired = _norm_str(getattr(r, "desired_value", ""))
+        sheet_row = getattr(r, "sheet_row", None)
+
+        if (entity_type, owner_id, field_key) in duplicate_keys:
+            invalid_rows.append({
+                "sheet_row": sheet_row,
+                "entity_type": entity_type,
+                "owner_id": owner_id,
+                "field_key": field_key,
+                "error_reason": "duplicate_media_instruction",
+                "message": (
+                    f"sheet_row={sheet_row} | duplicate owner + field_key in one run; "
+                    "keep exactly one row"
+                ),
+            })
+            continue
+
+        if field_key == PRODUCT_IMAGES_FIELD_KEY:
+            try:
+                urls = _json_array_of_urls(desired)
+                if not urls:
+                    raise ValueError("SET requires at least one Product image URL")
+            except Exception as e:
+                invalid_rows.append({
+                    "sheet_row": sheet_row,
+                    "entity_type": entity_type,
+                    "owner_id": owner_id,
+                    "field_key": field_key,
+                    "error_reason": "invalid_product_images_json",
+                    "message": f"sheet_row={sheet_row} | {e}",
+                })
+                continue
+
+            product_rows.append({
+                "sheet_row": sheet_row,
+                "entity_type": "PRODUCT",
+                "owner_id": owner_id,
+                "field_key": field_key,
+                "action": action,
+                "urls": urls,
+            })
+            preview_rows.append({
+                "sheet_row": sheet_row,
+                "entity_type": "PRODUCT",
+                "owner_id": owner_id,
+                "field_key": field_key,
+                "action": action,
+                "plan_type": "product_media_add_and_reorder",
+                "image_count": len(urls),
+                "value_preview": json.dumps(urls, ensure_ascii=False)[:500],
+            })
+            continue
+
+        if field_key == VARIANT_IMAGE_FIELD_KEY:
+            context = variant_context.get(owner_id) or {}
+            product_id = _norm_str(context.get("product_id"))
+            current_media_ids = list(context.get("media_ids") or [])
+
+            if not product_id:
+                invalid_rows.append({
+                    "sheet_row": sheet_row,
+                    "entity_type": entity_type,
+                    "owner_id": owner_id,
+                    "field_key": field_key,
+                    "error_reason": "cannot_resolve_variant_product_id",
+                    "message": f"sheet_row={sheet_row} | variant_id={owner_id}",
+                })
+                continue
+
+            if action == "SET":
+                if not _is_http_url(desired):
+                    invalid_rows.append({
+                        "sheet_row": sheet_row,
+                        "entity_type": entity_type,
+                        "owner_id": owner_id,
+                        "field_key": field_key,
+                        "error_reason": "invalid_variant_image_url",
+                        "message": f"sheet_row={sheet_row} | invalid URL={desired}",
+                    })
+                    continue
+                target_url = desired
+            else:
+                target_url = ""
+
+            variant_rows.append({
+                "sheet_row": sheet_row,
+                "entity_type": "VARIANT",
+                "owner_id": owner_id,
+                "product_id": product_id,
+                "field_key": field_key,
+                "action": action,
+                "url": target_url,
+                "current_media_ids": current_media_ids,
+            })
+            preview_rows.append({
+                "sheet_row": sheet_row,
+                "entity_type": "VARIANT",
+                "owner_id": owner_id,
+                "field_key": field_key,
+                "action": action,
+                "plan_type": "variant_media_assign" if action == "SET" else "variant_media_clear",
+                "parent_product_id": product_id,
+                "value_preview": target_url,
+            })
+
+    return {
+        "product_rows": product_rows,
+        "variant_rows": variant_rows,
+        "preview_rows": preview_rows,
+        "invalid_rows": invalid_rows,
+    }
+
+
+# =========================================================
+# Media read / match / apply helpers
+# =========================================================
+
+def fetch_product_media(client: ShopifyClient, product_id: str, page_size: int = 100) -> list[dict[str, Any]]:
+    out = []
+    after = None
+
+    while True:
+        data = gql(
+            client,
+            Q_PRODUCT_MEDIA_PAGE,
+            {"id": product_id, "first": page_size, "after": after},
+        )
+        product = data.get("product")
+        if not product:
+            raise RuntimeError(f"Product not found while reading media: {product_id}")
+
+        conn = product.get("media") or {}
+        for node in conn.get("nodes") or []:
+            if not node:
+                continue
+            preview = node.get("preview") or {}
+            image_obj = node.get("image") or {}
+            preview_image = preview.get("image") or {}
+            urls = _dedupe_keep_order([
+                _norm_str(image_obj.get("url")),
+                _norm_str(preview_image.get("url")),
+            ])
+            out.append({
+                "id": _norm_str(node.get("id")),
+                "media_content_type": _norm_str(node.get("mediaContentType")),
+                "urls": urls,
+            })
+
+        page_info = conn.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        after = page_info.get("endCursor")
+        if not after:
+            break
+
+    return out
+
+
+def match_requested_urls_to_media(
+    requested_urls: list[str],
+    media_nodes: list[dict[str, Any]],
+) -> tuple[dict[str, str], list[str]]:
+    """Match URL -> Media ID, using exact normalized URL first and unique basename second."""
+    exact_map = defaultdict(list)
+    basename_map = defaultdict(list)
+
+    for node in media_nodes:
+        media_id = _norm_str(node.get("id"))
+        if not media_id:
+            continue
+        for url in node.get("urls") or []:
+            exact_key = _normalize_media_url(url)
+            base_key = _media_basename_key(url)
+            if exact_key:
+                exact_map[exact_key].append(media_id)
+            if base_key:
+                basename_map[base_key].append(media_id)
+
+    resolved = {}
+    unresolved = []
+    used_ids = set()
+
+    for url in requested_urls:
+        exact_key = _normalize_media_url(url)
+        candidates = [x for x in exact_map.get(exact_key, []) if x not in used_ids]
+
+        if not candidates:
+            base_key = _media_basename_key(url)
+            base_candidates = list(dict.fromkeys(
+                x for x in basename_map.get(base_key, []) if x not in used_ids
+            ))
+            # Basename fallback is only safe when exactly one candidate exists.
+            candidates = base_candidates if len(base_candidates) == 1 else []
+
+        if candidates:
+            media_id = candidates[0]
+            resolved[url] = media_id
+            used_ids.add(media_id)
+        else:
+            unresolved.append(url)
+
+    return resolved, unresolved
+
+
+def add_product_media_urls(
+    client: ShopifyClient,
+    product_id: str,
+    urls: list[str],
+    create_batch_size: int,
+) -> tuple[bool, str]:
+    if not urls:
+        return True, ""
+
+    for _, batch in _chunk_list(urls, max(1, int(create_batch_size or 1))):
+        media_inputs = [
+            {
+                "originalSource": url,
+                "mediaContentType": "IMAGE",
+            }
+            for url in batch
+        ]
+        data = gql(
+            client,
+            M_PRODUCT_ADD_MEDIA,
+            {
+                "product": {"id": product_id},
+                "media": media_inputs,
+            },
+        )
+        resp = data.get("productUpdate") or {}
+        errs = resp.get("userErrors") or []
+        if errs:
+            return False, json.dumps(errs, ensure_ascii=False)[:1000]
+
+    return True, ""
+
+
+def wait_for_product_media_urls(
+    client: ShopifyClient,
+    product_id: str,
+    urls: list[str],
+    poll_attempts: int,
+    poll_interval: float,
+) -> tuple[dict[str, str], list[str], list[dict[str, Any]]]:
+    last_nodes = []
+    resolved = {}
+    unresolved = list(urls)
+
+    for attempt in range(max(1, int(poll_attempts or 1))):
+        last_nodes = fetch_product_media(client, product_id)
+        resolved, unresolved = match_requested_urls_to_media(urls, last_nodes)
+        if not unresolved:
+            return resolved, [], last_nodes
+        if attempt < max(1, int(poll_attempts or 1)) - 1:
+            time.sleep(max(0.0, float(poll_interval or 0)))
+
+    return resolved, unresolved, last_nodes
+
+
+def wait_for_job(
+    client: ShopifyClient,
+    job_id: str,
+    poll_attempts: int,
+    poll_interval: float,
+) -> tuple[bool, str]:
+    if not job_id:
+        return True, ""
+
+    for attempt in range(max(1, int(poll_attempts or 1))):
+        data = gql(client, Q_JOB_STATUS, {"id": job_id})
+        node = data.get("node") or {}
+        if bool(node.get("done")):
+            return True, ""
+        if attempt < max(1, int(poll_attempts or 1)) - 1:
+            time.sleep(max(0.0, float(poll_interval or 0)))
+
+    return False, f"Timed out waiting for media reorder job: {job_id}"
+
+
+def reorder_product_media(
+    client: ShopifyClient,
+    product_id: str,
+    ordered_media_ids: list[str],
+    current_media_nodes: list[dict[str, Any]],
+    job_poll_attempts: int,
+    job_poll_interval: float,
+) -> tuple[bool, str]:
+    if not ordered_media_ids:
+        return True, ""
+
+    current_ids = [_norm_str(x.get("id")) for x in current_media_nodes if _norm_str(x.get("id"))]
+    if current_ids[:len(ordered_media_ids)] == ordered_media_ids:
+        return True, ""
+
+    moves = [
+        {"id": media_id, "newPosition": str(position)}
+        for position, media_id in enumerate(ordered_media_ids)
+    ]
+
+    data = gql(
+        client,
+        M_PRODUCT_REORDER_MEDIA,
+        {"id": product_id, "moves": moves},
+    )
+    resp = data.get("productReorderMedia") or {}
+    errs = (resp.get("mediaUserErrors") or []) + (resp.get("userErrors") or [])
+    if errs:
+        return False, json.dumps(errs, ensure_ascii=False)[:1000]
+
+    job = resp.get("job") or {}
+    job_id = _norm_str(job.get("id"))
+    if bool(job.get("done")):
+        return True, ""
+
+    return wait_for_job(
+        client=client,
+        job_id=job_id,
+        poll_attempts=job_poll_attempts,
+        poll_interval=job_poll_interval,
+    )
+
+
+def _parse_variant_media_error_indices(errors: list[dict[str, Any]]) -> tuple[set[int], list[dict[str, Any]]]:
+    indexed = set()
+    non_indexed = []
+
+    for err in errors:
+        field = err.get("field") or []
+        idx = None
+        if isinstance(field, list):
+            for i, part in enumerate(field):
+                if str(part) == "variantMedia" and i + 1 < len(field):
+                    try:
+                        idx = int(field[i + 1])
+                    except Exception:
+                        idx = None
+                    break
+        if idx is None:
+            non_indexed.append(err)
+        else:
+            indexed.add(idx)
+
+    return indexed, non_indexed
+
+
+def apply_variant_media_mutation_batches(
+    *,
+    client: ShopifyClient,
+    mutation: str,
+    response_key: str,
+    product_id: str,
+    ops: list[dict[str, Any]],
+    batch_size: int,
+    operation_name: str,
+) -> dict[str, Any]:
+    """Apply append/detach variant-media inputs and return failed row keys."""
+    failed_keys = set()
+    detail_fail_rows = []
+
+    if not ops:
+        return {"failed_keys": failed_keys, "detail_fail_rows": detail_fail_rows}
+
+    total_batches = (len(ops) + batch_size - 1) // batch_size
+    for batch_no, (_, batch) in enumerate(_chunk_list(ops, batch_size), start=1):
+        variables = {
+            "productId": product_id,
+            "variantMedia": [x["input"] for x in batch],
+        }
+        print(
+            f"  {operation_name} {batch_no}/{total_batches}: "
+            f"{len(batch)} variants ... ",
+            end="",
+            flush=True,
+        )
+
+        try:
+            data = gql(client, mutation, variables)
+            resp = data.get(response_key) or {}
+            errs = resp.get("userErrors") or []
+
+            if not errs:
+                print("OK", flush=True)
+                continue
+
+            indexed, non_indexed = _parse_variant_media_error_indices(errs)
+
+            if non_indexed:
+                for op in batch:
+                    failed_keys.add(op["row_key"])
+                    detail_fail_rows.append({
+                        "entity_type": "VARIANT",
+                        "owner_id": op["variant_id"],
+                        "field_key": VARIANT_IMAGE_FIELD_KEY,
+                        "error_reason": f"{operation_name}_batch_error",
+                        "message": (
+                            f"sheet_row={op.get('sheet_row')} | product_id={product_id} | "
+                            f"errors={json.dumps(non_indexed, ensure_ascii=False)[:500]}"
+                        ),
+                    })
+                print(f"FAILED (fail={len(batch)})", flush=True)
+                continue
+
+            for idx in indexed:
+                if 0 <= idx < len(batch):
+                    op = batch[idx]
+                    failed_keys.add(op["row_key"])
+                    matched = [
+                        e for e in errs
+                        if isinstance(e.get("field"), list)
+                        and "variantMedia" in [str(x) for x in e.get("field")]
+                    ]
+                    detail_fail_rows.append({
+                        "entity_type": "VARIANT",
+                        "owner_id": op["variant_id"],
+                        "field_key": VARIANT_IMAGE_FIELD_KEY,
+                        "error_reason": f"{operation_name}_error",
+                        "message": (
+                            f"sheet_row={op.get('sheet_row')} | product_id={product_id} | "
+                            f"error={json.dumps((matched or errs)[:1], ensure_ascii=False)[:500]}"
+                        ),
+                    })
+
+            print(f"PARTIAL_FAIL (fail={len(indexed)})", flush=True)
+
+        except Exception as e:
+            for op in batch:
+                failed_keys.add(op["row_key"])
+                detail_fail_rows.append({
+                    "entity_type": "VARIANT",
+                    "owner_id": op["variant_id"],
+                    "field_key": VARIANT_IMAGE_FIELD_KEY,
+                    "error_reason": f"{operation_name}_exception",
+                    "message": (
+                        f"sheet_row={op.get('sheet_row')} | product_id={product_id} | "
+                        f"exception={e}"
+                    ),
+                })
+            print(f"FAILED (fail={len(batch)})", flush=True)
+
+    return {"failed_keys": failed_keys, "detail_fail_rows": detail_fail_rows}
+
+
+def apply_media_plan(
+    *,
+    client: ShopifyClient,
+    product_rows: list[dict[str, Any]],
+    variant_rows: list[dict[str, Any]],
+    create_batch_size: int,
+    variant_batch_size: int,
+    media_poll_attempts: int,
+    media_poll_interval: float,
+    reorder_poll_attempts: int,
+    reorder_poll_interval: float,
+) -> dict[str, Any]:
+    total = len(product_rows) + len(variant_rows)
+    print(
+        f"=== Applying media edits === total={total}, "
+        f"product_rows={len(product_rows)}, variant_rows={len(variant_rows)}"
+    )
+
+    ok_count = 0
+    fail_count = 0
+    detail_fail_rows = []
+
+    # Cache product media so product rows and variant rows can share the same URL lookup.
+    media_cache: dict[str, list[dict[str, Any]]] = {}
+
+    # -----------------------------------------------------
+    # Product image URL add + order
+    # -----------------------------------------------------
+    for row_no, row in enumerate(product_rows, start=1):
+        product_id = row["owner_id"]
+        urls = row["urls"]
+        print(
+            f"Product media {row_no}/{len(product_rows)}: "
+            f"{product_id} | images={len(urls)} ... ",
+            end="",
+            flush=True,
+        )
+
+        try:
+            current_nodes = fetch_product_media(client, product_id)
+            _, missing_urls = match_requested_urls_to_media(urls, current_nodes)
+
+            if missing_urls:
+                created, create_error = add_product_media_urls(
+                    client=client,
+                    product_id=product_id,
+                    urls=missing_urls,
+                    create_batch_size=create_batch_size,
+                )
+                if not created:
+                    raise RuntimeError(f"add media failed: {create_error}")
+
+            resolved, unresolved, current_nodes = wait_for_product_media_urls(
+                client=client,
+                product_id=product_id,
+                urls=urls,
+                poll_attempts=media_poll_attempts,
+                poll_interval=media_poll_interval,
+            )
+            if unresolved:
+                raise RuntimeError(
+                    "Media URL(s) not found on product after upload: "
+                    + json.dumps(unresolved[:5], ensure_ascii=False)
+                )
+
+            ordered_ids = [resolved[url] for url in urls]
+            reordered, reorder_error = reorder_product_media(
+                client=client,
+                product_id=product_id,
+                ordered_media_ids=ordered_ids,
+                current_media_nodes=current_nodes,
+                job_poll_attempts=reorder_poll_attempts,
+                job_poll_interval=reorder_poll_interval,
+            )
+            if not reordered:
+                raise RuntimeError(reorder_error)
+
+            media_cache[product_id] = fetch_product_media(client, product_id)
+            ok_count += 1
+            print("OK", flush=True)
+
+        except Exception as e:
+            fail_count += 1
+            detail_fail_rows.append({
+                "entity_type": "PRODUCT",
+                "owner_id": product_id,
+                "field_key": PRODUCT_IMAGES_FIELD_KEY,
+                "error_reason": "product_media_apply_error",
+                "message": f"sheet_row={row.get('sheet_row')} | exception={e}",
+            })
+            print("FAILED", flush=True)
+
+    # -----------------------------------------------------
+    # Variant image assignment / clear
+    # -----------------------------------------------------
+    row_status = {}
+    target_media_by_row = {}
+
+    for idx, row in enumerate(variant_rows):
+        row_key = f"{row['owner_id']}|{row.get('sheet_row')}|{idx}"
+        row["row_key"] = row_key
+        row_status[row_key] = True
+
+    # Resolve/add all target image URLs product by product.
+    variant_by_product = defaultdict(list)
+    for row in variant_rows:
+        variant_by_product[row["product_id"]].append(row)
+
+    for product_id, rows_for_product in variant_by_product.items():
+        set_rows = [r for r in rows_for_product if r["action"] == "SET"]
+        if not set_rows:
+            continue
+
+        requested_urls = _dedupe_keep_order([r["url"] for r in set_rows])
+
+        try:
+            current_nodes = media_cache.get(product_id)
+            if current_nodes is None:
+                current_nodes = fetch_product_media(client, product_id)
+
+            resolved, missing_urls = match_requested_urls_to_media(requested_urls, current_nodes)
+
+            if missing_urls:
+                created, create_error = add_product_media_urls(
+                    client=client,
+                    product_id=product_id,
+                    urls=missing_urls,
+                    create_batch_size=create_batch_size,
+                )
+                if not created:
+                    raise RuntimeError(f"add media failed: {create_error}")
+
+                resolved, unresolved, current_nodes = wait_for_product_media_urls(
+                    client=client,
+                    product_id=product_id,
+                    urls=requested_urls,
+                    poll_attempts=media_poll_attempts,
+                    poll_interval=media_poll_interval,
+                )
+                if unresolved:
+                    raise RuntimeError(
+                        "Variant image URL(s) not found on parent product: "
+                        + json.dumps(unresolved[:5], ensure_ascii=False)
+                    )
+
+            media_cache[product_id] = current_nodes
+
+            for row in set_rows:
+                target_media_by_row[row["row_key"]] = resolved[row["url"]]
+
+        except Exception as e:
+            for row in set_rows:
+                row_status[row["row_key"]] = False
+                detail_fail_rows.append({
+                    "entity_type": "VARIANT",
+                    "owner_id": row["owner_id"],
+                    "field_key": VARIANT_IMAGE_FIELD_KEY,
+                    "error_reason": "variant_target_media_resolve_error",
+                    "message": (
+                        f"sheet_row={row.get('sheet_row')} | product_id={product_id} | "
+                        f"url={row.get('url')} | exception={e}"
+                    ),
+                })
+
+    for product_no, (product_id, rows_for_product) in enumerate(variant_by_product.items(), start=1):
+        active_rows = [r for r in rows_for_product if row_status.get(r["row_key"], False)]
+        if not active_rows:
+            continue
+
+        print(
+            f"Variant media product {product_no}/{len(variant_by_product)}: "
+            f"{product_id} | variants={len(active_rows)}"
+        )
+
+        detach_ops = []
+        append_ops = []
+
+        for row in active_rows:
+            current_ids = _dedupe_keep_order(row.get("current_media_ids") or [])
+            target_id = target_media_by_row.get(row["row_key"], "")
+
+            if row["action"] == "CLEAR":
+                detach_ids = current_ids
+            else:
+                detach_ids = [x for x in current_ids if x != target_id]
+
+            if detach_ids:
+                detach_ops.append({
+                    "row_key": row["row_key"],
+                    "variant_id": row["owner_id"],
+                    "sheet_row": row.get("sheet_row"),
+                    "input": {
+                        "variantId": row["owner_id"],
+                        "mediaIds": detach_ids,
+                    },
+                })
+
+            if row["action"] == "SET" and target_id and target_id not in current_ids:
+                append_ops.append({
+                    "row_key": row["row_key"],
+                    "variant_id": row["owner_id"],
+                    "sheet_row": row.get("sheet_row"),
+                    "input": {
+                        "variantId": row["owner_id"],
+                        "mediaIds": [target_id],
+                    },
+                })
+
+        detach_result = apply_variant_media_mutation_batches(
+            client=client,
+            mutation=M_VARIANT_DETACH_MEDIA,
+            response_key="productVariantDetachMedia",
+            product_id=product_id,
+            ops=detach_ops,
+            batch_size=max(1, int(variant_batch_size or 1)),
+            operation_name="variant_media_detach",
+        )
+        for key in detach_result["failed_keys"]:
+            row_status[key] = False
+        detail_fail_rows.extend(detach_result["detail_fail_rows"])
+
+        # Never append a target image for a row whose detach step failed.
+        append_ops = [x for x in append_ops if row_status.get(x["row_key"], False)]
+        append_result = apply_variant_media_mutation_batches(
+            client=client,
+            mutation=M_VARIANT_APPEND_MEDIA,
+            response_key="productVariantAppendMedia",
+            product_id=product_id,
+            ops=append_ops,
+            batch_size=max(1, int(variant_batch_size or 1)),
+            operation_name="variant_media_append",
+        )
+        for key in append_result["failed_keys"]:
+            row_status[key] = False
+        detail_fail_rows.extend(append_result["detail_fail_rows"])
+
+    variant_ok = sum(1 for row in variant_rows if row_status.get(row["row_key"], False))
+    variant_fail = len(variant_rows) - variant_ok
+    ok_count += variant_ok
+    fail_count += variant_fail
+
+    print(
+        f"=== media edits done === total={total}, ok={ok_count}, fail={fail_count}"
+    )
+    return {
+        "ok_count": ok_count,
+        "fail_count": fail_count,
+        "detail_fail_rows": detail_fail_rows,
+    }
+
+
 # =========================================================
 # Apply helpers
 # =========================================================
@@ -2294,6 +3256,12 @@ def run(
     type_override_by_field_key: Optional[dict[str, str]] = None,
     set_batch_size: int = 25,
     http_timeout: int = 60,
+    media_create_batch_size: int = 20,
+    media_variant_batch_size: int = 25,
+    media_poll_attempts: int = 30,
+    media_poll_interval: float = 2.0,
+    media_reorder_poll_attempts: int = 30,
+    media_reorder_poll_interval: float = 1.0,
     abort_if_fieldkey_contains: str = ".shopify.",
     detail_max_per_reason: int = 2,
 ) -> dict[str, Any]:
@@ -2439,11 +3407,12 @@ def run(
     )
 
     core_plan = build_core_plan(df_ready, shopify)
+    media_plan = build_media_plan(df_ready, shopify)
 
     # ---------------------------------------------------------
     # Plan summary
     # ---------------------------------------------------------
-    full_preview = meta_plan["preview_rows"] + core_plan["preview_rows"]
+    full_preview = meta_plan["preview_rows"] + core_plan["preview_rows"] + media_plan["preview_rows"]
 
     # rows_planned_ops = Shopify API write operation count.
     # rows_planned_rows = human input rows planned for write.
@@ -2455,6 +3424,8 @@ def run(
         + len(core_plan["tag_delta_rows"])
         + len(core_plan["variant_inputs"])
         + len(core_plan["inventory_sku_inputs"])
+        + len(media_plan["product_rows"])
+        + len(media_plan["variant_rows"])
     )
     rows_planned_rows = len(full_preview)
 
@@ -2487,7 +3458,7 @@ def run(
         ),
     } for r in df_unresolvable.to_dict("records")]
 
-    invalid_detail_rows = meta_plan["invalid_rows"] + core_plan["invalid_rows"]
+    invalid_detail_rows = meta_plan["invalid_rows"] + core_plan["invalid_rows"] + media_plan["invalid_rows"]
     rows_skipped = len(df_bad) + len(df_unresolvable) + len(invalid_detail_rows)
 
     # preview_limit <= 0 means show all preview rows.
@@ -2665,6 +3636,18 @@ def run(
         set_batch_size=set_batch_size,
     )
 
+    media_apply = apply_media_plan(
+        client=shopify,
+        product_rows=media_plan["product_rows"],
+        variant_rows=media_plan["variant_rows"],
+        create_batch_size=media_create_batch_size,
+        variant_batch_size=media_variant_batch_size,
+        media_poll_attempts=media_poll_attempts,
+        media_poll_interval=media_poll_interval,
+        reorder_poll_attempts=media_reorder_poll_attempts,
+        reorder_poll_interval=media_reorder_poll_interval,
+    )
+
     print("====================================")
     print("APPLY END")
     print("====================================")
@@ -2674,12 +3657,14 @@ def run(
         + product_apply["ok_count"]
         + inventory_sku_apply["ok_count"]
         + variant_apply["ok_count"]
+        + media_apply["ok_count"]
     )
     apply_fail_count = (
         metafield_apply["fail_count"]
         + product_apply["fail_count"]
         + inventory_sku_apply["fail_count"]
         + variant_apply["fail_count"]
+        + media_apply["fail_count"]
     )
 
     final_status = "SUCCESS"
@@ -2720,6 +3705,7 @@ def run(
             + product_apply["detail_fail_rows"]
             + inventory_sku_apply["detail_fail_rows"]
             + variant_apply["detail_fail_rows"]
+            + media_apply["detail_fail_rows"]
         ),
         max_per_reason=detail_max_per_reason,
     )
