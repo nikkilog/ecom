@@ -135,12 +135,15 @@ mutation productUpdate($input: ProductInput!) {
 }
 """
 
-Q_VARIANT_PRODUCT_MAP = """
+Q_VARIANT_CONTEXT_MAP = """
 query($ids: [ID!]!) {
   nodes(ids: $ids) {
     ... on ProductVariant {
       id
       product {
+        id
+      }
+      inventoryItem {
         id
       }
     }
@@ -302,7 +305,16 @@ def build_shopify_client(
     )
 
 
+class _RetryableGqlError(RuntimeError):
+    pass
+
+
 def gql(client: ShopifyClient, query: str, variables: Optional[dict] = None, retries: int = 6) -> dict:
+    """Execute GraphQL with retries only for transient failures.
+
+    Schema/validation errors and normal Shopify userErrors are not retried.
+    Network errors, HTTP 429/5xx, and GraphQL THROTTLED errors are retried.
+    """
     payload = {"query": query, "variables": variables or {}}
     last_err = None
 
@@ -314,21 +326,38 @@ def gql(client: ShopifyClient, query: str, variables: Optional[dict] = None, ret
                 json=payload,
                 timeout=client.timeout,
             )
-            data = r.json()
 
-            if r.status_code >= 500:
-                raise RuntimeError(f"HTTP {r.status_code}")
+            try:
+                data = r.json()
+            except Exception:
+                data = {"raw_text": r.text[:1000]}
 
-            if data.get("errors"):
-                raise RuntimeError(data["errors"])
+            if r.status_code == 429 or r.status_code >= 500:
+                raise _RetryableGqlError(f"HTTP {r.status_code}: {data}")
+
+            if r.status_code >= 400:
+                raise RuntimeError(f"HTTP {r.status_code}: {data}")
+
+            errors = data.get("errors") or []
+            if errors:
+                throttled = any(
+                    _upper_strip((e.get("extensions") or {}).get("code")) == "THROTTLED"
+                    for e in errors
+                    if isinstance(e, dict)
+                )
+                if throttled:
+                    raise _RetryableGqlError(errors)
+                raise RuntimeError(errors)
 
             if data.get("data") is None:
                 raise RuntimeError(f"No data returned: {data}")
 
             return data["data"]
 
-        except Exception as e:
+        except (requests.Timeout, requests.ConnectionError, _RetryableGqlError) as e:
             last_err = e
+            if i >= retries - 1:
+                break
             time.sleep(min(2**i, 12) + random.random())
 
     raise RuntimeError(f"GraphQL failed after retries: {last_err}")
@@ -901,20 +930,24 @@ def resolve_owner_ids(client: ShopifyClient, df_parsed: pd.DataFrame) -> pd.Data
 
 
 
-def get_variant_product_map(client: ShopifyClient, variant_ids: list[str], chunk_size: int = 80) -> dict[str, str]:
-    out = {}
+def get_variant_context_map(client: ShopifyClient, variant_ids: list[str], chunk_size: int = 80) -> dict[str, dict[str, str]]:
+    """Resolve parent Product ID and InventoryItem ID for Variant IDs in batches."""
+    out: dict[str, dict[str, str]] = {}
     ids = [x for x in variant_ids if isinstance(x, str) and x.strip()]
     for _, part in _chunk_list(ids, chunk_size):
-        data = gql(client, Q_VARIANT_PRODUCT_MAP, {"ids": part})
+        data = gql(client, Q_VARIANT_CONTEXT_MAP, {"ids": part})
         nodes = data.get("nodes") or []
         for node in nodes:
             if not node:
                 continue
-            vid = node.get("id")
-            product = node.get("product") or {}
-            pid = product.get("id")
-            if vid and pid:
-                out[vid] = pid
+            vid = _norm_str(node.get("id"))
+            product_id = _norm_str((node.get("product") or {}).get("id"))
+            inventory_item_id = _norm_str((node.get("inventoryItem") or {}).get("id"))
+            if vid:
+                out[vid] = {
+                    "product_id": product_id,
+                    "inventory_item_id": inventory_item_id,
+                }
     return out
 
 
@@ -1504,7 +1537,7 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                     "owner_id": owner_id,
                     "field_key": fk,
                     "action": action,
-                    "plan_type": "variant_core",
+                    "plan_type": "inventory_item_sku",
                     "value_preview": bucket["sku"],
                 })
 
@@ -1622,27 +1655,63 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
 
     variant_inputs = []
     variant_meta_rows = []
+    inventory_sku_inputs = []
+    inventory_sku_meta_rows = []
 
     variant_owner_ids = list(variant_updates.keys())
-    variant_product_map = get_variant_product_map(client, variant_owner_ids, chunk_size=80)
+    variant_context_map = get_variant_context_map(client, variant_owner_ids, chunk_size=80)
 
     for owner_id, bucket in variant_updates.items():
-        product_id = variant_product_map.get(owner_id)
+        context = variant_context_map.get(owner_id) or {}
+        product_id = _norm_str(context.get("product_id"))
+        inventory_item_id = _norm_str(context.get("inventory_item_id"))
+
+        if bucket["sku_present"]:
+            if not inventory_item_id:
+                invalid_rows.append({
+                    "sheet_row": bucket["source_rows"][0] if bucket["source_rows"] else None,
+                    "entity_type": "VARIANT",
+                    "owner_id": owner_id,
+                    "field_key": "core.sku",
+                    "error_reason": "cannot_resolve_inventory_item_id",
+                    "message": f"variant_id={owner_id} | cannot resolve inventory item id for SKU update",
+                })
+            else:
+                inventory_sku_inputs.append({
+                    "inventory_item_id": inventory_item_id,
+                    "sku": bucket["sku"],
+                })
+                inventory_sku_meta_rows.append({
+                    "entity_type": "VARIANT",
+                    "owner_id": owner_id,
+                    "inventory_item_id": inventory_item_id,
+                    "field_key": "core.sku",
+                    "sheet_rows": bucket["source_rows"],
+                })
+
+        has_variant_bulk_fields = (
+            bucket["price"] is not None
+            or bucket["compareAtPrice_present"]
+            or bucket["weight_value_present"]
+            or bucket["weight_unit_present"]
+        )
+        if not has_variant_bulk_fields:
+            continue
+
         if not product_id:
             invalid_rows.append({
                 "sheet_row": bucket["source_rows"][0] if bucket["source_rows"] else None,
                 "entity_type": "VARIANT",
                 "owner_id": owner_id,
-                "field_key": ",".join(bucket["field_keys"]) if bucket["field_keys"] else "core.variant",
+                "field_key": ",".join(
+                    sorted(k for k in set(bucket["field_keys"]) if k != "core.sku")
+                ) or "core.variant",
                 "error_reason": "cannot_resolve_variant_product_id",
                 "message": f"variant_id={owner_id} | cannot resolve parent product id",
             })
             continue
 
         input_obj = {"id": owner_id}
-
-        if bucket["sku_present"]:
-            input_obj["sku"] = bucket["sku"]
 
         if bucket["price"] is not None:
             input_obj["price"] = bucket["price"]
@@ -1660,6 +1729,7 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
             if weight_part:
                 input_obj["inventoryItem"] = {"measurement": {"weight": weight_part}}
 
+        variant_field_keys = sorted(k for k in set(bucket["field_keys"]) if k != "core.sku")
         variant_inputs.append({
             "product_id": product_id,
             "variant_input": input_obj,
@@ -1668,7 +1738,7 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
             "entity_type": "VARIANT",
             "owner_id": owner_id,
             "product_id": product_id,
-            "field_key": ",".join(sorted(set(bucket["field_keys"]))) if bucket["field_keys"] else "core.variant",
+            "field_key": ",".join(variant_field_keys) if variant_field_keys else "core.variant",
             "sheet_rows": bucket["source_rows"],
         })
 
@@ -1687,6 +1757,8 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
         "product_meta_rows": product_meta_rows,
         "variant_inputs": variant_inputs,
         "variant_meta_rows": variant_meta_rows,
+        "inventory_sku_inputs": inventory_sku_inputs,
+        "inventory_sku_meta_rows": inventory_sku_meta_rows,
         "tag_delta_rows": tag_delta_rows,
         "preview_rows": preview_rows,
         "invalid_rows": invalid_rows,
@@ -1942,6 +2014,123 @@ def apply_product_core_plan(
     print(f"=== productUpdate done === total={total}, ok={ok_count}, fail={fail_count}")
     return {"ok_count": ok_count, "fail_count": fail_count, "detail_fail_rows": detail_fail_rows}
     
+
+
+def _build_inventory_item_sku_batch_mutation(batch_size: int) -> str:
+    variable_defs = []
+    fields = []
+
+    for i in range(batch_size):
+        variable_defs.append(f"$id{i}: ID!")
+        variable_defs.append(f"$input{i}: InventoryItemInput!")
+        fields.append(
+            f"""
+  item{i}: inventoryItemUpdate(id: $id{i}, input: $input{i}) {{
+    inventoryItem {{
+      id
+      sku
+    }}
+    userErrors {{
+      field
+      message
+    }}
+  }}
+""".rstrip()
+        )
+
+    return "mutation inventoryItemSkuBatch(" + ", ".join(variable_defs) + ") {\n" + "\n".join(fields) + "\n}"
+
+
+def apply_inventory_item_sku_plan(
+    client: ShopifyClient,
+    sku_inputs: list[dict[str, Any]],
+    sku_meta_rows: list[dict[str, Any]],
+    set_batch_size: int,
+) -> dict[str, Any]:
+    """Update SKU through InventoryItem, batching multiple aliases per HTTP request."""
+    total = len(sku_inputs)
+    batch_size = max(1, min(int(set_batch_size or 1), 25))
+    total_batches = (total + batch_size - 1) // batch_size if total else 0
+
+    print(
+        f"=== Applying inventoryItemUpdate SKU batches === "
+        f"total={total}, batches={total_batches}, batch_size={batch_size}"
+    )
+
+    if total == 0:
+        print("=== inventoryItemUpdate SKU done === total=0, ok=0, fail=0")
+        return {"ok_count": 0, "fail_count": 0, "detail_fail_rows": []}
+
+    ok_count = 0
+    fail_count = 0
+    detail_fail_rows = []
+
+    for batch_no, (start_idx, batch_inputs) in enumerate(_chunk_list(sku_inputs, batch_size), start=1):
+        batch_meta = sku_meta_rows[start_idx:start_idx + len(batch_inputs)]
+        mutation = _build_inventory_item_sku_batch_mutation(len(batch_inputs))
+        variables = {}
+
+        for i, item in enumerate(batch_inputs):
+            variables[f"id{i}"] = item["inventory_item_id"]
+            variables[f"input{i}"] = {"sku": item["sku"]}
+
+        print(f"Batch {batch_no}/{total_batches}: {len(batch_inputs)} items ... ", end="", flush=True)
+
+        try:
+            data = gql(client, mutation, variables)
+            batch_ok = 0
+            batch_fail = 0
+
+            for i, meta in enumerate(batch_meta):
+                payload = data.get(f"item{i}") or {}
+                errs = payload.get("userErrors") or []
+                inventory_item = payload.get("inventoryItem") or {}
+
+                if errs or not inventory_item.get("id"):
+                    batch_fail += 1
+                    first_err = errs[0] if errs else {}
+                    detail_fail_rows.append({
+                        "entity_type": meta.get("entity_type", "VARIANT"),
+                        "owner_id": meta.get("owner_id", ""),
+                        "field_key": "core.sku",
+                        "error_reason": "inventory_item_sku_update_error",
+                        "message": (
+                            f"sheet_rows={meta.get('sheet_rows')} | "
+                            f"inventory_item_id={meta.get('inventory_item_id')} | "
+                            f"msg={first_err.get('message', 'No inventoryItem returned')} | "
+                            f"field={first_err.get('field')}"
+                        ),
+                    })
+                else:
+                    batch_ok += 1
+
+            ok_count += batch_ok
+            fail_count += batch_fail
+
+            if batch_fail == 0:
+                print("OK", flush=True)
+            elif batch_ok == 0:
+                print(f"FAILED (fail={batch_fail})", flush=True)
+            else:
+                print(f"PARTIAL_FAIL (ok={batch_ok}, fail={batch_fail})", flush=True)
+
+        except Exception as e:
+            fail_count += len(batch_inputs)
+            for meta in batch_meta:
+                detail_fail_rows.append({
+                    "entity_type": meta.get("entity_type", "VARIANT"),
+                    "owner_id": meta.get("owner_id", ""),
+                    "field_key": "core.sku",
+                    "error_reason": "inventory_item_sku_batch_exception",
+                    "message": (
+                        f"sheet_rows={meta.get('sheet_rows')} | "
+                        f"inventory_item_id={meta.get('inventory_item_id')} | exception={e}"
+                    ),
+                })
+            print(f"FAILED (fail={len(batch_inputs)})", flush=True)
+
+    print(f"=== inventoryItemUpdate SKU done === total={total}, ok={ok_count}, fail={fail_count}")
+    return {"ok_count": ok_count, "fail_count": fail_count, "detail_fail_rows": detail_fail_rows}
 
 
 def apply_variant_core_plan(
@@ -2265,6 +2454,7 @@ def run(
         + len(core_plan["product_inputs"])
         + len(core_plan["tag_delta_rows"])
         + len(core_plan["variant_inputs"])
+        + len(core_plan["inventory_sku_inputs"])
     )
     rows_planned_rows = len(full_preview)
 
@@ -2461,6 +2651,13 @@ def run(
         set_batch_size=set_batch_size,
     )
 
+    inventory_sku_apply = apply_inventory_item_sku_plan(
+        client=shopify,
+        sku_inputs=core_plan["inventory_sku_inputs"],
+        sku_meta_rows=core_plan["inventory_sku_meta_rows"],
+        set_batch_size=set_batch_size,
+    )
+
     variant_apply = apply_variant_core_plan(
         client=shopify,
         variant_inputs=core_plan["variant_inputs"],
@@ -2472,8 +2669,18 @@ def run(
     print("APPLY END")
     print("====================================")
     
-    rows_written = metafield_apply["ok_count"] + product_apply["ok_count"] + variant_apply["ok_count"]
-    apply_fail_count = metafield_apply["fail_count"] + product_apply["fail_count"] + variant_apply["fail_count"]
+    rows_written = (
+        metafield_apply["ok_count"]
+        + product_apply["ok_count"]
+        + inventory_sku_apply["ok_count"]
+        + variant_apply["ok_count"]
+    )
+    apply_fail_count = (
+        metafield_apply["fail_count"]
+        + product_apply["fail_count"]
+        + inventory_sku_apply["fail_count"]
+        + variant_apply["fail_count"]
+    )
 
     final_status = "SUCCESS"
     if apply_fail_count > 0 and rows_written > 0:
@@ -2508,7 +2715,12 @@ def run(
         rows_planned=rows_planned,
         rows_written=rows_written,
         rows_skipped=rows_skipped,
-        detail_rows=metafield_apply["detail_fail_rows"] + product_apply["detail_fail_rows"] + variant_apply["detail_fail_rows"],
+        detail_rows=(
+            metafield_apply["detail_fail_rows"]
+            + product_apply["detail_fail_rows"]
+            + inventory_sku_apply["detail_fail_rows"]
+            + variant_apply["detail_fail_rows"]
+        ),
         max_per_reason=detail_max_per_reason,
     )
     logger.flush()
