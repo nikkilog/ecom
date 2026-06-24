@@ -55,6 +55,7 @@ SUPPORTED_METAFIELD_ACTIONS = {"SET", "CLEAR"}
 SUPPORTED_CORE_TAG_ACTIONS = {"SET", "CLEAR", "ADD", "REMOVE"}
 SUPPORTED_CORE_SCALAR_ACTIONS = {"SET", "CLEAR"}
 SUPPORTED_CORE_PRICE_ACTIONS = {"SET"}
+SUPPORTED_CORE_SKU_ACTIONS = {"SET"}
 SUPPORTED_CORE_COMPARE_AT_ACTIONS = {"SET", "CLEAR"}
 
 ALLOWED_PREFIXES = ("mf.", "v_mf.", "core.")
@@ -70,7 +71,7 @@ PRODUCT_CORE_KEYS = {
     "core.seo_description",
     "core.vendor",
 }
-VARIANT_CORE_KEYS = {"core.weight", "core.weight_unit", "core.price", "core.compare_at_price"}
+VARIANT_CORE_KEYS = {"core.sku", "core.weight", "core.weight_unit", "core.price", "core.compare_at_price"}
 
 Q_PRODUCT_BY_HANDLE = """
 query($handle: String!) {
@@ -163,6 +164,7 @@ mutation productVariantsBulkUpdate(
     }
     productVariants {
       id
+      sku
       price
       compareAtPrice
       inventoryItem {
@@ -658,6 +660,12 @@ def validate_row(entity_type: str, field_key: str, action: str) -> tuple[bool, s
         if act not in SUPPORTED_CORE_SCALAR_ACTIONS:
             return False, "action_not_supported"
 
+    elif fk == "core.sku":
+        if et != "VARIANT":
+            return False, "core_entity_mismatch"
+        if act not in SUPPORTED_CORE_SKU_ACTIONS:
+            return False, "action_not_supported"
+
     elif fk == "core.price":
         if et != "VARIANT":
             return False, "core_entity_mismatch"
@@ -702,6 +710,37 @@ def recognize_rows(df_work: pd.DataFrame, mode_default: str) -> tuple[pd.DataFra
                 "desired_value": desired,
             })
             continue
+
+        # SKU updates must be anchored to an immutable Variant identifier.
+        # Do not resolve core.sku rows from the old SKU value.
+        if field_key == "core.sku":
+            is_variant_gid = bool(re.fullmatch(r"gid://shopify/ProductVariant/\d+", owner_raw))
+            is_variant_numeric_id = bool(re.fullmatch(r"\d+", owner_raw))
+            if not (is_variant_gid or is_variant_numeric_id):
+                bad_rows.append({
+                    "sheet_row": sheet_row,
+                    "entity_type": entity_type,
+                    "gid_or_handle": owner_raw,
+                    "field_key": field_key,
+                    "action": action,
+                    "mode": mode,
+                    "reason": "sku_update_requires_variant_id",
+                    "desired_value": desired,
+                })
+                continue
+
+            if desired == "":
+                bad_rows.append({
+                    "sheet_row": sheet_row,
+                    "entity_type": entity_type,
+                    "gid_or_handle": owner_raw,
+                    "field_key": field_key,
+                    "action": action,
+                    "mode": mode,
+                    "reason": "sku_cannot_be_empty",
+                    "desired_value": desired,
+                })
+                continue
 
         row_type = "core" if field_key.startswith("core.") else "metafield"
 
@@ -1295,6 +1334,8 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
         if owner_id not in variant_updates:
             variant_updates[owner_id] = {
                 "id": owner_id,
+                "sku_present": False,
+                "sku": None,
                 "price": None,
                 "compareAtPrice_present": False,
                 "compareAtPrice": None,
@@ -1449,6 +1490,24 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                     "value_preview": json.dumps(bucket["tags_value"], ensure_ascii=False)[:200],
                 })
 
+            elif fk == "core.sku":
+                if desired == "":
+                    raise ValueError("core.sku cannot be empty")
+                bucket = get_variant_bucket(owner_id)
+                bucket["sku_present"] = True
+                bucket["sku"] = desired
+                bucket["source_rows"].append(sheet_row)
+                bucket["field_keys"].append(fk)
+                preview_rows.append({
+                    "sheet_row": sheet_row,
+                    "entity_type": entity_type,
+                    "owner_id": owner_id,
+                    "field_key": fk,
+                    "action": action,
+                    "plan_type": "variant_core",
+                    "value_preview": bucket["sku"],
+                })
+
             elif fk == "core.price":
                 bucket = get_variant_bucket(owner_id)
                 bucket["price"] = parse_decimal_str(desired, fk)
@@ -1581,6 +1640,9 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
             continue
 
         input_obj = {"id": owner_id}
+
+        if bucket["sku_present"]:
+            input_obj["sku"] = bucket["sku"]
 
         if bucket["price"] is not None:
             input_obj["price"] = bucket["price"]
