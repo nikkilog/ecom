@@ -1,10 +1,10 @@
-# delivery_name: edit_core_media_fast_apply_v4.py
+# delivery_name: edit_core_media_reliable_fast_v5.py
 # deployment_path: shopify_sync/edit_core.py
 # Full Edit__Core apply engine: core fields, metafields, SKU/prices, and media.
 
 from __future__ import annotations
 
-MODULE_VERSION = "edit_core_media_fast_apply_v4_20260624"
+MODULE_VERSION = "edit_core_media_reliable_fast_v5_20260624"
 
 import base64
 import datetime as dt
@@ -174,14 +174,12 @@ M_PRODUCT_VARIANTS_BULK_UPDATE = """
 mutation productVariantsBulkUpdate(
   $productId: ID!,
   $variants: [ProductVariantsBulkInput!]!,
-  $allowPartialUpdates: Boolean,
-  $media: [CreateMediaInput!]
+  $allowPartialUpdates: Boolean
 ) {
   productVariantsBulkUpdate(
     productId: $productId,
     variants: $variants,
-    allowPartialUpdates: $allowPartialUpdates,
-    media: $media
+    allowPartialUpdates: $allowPartialUpdates
   ) {
     product {
       id
@@ -2502,18 +2500,18 @@ def apply_media_plan(
     reorder_poll_interval: float,
     wait_for_reorder_job: bool = False,
 ) -> dict[str, Any]:
-    """Apply only the two Media Core fields through the Edit__Core pipeline.
+    """Apply Product and Variant image fields through Edit__Core.
 
-    Fast path:
-      - Product images keep the required add + order behavior.
-      - Variant SET uses productVariantsBulkUpdate in product batches.
-        Existing product media use mediaId; missing URLs use mediaSrc and are
-        created/associated in the same mutation.
-      - Variant CLEAR uses productVariantDetachMedia in product batches.
+    Reliability rule for Variant SET:
+      1. Read media already attached to the Variant's parent Product.
+      2. If the requested URL already exists, immediately use its MediaImage ID.
+      3. If it does not exist, attach it to that Product once.
+      4. Poll only that Product until Shopify exposes the MediaImage ID.
+      5. Batch all Variant updates for that Product through
+         productVariantsBulkUpdate using mediaId.
 
-    This deliberately avoids the old SET flow of:
-      add -> poll -> detach -> append
-    for every product/variant group.
+    This preserves the original fast Edit__Core batch architecture while
+    avoiding the unreliable one-mutation mediaSrc creation/assignment race.
     """
     total = len(product_rows) + len(variant_rows)
     print(
@@ -2525,7 +2523,7 @@ def apply_media_plan(
     fail_count = 0
     detail_fail_rows: list[dict[str, Any]] = []
 
-    # One product-media read can be shared by Product and Variant operations.
+    # Shared cache: one product-media read can serve both product and variant work.
     media_cache: dict[str, list[dict[str, Any]]] = {}
 
     # -----------------------------------------------------
@@ -2550,6 +2548,11 @@ def apply_media_plan(
             resolved, missing_urls = match_requested_urls_to_media(urls, current_nodes)
 
             if missing_urls:
+                print(
+                    f"attach_missing={len(missing_urls)} ... ",
+                    end="",
+                    flush=True,
+                )
                 created, create_error = add_product_media_urls(
                     client=client,
                     product_id=product_id,
@@ -2568,7 +2571,7 @@ def apply_media_plan(
                 )
                 if unresolved:
                     raise RuntimeError(
-                        "Media URL(s) not queryable after upload: "
+                        "Media URL(s) still unavailable after attach: "
                         + json.dumps(unresolved[:5], ensure_ascii=False)
                     )
 
@@ -2602,7 +2605,7 @@ def apply_media_plan(
                 "error_reason": "product_media_apply_error",
                 "message": f"sheet_row={row.get('sheet_row')} | exception={exc}",
             })
-            print("FAILED", flush=True)
+            print(f"FAILED | {exc}", flush=True)
 
     # -----------------------------------------------------
     # Variant: core.variant.image_url
@@ -2611,14 +2614,14 @@ def apply_media_plan(
     for row in variant_rows:
         variant_by_product[row["product_id"]].append(row)
 
-    # SET rows are converted into the exact same grouped input structure used
-    # by the original fast productVariantsBulkUpdate apply function.
     fast_variant_inputs: list[dict[str, Any]] = []
     fast_variant_meta: list[dict[str, Any]] = []
     already_correct_count = 0
 
+    product_groups = list(variant_by_product.items())
+
     for product_no, (product_id, rows_for_product) in enumerate(
-        variant_by_product.items(),
+        product_groups,
         start=1,
     ):
         set_rows = [row for row in rows_for_product if row["action"] == "SET"]
@@ -2626,52 +2629,77 @@ def apply_media_plan(
 
         if set_rows:
             print(
-                f"Resolve variant media {product_no}/{len(variant_by_product)}: "
-                f"{product_id} | set={len(set_rows)}"
+                f"Prepare variant media {product_no}/{len(product_groups)}: "
+                f"{product_id} | variants={len(set_rows)} ... ",
+                end="",
+                flush=True,
             )
 
             try:
                 current_nodes = media_cache.get(product_id)
                 if current_nodes is None:
                     current_nodes = fetch_product_media(client, product_id)
-                    media_cache[product_id] = current_nodes
 
-                requested_urls = _dedupe_keep_order([row["url"] for row in set_rows])
-                resolved, _ = match_requested_urls_to_media(
+                requested_urls = _dedupe_keep_order(
+                    [row["url"] for row in set_rows]
+                )
+                resolved, missing_urls = match_requested_urls_to_media(
                     requested_urls,
                     current_nodes,
                 )
 
+                if missing_urls:
+                    print(
+                        f"attach_missing={len(missing_urls)} ... ",
+                        end="",
+                        flush=True,
+                    )
+                    created, create_error = add_product_media_urls(
+                        client=client,
+                        product_id=product_id,
+                        urls=missing_urls,
+                        create_batch_size=create_batch_size,
+                    )
+                    if not created:
+                        raise RuntimeError(f"add media failed: {create_error}")
+
+                    resolved, unresolved, current_nodes = wait_for_product_media_urls(
+                        client=client,
+                        product_id=product_id,
+                        urls=requested_urls,
+                        poll_attempts=media_poll_attempts,
+                        poll_interval=media_poll_interval,
+                    )
+                    if unresolved:
+                        raise RuntimeError(
+                            "Media URL(s) still unavailable after attach: "
+                            + json.dumps(unresolved[:5], ensure_ascii=False)
+                        )
+
+                media_cache[product_id] = current_nodes
+
+                prepared_count = 0
                 for row in set_rows:
                     target_media_id = _norm_str(resolved.get(row["url"]))
+                    if not target_media_id:
+                        raise RuntimeError(
+                            f"Cannot resolve MediaImage ID for URL: {row['url']}"
+                        )
+
                     current_media_ids = _dedupe_keep_order(
                         row.get("current_media_ids") or []
                     )
 
-                    # No Shopify write when the requested media is already the
-                    # current variant media.
-                    if (
-                        target_media_id
-                        and current_media_ids == [target_media_id]
-                    ):
+                    if current_media_ids == [target_media_id]:
                         already_correct_count += 1
                         continue
 
-                    variant_input = {"id": row["owner_id"]}
-                    if target_media_id:
-                        variant_input["mediaId"] = target_media_id
-                        plan_key = "variant_media_id"
-                    else:
-                        # Official ProductVariantsBulkInput supports mediaSrc.
-                        # Missing media is created once at product level by the
-                        # existing batching function and associated in the same
-                        # mutation, so no readiness polling is needed here.
-                        variant_input["mediaSrc"] = [row["url"]]
-                        plan_key = "variant_media_src"
-
                     fast_variant_inputs.append({
                         "product_id": product_id,
-                        "variant_input": variant_input,
+                        "variant_input": {
+                            "id": row["owner_id"],
+                            "mediaId": target_media_id,
+                        },
                     })
                     fast_variant_meta.append({
                         "entity_type": "VARIANT",
@@ -2679,17 +2707,25 @@ def apply_media_plan(
                         "product_id": product_id,
                         "field_key": VARIANT_IMAGE_FIELD_KEY,
                         "sheet_rows": [row.get("sheet_row")],
-                        "media_plan": plan_key,
+                        "media_plan": "variant_media_id",
                     })
+                    prepared_count += 1
+
+                print(
+                    f"READY | prepared={prepared_count}, "
+                    f"already_correct={len(set_rows) - prepared_count}",
+                    flush=True,
+                )
 
             except Exception as exc:
                 fail_count += len(set_rows)
+                print(f"FAILED | {exc}", flush=True)
                 for row in set_rows:
                     detail_fail_rows.append({
                         "entity_type": "VARIANT",
                         "owner_id": row["owner_id"],
                         "field_key": VARIANT_IMAGE_FIELD_KEY,
-                        "error_reason": "variant_media_resolve_error",
+                        "error_reason": "variant_media_prepare_error",
                         "message": (
                             f"sheet_row={row.get('sheet_row')} | "
                             f"product_id={product_id} | exception={exc}"
@@ -2736,6 +2772,7 @@ def apply_media_plan(
             fail_count += clear_fail
             detail_fail_rows.extend(detach_result["detail_fail_rows"])
 
+    # Existing Edit__Core batching function; now every media SET uses mediaId.
     if fast_variant_inputs:
         variant_set_result = apply_variant_core_plan(
             client=client,
@@ -2746,6 +2783,16 @@ def apply_media_plan(
         ok_count += variant_set_result["ok_count"]
         fail_count += variant_set_result["fail_count"]
         detail_fail_rows.extend(variant_set_result["detail_fail_rows"])
+
+        # Print immediate failure details rather than hiding them until the end.
+        for detail in variant_set_result["detail_fail_rows"][:10]:
+            print(
+                "Variant media failure:",
+                detail.get("owner_id", ""),
+                "|",
+                detail.get("message", ""),
+                flush=True,
+            )
 
     ok_count += already_correct_count
 
@@ -3168,36 +3215,14 @@ def apply_variant_core_plan(
             print(f"Batch {batch_no}/{total_batches}: {len(batch_inputs)} items ... ", end="", flush=True)
 
             try:
-                # When a variant input uses mediaSrc, create each missing
-                # source once at product level in the same mutation. Existing
-                # product media continue to use mediaId.
-                media_sources = []
-                media_seen = set()
-                for variant_input in batch_inputs:
-                    for src in variant_input.get("mediaSrc") or []:
-                        src = _norm_str(src)
-                        if src and src not in media_seen:
-                            media_seen.add(src)
-                            media_sources.append(src)
-
-                variables = {
-                    "productId": product_id,
-                    "variants": batch_inputs,
-                    "allowPartialUpdates": True,
-                }
-                if media_sources:
-                    variables["media"] = [
-                        {
-                            "originalSource": src,
-                            "mediaContentType": "IMAGE",
-                        }
-                        for src in media_sources
-                    ]
-
                 data = gql(
                     client,
                     M_PRODUCT_VARIANTS_BULK_UPDATE,
-                    variables,
+                    {
+                        "productId": product_id,
+                        "variants": batch_inputs,
+                        "allowPartialUpdates": True,
+                    },
                 )
                 resp = (data.get("productVariantsBulkUpdate") or {})
                 errs = resp.get("userErrors") or []
@@ -3370,7 +3395,20 @@ def run(
         site_code=site_code,
     )
 
+    phase_started_at = time.perf_counter()
+    print("\n====================================")
+    print("EDIT__CORE PREPARE START")
+    print("====================================")
+    print("run_id:", run_id)
+    print("input:", f"{input_sheet_label} / {worksheet_title}")
+
     df = load_edit_core(ws_edit)
+    print(
+        f"[prepare 1/5] sheet loaded | rows={len(df)} | "
+        f"elapsed={time.perf_counter() - phase_started_at:.1f}s",
+        flush=True,
+    )
+
     scope_prefixes = (
         {"mf.", "v_mf.", "core."}
         if only_field_prefixes is None
@@ -3386,6 +3424,12 @@ def run(
 
     rows_loaded = int(len(df))
     rows_pending = int(len(df_work))
+    print(
+        f"[prepare 2/5] pending filtered | pending={rows_pending} | "
+        f"scope={sorted(scope_prefixes)} | "
+        f"elapsed={time.perf_counter() - phase_started_at:.1f}s",
+        flush=True,
+    )
 
     if df_work.empty:
         logger.log_row(
@@ -3412,6 +3456,12 @@ def run(
 
     df_parsed, df_bad = recognize_rows(df_work, mode_default=mode_default)
     rows_recognized = int(len(df_parsed))
+    print(
+        f"[prepare 3/5] rows recognized | recognized={rows_recognized} | "
+        f"rejected={len(df_bad)} | "
+        f"elapsed={time.perf_counter() - phase_started_at:.1f}s",
+        flush=True,
+    )
 
     if df_parsed.empty:
         rows_skipped = int(len(df_bad))
@@ -3457,9 +3507,18 @@ def run(
             "meta": {"site_code": site_code, "job_name": job_name, "run_id": run_id},
         }
 
+    print("[prepare 4/5] resolving Shopify owners ...", flush=True)
     df_ready = resolve_owner_ids(shopify, df_parsed)
+    print(
+        f"[prepare 4/5] owners resolved | unresolved="
+        f"{int((df_ready['_skip_reason'] != '').sum())} | "
+        f"elapsed={time.perf_counter() - phase_started_at:.1f}s",
+        flush=True,
+    )
+
     cfg_type_map = load_cfg_fields_map(ws_cfg_fields)
 
+    print("[prepare 5/5] building apply plans ...", flush=True)
     meta_plan = build_metafield_plan(
         df_ready=df_ready,
         cfg_type_map=cfg_type_map,
@@ -3469,6 +3528,14 @@ def run(
 
     core_plan = build_core_plan(df_ready, shopify)
     media_plan = build_media_plan(df_ready, shopify)
+    print(
+        f"[prepare 5/5] plans built | metafield={len(meta_plan['set_inputs'])} | "
+        f"product_core={len(core_plan['product_inputs'])} | "
+        f"variant_core={len(core_plan['variant_inputs'])} | "
+        f"media={len(media_plan['product_rows']) + len(media_plan['variant_rows'])} | "
+        f"elapsed={time.perf_counter() - phase_started_at:.1f}s",
+        flush=True,
+    )
 
     # ---------------------------------------------------------
     # Plan summary
