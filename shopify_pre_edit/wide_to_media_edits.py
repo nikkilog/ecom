@@ -1,4 +1,4 @@
-# shopify_pre_edit/wide_to_media_edits_v1.py
+# shopify_pre_edit/wide_to_media_edits.py
 
 from __future__ import annotations
 
