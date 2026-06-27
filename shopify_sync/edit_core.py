@@ -1,10 +1,11 @@
-# delivery_name: edit_core_media_compact_progress_v7.py
+# delivery_name: edit_core_inventory_cost_clear_v9_20260626.py
 # deployment_path: shopify_sync/edit_core.py
-# Full Edit__Core apply engine: core fields, metafields, SKU/prices, and media.
+# Full Edit__Core apply engine: core fields, metafields, SKU/cost/prices, and media.
+# core.cost uses the shop default currency and supports SET/CLEAR; core.cost_currency is intentionally not read or written.
 
 from __future__ import annotations
 
-MODULE_VERSION = "edit_core_media_compact_progress_v7_20260624"
+MODULE_VERSION = "edit_core_inventory_cost_clear_v9_20260626"
 
 import base64
 import datetime as dt
@@ -63,6 +64,7 @@ SUPPORTED_CORE_TAG_ACTIONS = {"SET", "CLEAR", "ADD", "REMOVE"}
 SUPPORTED_CORE_SCALAR_ACTIONS = {"SET", "CLEAR"}
 SUPPORTED_CORE_PRICE_ACTIONS = {"SET"}
 SUPPORTED_CORE_SKU_ACTIONS = {"SET"}
+SUPPORTED_CORE_COST_ACTIONS = {"SET", "CLEAR"}
 SUPPORTED_CORE_COMPARE_AT_ACTIONS = {"SET", "CLEAR"}
 SUPPORTED_PRODUCT_MEDIA_ACTIONS = {"SET"}
 SUPPORTED_VARIANT_MEDIA_ACTIONS = {"SET", "CLEAR"}
@@ -85,7 +87,7 @@ PRODUCT_CORE_KEYS = {
     "core.vendor",
     PRODUCT_IMAGES_FIELD_KEY,
 }
-VARIANT_CORE_KEYS = {"core.sku", "core.weight", "core.weight_unit", "core.price", "core.compare_at_price", VARIANT_IMAGE_FIELD_KEY}
+VARIANT_CORE_KEYS = {"core.sku", "core.cost", "core.weight", "core.weight_unit", "core.price", "core.compare_at_price", VARIANT_IMAGE_FIELD_KEY}
 
 Q_PRODUCT_BY_HANDLE = """
 query($handle: String!) {
@@ -932,6 +934,12 @@ def validate_row(entity_type: str, field_key: str, action: str) -> tuple[bool, s
         if act not in SUPPORTED_CORE_SKU_ACTIONS:
             return False, "action_not_supported"
 
+    elif fk == "core.cost":
+        if et != "VARIANT":
+            return False, "core_entity_mismatch"
+        if act not in SUPPORTED_CORE_COST_ACTIONS:
+            return False, "action_not_supported"
+
     elif fk == "core.price":
         if et != "VARIANT":
             return False, "core_entity_mismatch"
@@ -1615,6 +1623,10 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                 "id": owner_id,
                 "sku_present": False,
                 "sku": None,
+                "cost_present": False,
+                "cost": None,
+                "inventory_item_source_rows": [],
+                "inventory_item_field_keys": [],
                 "price": None,
                 "compareAtPrice_present": False,
                 "compareAtPrice": None,
@@ -1777,14 +1789,37 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                 bucket["sku"] = desired
                 bucket["source_rows"].append(sheet_row)
                 bucket["field_keys"].append(fk)
+                bucket["inventory_item_source_rows"].append(sheet_row)
+                bucket["inventory_item_field_keys"].append(fk)
                 preview_rows.append({
                     "sheet_row": sheet_row,
                     "entity_type": entity_type,
                     "owner_id": owner_id,
                     "field_key": fk,
                     "action": action,
-                    "plan_type": "inventory_item_sku",
+                    "plan_type": "inventory_item",
                     "value_preview": bucket["sku"],
+                })
+
+            elif fk == "core.cost":
+                bucket = get_variant_bucket(owner_id)
+                bucket["cost_present"] = True
+                # SET accepts 0 and other non-negative decimals.
+                # CLEAR sends GraphQL null to remove the stored cost.
+                bucket["cost"] = None if action == "CLEAR" else parse_decimal_str(desired, fk)
+                bucket["source_rows"].append(sheet_row)
+                bucket["field_keys"].append(fk)
+                bucket["inventory_item_source_rows"].append(sheet_row)
+                bucket["inventory_item_field_keys"].append(fk)
+                preview_rows.append({
+                    "sheet_row": sheet_row,
+                    "entity_type": entity_type,
+                    "owner_id": owner_id,
+                    "field_key": fk,
+                    "action": action,
+                    "plan_type": "inventory_item",
+                    "currency_mode": "shop_default",
+                    "value_preview": "" if bucket["cost"] is None else bucket["cost"],
                 })
 
             elif fk == "core.price":
@@ -1901,8 +1936,8 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
 
     variant_inputs = []
     variant_meta_rows = []
-    inventory_sku_inputs = []
-    inventory_sku_meta_rows = []
+    inventory_item_inputs = []
+    inventory_item_meta_rows = []
 
     variant_owner_ids = list(variant_updates.keys())
     variant_context_map = get_variant_context_map(client, variant_owner_ids, chunk_size=80)
@@ -1912,27 +1947,42 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
         product_id = _norm_str(context.get("product_id"))
         inventory_item_id = _norm_str(context.get("inventory_item_id"))
 
-        if bucket["sku_present"]:
+        has_inventory_item_fields = bucket["sku_present"] or bucket["cost_present"]
+        if has_inventory_item_fields:
+            inventory_field_keys = sorted(set(bucket["inventory_item_field_keys"]))
+            inventory_sheet_rows = list(bucket["inventory_item_source_rows"])
+
             if not inventory_item_id:
                 invalid_rows.append({
-                    "sheet_row": bucket["source_rows"][0] if bucket["source_rows"] else None,
+                    "sheet_row": inventory_sheet_rows[0] if inventory_sheet_rows else None,
                     "entity_type": "VARIANT",
                     "owner_id": owner_id,
-                    "field_key": "core.sku",
+                    "field_key": ",".join(inventory_field_keys) or "core.inventory_item",
                     "error_reason": "cannot_resolve_inventory_item_id",
-                    "message": f"variant_id={owner_id} | cannot resolve inventory item id for SKU update",
+                    "message": (
+                        f"variant_id={owner_id} | cannot resolve inventory item id for "
+                        f"fields={inventory_field_keys}"
+                    ),
                 })
             else:
-                inventory_sku_inputs.append({
+                inventory_input = {}
+                if bucket["sku_present"]:
+                    inventory_input["sku"] = bucket["sku"]
+                if bucket["cost_present"]:
+                    # Keep the key even when the value is None: None becomes
+                    # GraphQL null, which clears the InventoryItem cost.
+                    inventory_input["cost"] = bucket["cost"]
+
+                inventory_item_inputs.append({
                     "inventory_item_id": inventory_item_id,
-                    "sku": bucket["sku"],
+                    "input": inventory_input,
                 })
-                inventory_sku_meta_rows.append({
+                inventory_item_meta_rows.append({
                     "entity_type": "VARIANT",
                     "owner_id": owner_id,
                     "inventory_item_id": inventory_item_id,
-                    "field_key": "core.sku",
-                    "sheet_rows": bucket["source_rows"],
+                    "field_key": ",".join(inventory_field_keys) or "core.inventory_item",
+                    "sheet_rows": inventory_sheet_rows,
                 })
 
         has_variant_bulk_fields = (
@@ -1975,7 +2025,7 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
             if weight_part:
                 input_obj["inventoryItem"] = {"measurement": {"weight": weight_part}}
 
-        variant_field_keys = sorted(k for k in set(bucket["field_keys"]) if k != "core.sku")
+        variant_field_keys = sorted(k for k in set(bucket["field_keys"]) if k not in {"core.sku", "core.cost"})
         variant_inputs.append({
             "product_id": product_id,
             "variant_input": input_obj,
@@ -2003,8 +2053,8 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
         "product_meta_rows": product_meta_rows,
         "variant_inputs": variant_inputs,
         "variant_meta_rows": variant_meta_rows,
-        "inventory_sku_inputs": inventory_sku_inputs,
-        "inventory_sku_meta_rows": inventory_sku_meta_rows,
+        "inventory_item_inputs": inventory_item_inputs,
+        "inventory_item_meta_rows": inventory_item_meta_rows,
         "tag_delta_rows": tag_delta_rows,
         "preview_rows": preview_rows,
         "invalid_rows": invalid_rows,
@@ -3488,7 +3538,7 @@ def apply_product_core_plan(
     
 
 
-def _build_inventory_item_sku_batch_mutation(batch_size: int) -> str:
+def _build_inventory_item_batch_mutation(batch_size: int) -> str:
     variable_defs = []
     fields = []
 
@@ -3510,41 +3560,45 @@ def _build_inventory_item_sku_batch_mutation(batch_size: int) -> str:
 """.rstrip()
         )
 
-    return "mutation inventoryItemSkuBatch(" + ", ".join(variable_defs) + ") {\n" + "\n".join(fields) + "\n}"
+    return "mutation inventoryItemBatch(" + ", ".join(variable_defs) + ") {\n" + "\n".join(fields) + "\n}"
 
 
-def apply_inventory_item_sku_plan(
+def apply_inventory_item_plan(
     client: ShopifyClient,
-    sku_inputs: list[dict[str, Any]],
-    sku_meta_rows: list[dict[str, Any]],
+    item_inputs: list[dict[str, Any]],
+    item_meta_rows: list[dict[str, Any]],
     set_batch_size: int,
 ) -> dict[str, Any]:
-    """Update SKU through InventoryItem, batching multiple aliases per HTTP request."""
-    total = len(sku_inputs)
+    """Update InventoryItem fields such as SKU and cost, batching aliases per HTTP request.
+
+    Cost is sent as InventoryItemInput.cost. Shopify interprets it in the
+    shop's default currency; no currency field is queried or written.
+    """
+    total = len(item_inputs)
     batch_size = max(1, min(int(set_batch_size or 1), 25))
     total_batches = (total + batch_size - 1) // batch_size if total else 0
 
     print(
-        f"=== Applying inventoryItemUpdate SKU batches === "
+        f"=== Applying inventoryItemUpdate (SKU/Cost) batches === "
         f"total={total}, batches={total_batches}, batch_size={batch_size}"
     )
 
     if total == 0:
-        print("=== inventoryItemUpdate SKU done === total=0, ok=0, fail=0")
+        print("=== inventoryItemUpdate (SKU/Cost) done === total=0, ok=0, fail=0")
         return {"ok_count": 0, "fail_count": 0, "detail_fail_rows": []}
 
     ok_count = 0
     fail_count = 0
     detail_fail_rows = []
 
-    for batch_no, (start_idx, batch_inputs) in enumerate(_chunk_list(sku_inputs, batch_size), start=1):
-        batch_meta = sku_meta_rows[start_idx:start_idx + len(batch_inputs)]
-        mutation = _build_inventory_item_sku_batch_mutation(len(batch_inputs))
+    for batch_no, (start_idx, batch_inputs) in enumerate(_chunk_list(item_inputs, batch_size), start=1):
+        batch_meta = item_meta_rows[start_idx:start_idx + len(batch_inputs)]
+        mutation = _build_inventory_item_batch_mutation(len(batch_inputs))
         variables = {}
 
         for i, item in enumerate(batch_inputs):
             variables[f"id{i}"] = item["inventory_item_id"]
-            variables[f"input{i}"] = {"sku": item["sku"]}
+            variables[f"input{i}"] = dict(item.get("input") or {})
 
         print(f"Batch {batch_no}/{total_batches}: {len(batch_inputs)} items ... ", end="", flush=True)
 
@@ -3564,8 +3618,8 @@ def apply_inventory_item_sku_plan(
                     detail_fail_rows.append({
                         "entity_type": meta.get("entity_type", "VARIANT"),
                         "owner_id": meta.get("owner_id", ""),
-                        "field_key": "core.sku",
-                        "error_reason": "inventory_item_sku_update_error",
+                        "field_key": meta.get("field_key", "core.inventory_item"),
+                        "error_reason": "inventory_item_update_error",
                         "message": (
                             f"sheet_rows={meta.get('sheet_rows')} | "
                             f"inventory_item_id={meta.get('inventory_item_id')} | "
@@ -3592,8 +3646,8 @@ def apply_inventory_item_sku_plan(
                 detail_fail_rows.append({
                     "entity_type": meta.get("entity_type", "VARIANT"),
                     "owner_id": meta.get("owner_id", ""),
-                    "field_key": "core.sku",
-                    "error_reason": "inventory_item_sku_batch_exception",
+                    "field_key": meta.get("field_key", "core.inventory_item"),
+                    "error_reason": "inventory_item_batch_exception",
                     "message": (
                         f"sheet_rows={meta.get('sheet_rows')} | "
                         f"inventory_item_id={meta.get('inventory_item_id')} | exception={e}"
@@ -3601,9 +3655,8 @@ def apply_inventory_item_sku_plan(
                 })
             print(f"FAILED (fail={len(batch_inputs)})", flush=True)
 
-    print(f"=== inventoryItemUpdate SKU done === total={total}, ok={ok_count}, fail={fail_count}")
+    print(f"=== inventoryItemUpdate (SKU/Cost) done === total={total}, ok={ok_count}, fail={fail_count}")
     return {"ok_count": ok_count, "fail_count": fail_count, "detail_fail_rows": detail_fail_rows}
-
 
 def apply_variant_core_plan(
     client: ShopifyClient,
@@ -3984,7 +4037,7 @@ def run(
         + len(core_plan["product_inputs"])
         + len(core_plan["tag_delta_rows"])
         + len(core_plan["variant_inputs"])
-        + len(core_plan["inventory_sku_inputs"])
+        + len(core_plan["inventory_item_inputs"])
         + len(media_plan["product_rows"])
         + len(media_plan["variant_rows"])
     )
@@ -4183,10 +4236,10 @@ def run(
         set_batch_size=set_batch_size,
     )
 
-    inventory_sku_apply = apply_inventory_item_sku_plan(
+    inventory_item_apply = apply_inventory_item_plan(
         client=shopify,
-        sku_inputs=core_plan["inventory_sku_inputs"],
-        sku_meta_rows=core_plan["inventory_sku_meta_rows"],
+        item_inputs=core_plan["inventory_item_inputs"],
+        item_meta_rows=core_plan["inventory_item_meta_rows"],
         set_batch_size=set_batch_size,
     )
 
@@ -4221,14 +4274,14 @@ def run(
     rows_written = (
         metafield_apply["ok_count"]
         + product_apply["ok_count"]
-        + inventory_sku_apply["ok_count"]
+        + inventory_item_apply["ok_count"]
         + variant_apply["ok_count"]
         + media_apply["ok_count"]
     )
     apply_fail_count = (
         metafield_apply["fail_count"]
         + product_apply["fail_count"]
-        + inventory_sku_apply["fail_count"]
+        + inventory_item_apply["fail_count"]
         + variant_apply["fail_count"]
         + media_apply["fail_count"]
     )
@@ -4269,7 +4322,7 @@ def run(
         detail_rows=(
             metafield_apply["detail_fail_rows"]
             + product_apply["detail_fail_rows"]
-            + inventory_sku_apply["detail_fail_rows"]
+            + inventory_item_apply["detail_fail_rows"]
             + variant_apply["detail_fail_rows"]
             + media_apply["detail_fail_rows"]
         ),
