@@ -1,4 +1,5 @@
 # shopify_sync/edit_entries_update.py
+# Progress build v2: batched Shopify preflight + visible stage output
 
 from __future__ import annotations
 
@@ -53,6 +54,19 @@ mutation($id: ID!, $metaobject: MetaobjectUpdateInput!) {
 Q_METAOBJECT_BY_ID = """
 query($id: ID!) {
   node(id: $id) {
+    ... on Metaobject {
+      id
+      handle
+      type
+    }
+  }
+}
+"""
+
+
+Q_METAOBJECTS_BY_IDS = """
+query($ids: [ID!]!) {
+  nodes(ids: $ids) {
     ... on Metaobject {
       id
       handle
@@ -199,6 +213,11 @@ class RunLogger:
             except Exception:
                 time.sleep(min(2 ** i, 20) + random.random())
         raise RuntimeError("Failed writing Ops__RunLog after retries")
+
+
+def progress(message: str) -> None:
+    """Print progress immediately in Colab instead of waiting for buffered output."""
+    print(f"[edit_entries_update] {message}", flush=True)
 
 
 def now_cn_str(tz_name: str) -> str:
@@ -480,7 +499,12 @@ class ShopifyClient:
         for i in range(retry):
             r = requests.post(self.graphql_url, headers=self.headers, json=payload, timeout=90)
             if r.status_code in (429, 502, 503, 504):
-                time.sleep(min(2 ** i, 20) + random.random())
+                wait_s = min(2 ** i, 20) + random.random()
+                progress(
+                    f"Shopify API retry {i + 1}/{retry}: "
+                    f"HTTP {r.status_code}; waiting {wait_s:.1f}s"
+                )
+                time.sleep(wait_s)
                 continue
             r.raise_for_status()
             data = r.json()
@@ -614,6 +638,64 @@ class Resolver:
         self.mo_info_cache[gid] = info
         return info
 
+    def get_metaobject_infos_by_gids(
+        self,
+        entry_gids: List[str],
+        batch_size: int = 50,
+    ) -> Dict[str, Dict[str, str]]:
+        """
+        Resolve many metaobject GIDs in batches.
+
+        The old implementation made one Shopify request per entry_gid.
+        This method reduces preflight requests substantially and prints
+        visible progress for every batch.
+        """
+        gids = list(dict.fromkeys(
+            str(x).strip() for x in entry_gids if str(x).strip()
+        ))
+        missing = [gid for gid in gids if gid not in self.mo_info_cache]
+
+        if not missing:
+            progress(f"Shopify preflight cache hit: {len(gids)} entry_gid(s)")
+            return {gid: self.mo_info_cache[gid] for gid in gids}
+
+        batch_size = max(1, int(batch_size))
+        total = len(missing)
+        total_batches = (total + batch_size - 1) // batch_size
+
+        progress(
+            f"Shopify preflight: checking {total} uncached entry_gid(s) "
+            f"in {total_batches} batch(es), batch_size={batch_size}"
+        )
+
+        checked = 0
+        for batch_no, gid_batch in enumerate(chunk(missing, batch_size), start=1):
+            start_no = checked + 1
+            end_no = checked + len(gid_batch)
+            progress(
+                f"Shopify preflight batch {batch_no}/{total_batches}: "
+                f"entry_gid {start_no}-{end_no}/{total}"
+            )
+
+            data = self.sc.gql(Q_METAOBJECTS_BY_IDS, {"ids": gid_batch})
+            nodes = data.get("nodes") or []
+
+            for idx, gid in enumerate(gid_batch):
+                node = nodes[idx] if idx < len(nodes) and nodes[idx] else {}
+                self.mo_info_cache[gid] = {
+                    "id": node.get("id", "") or "",
+                    "handle": node.get("handle", "") or "",
+                    "type": node.get("type", "") or "",
+                }
+
+            checked = end_no
+            progress(
+                f"Shopify preflight batch {batch_no}/{total_batches} complete: "
+                f"{checked}/{total}"
+            )
+
+        return {gid: self.mo_info_cache[gid] for gid in gids}
+
     def to_gid_collection(self, val: str) -> str:
         v = str(val).strip()
         if not v:
@@ -727,8 +809,10 @@ def preflight(
     gid_type_cache: Dict[str, str] = {}
     gids = list(dict.fromkeys(df["entry_gid"].astype(str).tolist()))
 
+    progress(f"Preflight: {len(gids)} distinct entry_gid(s) found")
+    gid_infos = resolver.get_metaobject_infos_by_gids(gids, batch_size=50)
     for gid in gids:
-        gid_type_cache[gid] = resolver.get_metaobject_info_by_gid(gid).get("type", "") or ""
+        gid_type_cache[gid] = gid_infos.get(gid, {}).get("type", "") or ""
 
     for _, r in df_with_field.iterrows():
         fid_type = extract_type_from_field_id(r["field_id"])
@@ -906,7 +990,16 @@ def build_jobs(
     preview: List[Dict[str, Any]] = []
     rows_skipped = 0
 
-    for entry_gid, items in groups.items():
+    total_groups = len(groups)
+    progress(f"Build jobs: processing {total_groups} entry group(s)")
+
+    for group_no, (entry_gid, items) in enumerate(groups.items(), start=1):
+        if group_no == 1 or group_no % 10 == 0 or group_no == total_groups:
+            progress(
+                f"Build jobs: group {group_no}/{total_groups} "
+                f"entry_gid={entry_gid}"
+            )
+
         modes = [str(x.get("mode", "")).strip().upper() or ctx.default_mode for x in items]
         strict = ("STRICT" in modes)
         min_row = min(int(x.get("_sheet_row", 10 ** 9)) for x in items)
@@ -996,7 +1089,7 @@ def execute_jobs(
     seen_fail_signatures = set()
 
     for batch_idx, batch in enumerate(chunk(jobs, ctx.job_chunk_size), start=1):
-        print(f"Batch {batch_idx}: {len(batch)} jobs")
+        progress(f"Execute batch {batch_idx}: {len(batch)} job(s)")
 
         for job in batch:
             entry_gid = job["entry_gid"]
@@ -1109,36 +1202,75 @@ def run(
         run_id=run_id or gen_run_id(job_name, tz_name),
     )
 
+    progress(
+        f"START run_id={ctx.run_id} site={ctx.site_code} "
+        f"dry_run={ctx.dry_run} confirmed={ctx.confirmed}"
+    )
+    if ctx.dry_run:
+        progress(
+            "DRY_RUN=True: Shopify write mutations are skipped, "
+            "but sheet reads and Shopify validation still run."
+        )
+
     if (not ctx.dry_run) and (not ctx.confirmed):
         raise ValueError("Apply blocked: set DRY_RUN=False and CONFIRMED=True together.")
 
+    progress("Authorizing Google Sheets")
     gc = build_gc(ctx.gsheet_sa_b64)
+    progress("Google Sheets authorization complete")
+
     sc = ShopifyClient(ctx.shop_domain, ctx.api_version, ctx.shopify_token)
     resolver = Resolver(sc)
 
+    progress("Resolving edit/config/runlog sheet URLs from Cfg__Sites")
     url_edit = resolve_sheet_url_from_cfg_sites(gc, ctx.cfg_sites_url, ctx.cfg_sites_tab, ctx.site_code, ctx.label_edit)
+    progress("Resolved edit sheet URL")
     url_config = resolve_sheet_url_from_cfg_sites(gc, ctx.cfg_sites_url, ctx.cfg_sites_tab, ctx.site_code, ctx.label_config)
+    progress("Resolved config sheet URL")
     url_runlog = resolve_sheet_url_from_cfg_sites(gc, ctx.cfg_sites_url, ctx.cfg_sites_tab, ctx.site_code, ctx.label_runlog)
+    progress("Resolved runlog sheet URL")
 
+    progress("Opening Google Sheets workbooks")
     sh_edit = gc.open_by_url(url_edit)
     sh_cfg = gc.open_by_url(url_config)
     sh_runlog = gc.open_by_url(url_runlog)
+    progress("Google Sheets workbooks opened")
 
+    progress("Opening worksheets")
     ws_edit = sh_edit.worksheet(ctx.tab_edit_update)
     ws_fields = sh_cfg.worksheet(ctx.tab_cfg_fields)
     ws_log = sh_runlog.worksheet(ctx.tab_runlog)
+    progress("Worksheets opened")
 
     logger = RunLogger(ws_log, ctx)
+    progress("Checking Ops__RunLog header")
     logger.ensure_header()
+    progress("Ops__RunLog header ready")
 
+    progress(f"Loading {ctx.tab_cfg_fields}")
     cfg_by_field_id = load_cfg_fields(ws_fields)
+    progress(f"Loaded {len(cfg_by_field_id)} field definition(s)")
+
+    progress(f"Loading {ctx.tab_edit_update}")
     df = load_edit_rows(
         ws_edit,
         required_cols=["op", "entry_gid", "mode", "field_id", "value", "new_handle"],
     )
+    progress(f"Loaded {len(df)} raw edit row(s)")
 
+    progress("Starting preflight validation")
     plan_df, warnings_preflight, c1, _ = preflight(df, cfg_by_field_id, resolver, ctx)
+    progress(
+        f"Preflight complete: rows_loaded={c1['rows_loaded']} "
+        f"distinct_gid_count={c1['distinct_gid_count']}"
+    )
+
+    progress("Starting job construction")
     jobs, warnings_build, c2, preview = build_jobs(plan_df, cfg_by_field_id, resolver, ctx)
+    progress(
+        f"Job construction complete: jobs_planned={c2['jobs_planned']} "
+        f"rows_planned={c2['rows_planned']}"
+    )
 
     warnings_all = warnings_preflight + warnings_build
 
@@ -1193,7 +1325,16 @@ def run(
                 error_reason="WARNING",
             )
 
+    progress(
+        f"Starting {'preview' if ctx.dry_run else 'apply'} execution "
+        f"for {len(jobs)} job(s)"
+    )
     exec_result = execute_jobs(jobs, resolver, sc, logger, ctx)
+    progress(
+        f"Execution complete: ok={exec_result['ok']} "
+        f"fail={exec_result['fail']} skip={exec_result['skip']} "
+        f"written={exec_result['written']}"
+    )
     summary["rows_written"] = exec_result["written"]
     summary["rows_skipped"] = int(summary["rows_skipped"]) + int(exec_result["skip"])
     summary["ok"] = exec_result["ok"]
@@ -1216,7 +1357,14 @@ def run(
         message=f"done; ok={summary['ok']} fail={summary['fail']} skip={summary['skip']} jobs={summary['jobs_planned']}",
         error_reason="",
     )
+    progress("Flushing run log")
     logger.flush()
+    progress(
+        f"DONE run_id={ctx.run_id} rows_loaded={summary['rows_loaded']} "
+        f"jobs_planned={summary['jobs_planned']} "
+        f"rows_written={summary['rows_written']} "
+        f"warning_count={summary['warning_count']}"
+    )
 
     return {
         "summary": summary,
