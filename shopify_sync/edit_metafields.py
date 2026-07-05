@@ -471,6 +471,8 @@ def normalize_owner_ref(entity_type: str, gid_or_handle: str) -> str:
             return f"gid://shopify/Collection/{s}"
         if entity_type == "PAGE":
             return f"gid://shopify/Page/{s}"
+        if entity_type == "CUSTOMER":
+            return f"gid://shopify/Customer/{s}"
 
     return s
 
@@ -570,6 +572,8 @@ def normalize_gid_or_numeric(entity_type: str, ref: str) -> Optional[str]:
             return f"gid://shopify/Collection/{s}"
         if entity_type == "PAGE":
             return f"gid://shopify/Page/{s}"
+        if entity_type == "CUSTOMER":
+            return f"gid://shopify/Customer/{s}"
     return None
 
 
