@@ -40,7 +40,7 @@ from gspread.utils import rowcol_to_a1
 
 
 JOB_NAME = "export_customers"
-MODULE_VERSION = "2026-07-05-v1"
+MODULE_VERSION = "2026-07-05-v2-tags"
 ENTITY_TYPE = "CUSTOMER"
 ENTITY_ROOT = "customer"
 BASE_KEY_FIELD_ID = "CUSTOMER|core.gid"
@@ -81,6 +81,10 @@ RUNLOG_HEADER = [
 TOKEN_RE = re.compile(r"\{([^{}]+)\}")
 MF_VALUE_RE = re.compile(
     r'^MF_VALUE\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']\s*\)$',
+    re.IGNORECASE,
+)
+GET_LIST_ITEM_RE = re.compile(
+    r"^GET\(\s*\{([^{}]+)\}\s*,\s*(\d+)\s*\)$",
     re.IGNORECASE,
 )
 PATH_SEGMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -971,6 +975,35 @@ def _normalise_raw_value(value: Any, data_type: str) -> Any:
     return value
 
 
+def _list_item_value(value: Any, one_based_index: int) -> Any:
+    """Return a 1-based item from a list or a JSON-encoded list."""
+    index = int(one_based_index) - 1
+    if index < 0:
+        return ""
+
+    parsed = value
+    if isinstance(parsed, str):
+        text = parsed.strip()
+        if not text:
+            return ""
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return ""
+
+    if not isinstance(parsed, list) or index >= len(parsed):
+        return ""
+
+    item = parsed[index]
+    if item is None:
+        return ""
+    if isinstance(item, bool):
+        return "TRUE" if item else "FALSE"
+    if isinstance(item, (dict, list)):
+        return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+    return item
+
+
 def evaluate_field(
     definition: FieldDef,
     node: Mapping[str, Any],
@@ -1020,9 +1053,18 @@ def evaluate_field(
         cache[field_id] = value
         return value
 
+    # Config-driven list expansion, using the same 1-based GET syntax already used
+    # elsewhere in Cfg__Fields. Example: GET({CUSTOMER|core.tags},1).
+    get_match = GET_LIST_ITEM_RE.match(expr)
+    if definition.field_type == "CALC" and get_match:
+        source_field_id = _safe_str(get_match.group(1))
+        one_based_index = int(get_match.group(2))
+        value = _list_item_value(resolve(source_field_id), one_based_index)
+        cache[field_id] = value
+        return value
+
     # Minimal token-based calculated-field support. A pure token expression simply
-    # returns the referenced field. Other formula languages remain intentionally
-    # unsupported until explicitly required by Customer config.
+    # returns the referenced field.
     tokens = _extract_token_dependencies(expr)
     if definition.field_type == "CALC" and len(tokens) == 1:
         compact = re.sub(r"\s+", "", expr)
