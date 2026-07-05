@@ -1,4 +1,6 @@
 # shopify_export/build_product_views.py
+# delivery_name: build_product_views_tags_split_v5.py
+# feature: generic EXPAND_LIST support for Product / Variant view columns
 # -*- coding: utf-8 -*-
 
 import re
@@ -330,6 +332,181 @@ def apply_entity_filters(df: pd.DataFrame, filters: Dict[str, Any], mode: str = 
 # =========================================================
 
 TOKEN_RE = re.compile(r"\{([^}]+)\}")
+EXPAND_LIST_RE = re.compile(
+    r"^=?\s*EXPAND_LIST\(\s*\{([^{}]+)\}\s*,\s*(\d+)\s*\)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_expand_list_expr(expr: str) -> Optional[Tuple[str, int]]:
+    """
+    Parse:
+      EXPAND_LIST({PRODUCT|core.tags},10)
+
+    Returns:
+      ("PRODUCT|core.tags", 10)
+
+    The second argument is capped to prevent an accidental huge worksheet.
+    """
+    match = EXPAND_LIST_RE.match(_safe_str(expr))
+    if not match:
+        return None
+
+    source_field_id = _safe_str(match.group(1))
+    column_count = int(match.group(2))
+
+    if not source_field_id:
+        raise ValueError(f"EXPAND_LIST source field is blank: {expr}")
+    if column_count < 1 or column_count > 200:
+        raise ValueError(
+            f"EXPAND_LIST column count must be between 1 and 200: "
+            f"expr={expr}, count={column_count}"
+        )
+    return source_field_id, column_count
+
+
+def _coerce_expand_list(value: Any) -> List[Any]:
+    """
+    Normalize a source list for EXPAND_LIST.
+
+    Supported inputs:
+    - Python list / tuple
+    - JSON list string: ["tag1","tag2"]
+    - Human-readable IDX tags: tag1, tag2, tag3
+    - Pipe-separated list: tag1 | tag2 | tag3
+    """
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        return [x for x in value if _safe_str(x)]
+
+    if isinstance(value, tuple):
+        return [x for x in value if _safe_str(x)]
+
+    text = _safe_str(value)
+    if not text:
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [x for x in parsed if _safe_str(x)]
+        except Exception:
+            pass
+
+    # export_idx_tables currently writes core.tags as a human-readable
+    # comma-separated string. Pipe handling also keeps this generic for
+    # other list fields used by future views.
+    separator = "|" if "|" in text and "," not in text else ","
+    return [
+        part.strip()
+        for part in text.split(separator)
+        if part.strip()
+    ]
+
+
+def _collect_expand_dependencies(vf: pd.DataFrame) -> Dict[str, set]:
+    """
+    Collect source field_ids required by EXPAND rows.
+
+    Example:
+      PRODUCT|derived.tags_split
+      -> EXPAND_LIST({PRODUCT|core.tags},10)
+      -> PRODUCT dependency: PRODUCT|core.tags
+    """
+    dependencies: Dict[str, set] = {
+        "PRODUCT": set(),
+        "VARIANT": set(),
+    }
+
+    for _, row in vf.iterrows():
+        field_type = _safe_str(row.get("field_type")).upper()
+        if field_type != "EXPAND":
+            continue
+
+        field_id = _safe_str(row.get("field_id"))
+        expr = _safe_str(row.get("expr"))
+        parsed = _parse_expand_list_expr(expr)
+        if parsed is None:
+            raise ValueError(
+                f"EXPAND field must use EXPAND_LIST({{field_id}},count): "
+                f"field_id={field_id}, expr={expr}"
+            )
+
+        source_field_id, _ = parsed
+        if "|" not in source_field_id:
+            raise ValueError(
+                f"EXPAND_LIST source must use an entity-prefixed field_id: "
+                f"field_id={field_id}, source={source_field_id}"
+            )
+
+        source_entity = _safe_str(source_field_id.split("|", 1)[0]).upper()
+        if source_entity not in dependencies:
+            raise ValueError(
+                f"build_product_views only supports PRODUCT/VARIANT EXPAND sources: "
+                f"field_id={field_id}, source={source_field_id}"
+            )
+        dependencies[source_entity].add(source_field_id)
+
+    return dependencies
+
+
+def _expand_field_rows_for_output(
+    field_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Convert one configured EXPAND row into multiple physical output columns.
+
+    Config:
+      field_id   = PRODUCT|derived.tags_split
+      alias      = Tag
+      field_type = EXPAND
+      expr       = EXPAND_LIST({PRODUCT|core.tags},10)
+
+    Output headers:
+      Tag-1 ... Tag-10
+    """
+    expanded: List[Dict[str, Any]] = []
+
+    for field_row in field_rows:
+        field_type = _safe_str(field_row.get("field_type")).upper()
+        if field_type != "EXPAND":
+            expanded.append(field_row)
+            continue
+
+        field_id = _safe_str(field_row.get("field_id"))
+        parsed = _parse_expand_list_expr(field_row.get("expr"))
+        if parsed is None:
+            raise ValueError(
+                f"Invalid EXPAND_LIST expression: field_id={field_id}, "
+                f"expr={field_row.get('expr')}"
+            )
+
+        source_field_id, column_count = parsed
+        alias_base = (
+            _safe_str(field_row.get("alias"))
+            or _safe_str(field_row.get("field_id"))
+            or "Expanded"
+        )
+        output_key_base = (
+            _safe_str(field_row.get("output_key"))
+            or alias_base
+        )
+
+        for index in range(1, column_count + 1):
+            item = dict(field_row)
+            item["field_type"] = "EXPAND_ITEM"
+            item["source_field_id"] = source_field_id
+            item["source_index"] = index
+            item["expand_parent_field_id"] = field_id
+            item["field_id"] = f"{field_id}__item_{index}"
+            item["alias"] = f"{alias_base}-{index}"
+            item["output_key"] = f"{output_key_base}__expand_{index}"
+            expanded.append(item)
+
+    return expanded
 
 
 def compile_formula(expr: str, row_num_1based: int, token_to_col_letter: Dict[str, str]) -> str:
@@ -1032,10 +1209,14 @@ def build_and_write_view(
     merged_vf.update(fixed_vf)
     merged_vf.update(override_vf)
 
+    expand_dependencies = _collect_expand_dependencies(vf)
+
     needed_product_cols = set(vf[vf["entity_type"].astype(str).str.upper().eq("PRODUCT")]["field_id"].astype(str).tolist())
     needed_variant_cols = set(vf[vf["entity_type"].astype(str).str.upper().eq("VARIANT")]["field_id"].astype(str).tolist())
     needed_product_cols |= set(merged_pf.keys())
     needed_variant_cols |= set(merged_vf.keys())
+    needed_product_cols |= expand_dependencies["PRODUCT"]
+    needed_variant_cols |= expand_dependencies["VARIANT"]
 
     df_products = ensure_columns_from_long(df_products, list(needed_product_cols), long_value_map)
     df_variants = ensure_columns_from_long(df_variants, list(needed_variant_cols), long_value_map)
@@ -1082,6 +1263,7 @@ def build_and_write_view(
 
         needed_product_cols2 = set(vf[vf["entity_type"].astype(str).str.upper().eq("PRODUCT")]["field_id"].astype(str).tolist())
         needed_product_cols2 |= set(merged_pf.keys())
+        needed_product_cols2 |= expand_dependencies["PRODUCT"]
 
         take_cols = ["PRODUCT|core.gid"] + [c for c in needed_product_cols2 if c in df_products.columns]
         prod_take = df_products[take_cols].drop_duplicates(subset=["PRODUCT|core.gid"]).copy()
@@ -1108,9 +1290,25 @@ def build_and_write_view(
 
     field_rows_raw = _prepare_field_rows(vf)
 
-    # Keep image-list fields exactly as configured: one raw JSON/list column.
-    # Do not auto-create Image 01 / Product Image 01 columns or IMAGE() formulas.
-    field_rows = field_rows_raw
+    # Keep ordinary image-list fields exactly as configured.
+    # EXPAND rows are intentionally converted into multiple physical columns.
+    field_rows = _expand_field_rows_for_output(field_rows_raw)
+
+    required_expand_sources = sorted(
+        expand_dependencies["PRODUCT"] | expand_dependencies["VARIANT"]
+    )
+    missing_expand_sources = [
+        field_id
+        for field_id in required_expand_sources
+        if field_id not in base_df.columns
+    ]
+    if missing_expand_sources:
+        raise ValueError(
+            "EXPAND_LIST source field is missing from the prepared Product/Variant data: "
+            f"{missing_expand_sources}. Ensure the source field, such as "
+            "PRODUCT|core.tags, is present in IDX__Products / IDX__Variants, "
+            "then rerun export_idx_tables before build_product_views."
+        )
 
     output_keys = [fr["output_key"] for fr in field_rows]
     display_headers_raw = [fr["alias"] or fr["field_id"] or fr["output_key"] for fr in field_rows]
@@ -1126,7 +1324,17 @@ def build_and_write_view(
             output_key = fr["output_key"]
             fid = _safe_str(fr.get("field_id"))
 
-            if field_type == "CALC" and _safe_str(fr["expr"]).startswith("="):
+            if field_type == "EXPAND_ITEM":
+                source_field_id = _safe_str(fr.get("source_field_id"))
+                source_index = int(fr.get("source_index") or 0)
+                source_items = _coerce_expand_list(
+                    base_row.get(source_field_id, "")
+                )
+                if source_index >= 1 and source_index <= len(source_items):
+                    one[output_key] = _safe_str(source_items[source_index - 1])
+                else:
+                    one[output_key] = ""
+            elif field_type == "CALC" and _safe_str(fr["expr"]).startswith("="):
                 one[output_key] = ""
             else:
                 one[output_key] = _as_scalar(base_row.get(fid, "")) if fid else ""
