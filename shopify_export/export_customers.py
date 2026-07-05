@@ -19,6 +19,7 @@ Design rules:
 - Core GraphQL fields are derived from the selected config expressions.
 - Required metafields are derived from Cfg__Fields and selected views/filters.
 - Output columns, order, aliases and filters are controlled by config.
+- field_type=EXPAND with EXPAND_LIST({FIELD_ID},N) expands one configured field into N columns.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from gspread.utils import rowcol_to_a1
 
 
 JOB_NAME = "export_customers"
-MODULE_VERSION = "2026-07-05-v2-tags"
+MODULE_VERSION = "2026-07-05-v3-tags-split"
 ENTITY_TYPE = "CUSTOMER"
 ENTITY_ROOT = "customer"
 BASE_KEY_FIELD_ID = "CUSTOMER|core.gid"
@@ -85,6 +86,10 @@ MF_VALUE_RE = re.compile(
 )
 GET_LIST_ITEM_RE = re.compile(
     r"^GET\(\s*\{([^{}]+)\}\s*,\s*(\d+)\s*\)$",
+    re.IGNORECASE,
+)
+EXPAND_LIST_RE = re.compile(
+    r"^EXPAND_LIST\(\s*\{([^{}]+)\}\s*,\s*(\d+)\s*\)$",
     re.IGNORECASE,
 )
 PATH_SEGMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -590,6 +595,25 @@ def _load_views(
                     f"Customer field has no expr: view_id={view_id}, field_id={field_id}"
                 )
 
+            if definition.field_type == "EXPAND":
+                expand_match = EXPAND_LIST_RE.match(definition.expr)
+                if not expand_match:
+                    raise CustomerExportError(
+                        "EXPAND field must use EXPAND_LIST({FIELD_ID},N): "
+                        f"view_id={view_id}, field_id={field_id}, expr={definition.expr}"
+                    )
+                source_field_id = _safe_str(expand_match.group(1))
+                expand_count = int(expand_match.group(2))
+                if source_field_id == field_id:
+                    raise CustomerExportError(
+                        f"EXPAND field cannot reference itself: {field_id}"
+                    )
+                if expand_count < 1 or expand_count > 100:
+                    raise CustomerExportError(
+                        f"EXPAND_LIST column count must be 1-100: "
+                        f"field_id={field_id}, value={expand_count}"
+                    )
+
             alias = _safe_str(row.get("alias")) or definition.display_name or definition.field_id
             view_fields.append(
                 ViewField(
@@ -852,7 +876,7 @@ def build_customers_query(
         if path:
             core_paths.add(path)
             continue
-        if definition.field_type == "CALC" and _extract_token_dependencies(definition.expr):
+        if definition.field_type in {"CALC", "EXPAND"} and _extract_token_dependencies(definition.expr):
             continue
         unsupported.append(
             f"{definition.field_id} -> {definition.expr or '[blank expr]'}"
@@ -975,26 +999,21 @@ def _normalise_raw_value(value: Any, data_type: str) -> Any:
     return value
 
 
-def _list_item_value(value: Any, one_based_index: int) -> Any:
-    """Return a 1-based item from a list or a JSON-encoded list."""
-    index = int(one_based_index) - 1
-    if index < 0:
-        return ""
-
+def _coerce_list(value: Any) -> List[Any]:
+    """Convert a Shopify list or a JSON-encoded list into a Python list."""
     parsed = value
     if isinstance(parsed, str):
         text = parsed.strip()
         if not text:
-            return ""
+            return []
         try:
             parsed = json.loads(text)
         except Exception:
-            return ""
+            return []
+    return list(parsed) if isinstance(parsed, list) else []
 
-    if not isinstance(parsed, list) or index >= len(parsed):
-        return ""
 
-    item = parsed[index]
+def _normalise_list_item(item: Any) -> Any:
     if item is None:
         return ""
     if isinstance(item, bool):
@@ -1002,6 +1021,22 @@ def _list_item_value(value: Any, one_based_index: int) -> Any:
     if isinstance(item, (dict, list)):
         return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
     return item
+
+
+def _list_item_value(value: Any, one_based_index: int) -> Any:
+    """Return a 1-based item from a list or a JSON-encoded list."""
+    index = int(one_based_index) - 1
+    if index < 0:
+        return ""
+    parsed = _coerce_list(value)
+    if index >= len(parsed):
+        return ""
+    return _normalise_list_item(parsed[index])
+
+
+def _expand_list_value(value: Any, max_items: int) -> List[Any]:
+    """Return at most max_items normalized cells for EXPAND_LIST."""
+    return [_normalise_list_item(item) for item in _coerce_list(value)[:max_items]]
 
 
 def evaluate_field(
@@ -1053,8 +1088,17 @@ def evaluate_field(
         cache[field_id] = value
         return value
 
-    # Config-driven list expansion, using the same 1-based GET syntax already used
-    # elsewhere in Cfg__Fields. Example: GET({CUSTOMER|core.tags},1).
+    # One configured EXPAND field becomes multiple output columns. Example:
+    # EXPAND_LIST({CUSTOMER|core.tags},10) -> Tag-1 ... Tag-10.
+    expand_match = EXPAND_LIST_RE.match(expr)
+    if definition.field_type == "EXPAND" and expand_match:
+        source_field_id = _safe_str(expand_match.group(1))
+        max_items = int(expand_match.group(2))
+        value = _expand_list_value(resolve(source_field_id), max_items)
+        cache[field_id] = value
+        return value
+
+    # Config-driven single-item extraction. Example: GET({CUSTOMER|core.tags},1).
     get_match = GET_LIST_ITEM_RE.match(expr)
     if definition.field_type == "CALC" and get_match:
         source_field_id = _safe_str(get_match.group(1))
@@ -1186,6 +1230,26 @@ def _retry_sheet_call(label: str, func, retry: int = 6):
     raise CustomerExportError(f"Sheets {label} failed: {last_error}")
 
 
+def _view_output_plan(view: ViewDef) -> Tuple[List[str], List[Tuple[ViewField, Optional[int]]]]:
+    """Build physical output columns from logical view fields."""
+    headers: List[str] = []
+    plan: List[Tuple[ViewField, Optional[int]]] = []
+
+    for field in view.fields:
+        match = EXPAND_LIST_RE.match(field.field_def.expr)
+        if field.field_def.field_type == "EXPAND" and match:
+            count = int(match.group(2))
+            prefix = _safe_str(field.alias) or field.field_def.display_name or "Item"
+            for one_based_index in range(1, count + 1):
+                headers.append(f"{prefix}-{one_based_index}")
+                plan.append((field, one_based_index))
+        else:
+            headers.append(field.alias)
+            plan.append((field, None))
+
+    return _make_unique_headers(headers), plan
+
+
 def write_view_table(
     spreadsheet,
     view: ViewDef,
@@ -1194,11 +1258,17 @@ def write_view_table(
     chunk_rows: int,
     retry: int,
 ) -> Dict[str, Any]:
-    headers = _make_unique_headers([field.alias for field in view.fields])
-    body = [
-        [record.get(field.field_id, "") for field in view.fields]
-        for record in records
-    ]
+    headers, output_plan = _view_output_plan(view)
+    body: List[List[Any]] = []
+    for record in records:
+        row: List[Any] = []
+        for field, one_based_index in output_plan:
+            value = record.get(field.field_id, "")
+            if one_based_index is None:
+                row.append(value)
+            else:
+                row.append(_list_item_value(value, one_based_index))
+        body.append(row)
 
     ws = ensure_worksheet(
         spreadsheet,
