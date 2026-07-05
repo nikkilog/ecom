@@ -697,11 +697,14 @@ def write_long_output(
 # Main entry
 # =========================================================
 
-def run(
+def _run_impl(
     *,
     site_code: str,
     console_core_url: str,
     console_gsheet_sa_b64_secret: str,
+
+    job_name: str = JOB_NAME,
+    run_id: Optional[str] = None,
 
     input_sheet_label: str = "pre_edit",
     output_sheet_label: str = "pre_edit",
@@ -752,9 +755,10 @@ def run(
     """
     del write_wide_field_key_row, action_default, dedupe_product_urls, strict_url_validation
 
-    run_id = _utc_run_id(JOB_NAME)
+    job_name = _norm_str(job_name) or JOB_NAME
+    run_id = _norm_str(run_id) or _utc_run_id(job_name)
     print(
-        f"=== {JOB_NAME} start === site_code={site_code} run_id={run_id} "
+        f"=== {job_name} start === site_code={site_code} run_id={run_id} "
         f"preview_only={preview_only}",
         flush=True,
     )
@@ -838,7 +842,7 @@ def run(
         )
         return {
             "status": "error",
-            "job_name": JOB_NAME,
+            "job_name": job_name,
             "run_id": run_id,
             "site_code": site_code,
             "summary": {
@@ -890,7 +894,7 @@ def run(
     if preview_only:
         return {
             "status": "preview" if not build_errors else "preview_with_errors",
-            "job_name": JOB_NAME,
+            "job_name": job_name,
             "run_id": run_id,
             "site_code": site_code,
             "summary": summary,
@@ -919,7 +923,7 @@ def run(
 
     return {
         "status": "written" if not build_errors else "written_with_errors",
-        "job_name": JOB_NAME,
+        "job_name": job_name,
         "run_id": run_id,
         "site_code": site_code,
         "summary": summary,
@@ -929,3 +933,94 @@ def run(
         "parsed_columns": parsed["mapped_columns"],
         "meta": base_meta,
     }
+
+# =========================================================
+# Colab-compatible public entry
+# =========================================================
+
+def run(*args, **kwargs) -> dict[str, Any]:
+    """
+    Public runner compatible with both call styles:
+
+      run(site_code=SITE_CODE, ...)
+      run(SITE_CODE=SITE_CODE, JOB_NAME=JOB_NAME, ...)
+
+    The Colab does not need to be changed. Uppercase notebook parameter names
+    are normalized to the lowercase implementation parameters here.
+    """
+    if args:
+        raise TypeError(
+            "run() accepts keyword arguments only. "
+            "Example: run(SITE_CODE=SITE_CODE, CONSOLE_CORE_URL=CONSOLE_CORE_URL, ...)"
+        )
+
+    # Aliases whose notebook name is not simply the uppercase form of the
+    # implementation parameter.
+    alias_map = {
+        "CONSOLE_GSHEET_SA_B64": "console_gsheet_sa_b64_secret",
+        "BOOTSTRAP_GSHEET_SA_B64_SECRET": "console_gsheet_sa_b64_secret",
+        "GSHEET_SA_B64_SECRET": "console_gsheet_sa_b64_secret",
+
+        "INPUT_TAB": "input_worksheet_title",
+        "TAB_WIDE": "input_worksheet_title",
+        "WIDE_TAB": "input_worksheet_title",
+        "OUTPUT_TAB": "output_worksheet_title",
+        "TAB_LONG": "output_worksheet_title",
+        "LONG_TAB": "output_worksheet_title",
+
+        "INPUT_LABEL": "input_sheet_label",
+        "OUTPUT_LABEL": "output_sheet_label",
+
+        "HEADER_ROW": "wide_header_row",
+        "FIELD_KEY_ROW": "wide_field_key_row",
+        "DATA_START_ROW": "wide_data_start_row",
+    }
+
+    # One shared pre-edit label may be used by older runners for both tabs.
+    shared_label_keys = {
+        "SHEET_LABEL",
+        "PRE_EDIT_SHEET_LABEL",
+        "LABEL_PRE_EDIT",
+    }
+
+    normalized: dict[str, Any] = {}
+    source_for_target: dict[str, str] = {}
+
+    def put(target: str, value: Any, source: str) -> None:
+        if target in normalized and normalized[target] != value:
+            raise TypeError(
+                f"run() received conflicting values for '{target}' "
+                f"from '{source_for_target[target]}' and '{source}'."
+            )
+        normalized[target] = value
+        source_for_target[target] = source
+
+    for raw_key, value in kwargs.items():
+        key = str(raw_key)
+
+        if key in shared_label_keys:
+            put("input_sheet_label", value, key)
+            put("output_sheet_label", value, key)
+            continue
+
+        target = alias_map.get(key)
+        if target is None:
+            # SITE_CODE -> site_code, JOB_NAME -> job_name, etc.
+            target = key.lower() if key.isupper() else key
+
+        put(target, value, key)
+
+    import inspect
+
+    accepted = set(inspect.signature(_run_impl).parameters)
+    unknown = sorted(k for k in normalized if k not in accepted)
+    if unknown:
+        original_names = [source_for_target.get(k, k) for k in unknown]
+        raise TypeError(
+            "run() received unsupported parameter(s): "
+            + ", ".join(original_names)
+            + ". The Python module and Colab config names may be from different versions."
+        )
+
+    return _run_impl(**normalized)
+
