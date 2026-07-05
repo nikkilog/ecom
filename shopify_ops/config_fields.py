@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 job_name: config_fields
-delivery_name: config_fields_media_files_merged_v2.py
+delivery_name: config_fields_tags_split_v3.py
 module_path after deployment: shopify_ops/config_fields.py
 
 Multi-site Console Core version.
@@ -1776,7 +1776,66 @@ def _merge_fixed_rows_by_pk(
     return out
 
 
+# =========================================================
+# Generic Tags split fixed registry overlay
+# =========================================================
+#
+# These rows register one reusable EXPAND field per entity.
+# Export modules that support EXPAND_LIST can turn one configured field into:
+#   Tag-1, Tag-2, ... Tag-10
+#
+# The original core.tags rows remain the source fields.
+TAGS_SPLIT_FIXED = [
+    {
+        "field_handle": "CUSTOMER|Customer Tags Split",
+        "field_id": "CUSTOMER|derived.tags_split",
+        "display_name": "Customer Tags Split",
+        "entity_type": "CUSTOMER",
+        "field_key": "derived.tags_split",
+        "expr": "EXPAND_LIST({CUSTOMER|core.tags},10)",
+        "field_type": "EXPAND",
+        "data_type": "list.string",
+        "source_type": "DERIVED",
+        "namespace": "",
+        "key": "",
+        "group": "Tags",
+        "notes": "Expand Customer Tags into Tag-1 through Tag-10.",
+    },
+    {
+        "field_handle": "PRODUCT|Tags Split",
+        "field_id": "PRODUCT|derived.tags_split",
+        "display_name": "Tags Split",
+        "entity_type": "PRODUCT",
+        "field_key": "derived.tags_split",
+        "expr": "EXPAND_LIST({PRODUCT|core.tags},10)",
+        "field_type": "EXPAND",
+        "data_type": "list.string",
+        "source_type": "DERIVED",
+        "namespace": "",
+        "key": "",
+        "group": "Tags",
+        "notes": "Expand Product Tags into Tag-1 through Tag-10.",
+    },
+    {
+        "field_handle": "ORDER|Tags Split",
+        "field_id": "ORDER|derived.tags_split",
+        "display_name": "Tags Split",
+        "entity_type": "ORDER",
+        "field_key": "derived.tags_split",
+        "expr": "EXPAND_LIST({ORDER|core.tags},10)",
+        "field_type": "EXPAND",
+        "data_type": "list.string",
+        "source_type": "DERIVED",
+        "namespace": "",
+        "key": "",
+        "group": "Tags",
+        "notes": "Expand Order Tags into Tag-1 through Tag-10.",
+    },
+]
+
+
 CORE_FIXED = _merge_fixed_rows_by_pk(CORE_FIXED, MEDIA_FILE_FIXED)
+CORE_FIXED = _merge_fixed_rows_by_pk(CORE_FIXED, TAGS_SPLIT_FIXED)
 
 
 class ConfigFieldsError(RuntimeError):
@@ -2210,7 +2269,7 @@ def _sync_cfg_fields(ws, mf_defs: List[Dict[str, Any]], mo_defs: List[Dict[str, 
         desired_by_pk[pk] = slim
         desired_order.append(pk)
 
-    # CORE_FIXED — PBS gold standard plus the Media/File overlay,
+    # CORE_FIXED — PBS gold standard plus Media/File and Tags Split overlays,
     # with site-specific URLs from Cfg__account_id.
     for x in _build_core_fixed_rows(account_cfg):
         payload = {
