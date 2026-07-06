@@ -1,6 +1,6 @@
 # shopify_export/build_product_views.py
-# delivery_name: build_product_views_tags_split_v5.py
-# feature: generic EXPAND_LIST support for Product / Variant view columns
+# delivery_name: build_product_views_variant_mf_backfill_v6.py
+# feature: generic EXPAND_LIST support + Product/Variant metafield backfill from DL__ValuesLong
 # -*- coding: utf-8 -*-
 
 import re
@@ -899,14 +899,16 @@ def _resolve_related_rows(
             "VARIANT|core.parent.gid",
             "PRODUCT|core.gid",
         ]
-        direct_product_gid = _get_from_row_by_candidates(base_row, direct_product_gid_candidates)
+        direct_product_gid = _extract_gid_like(
+            _get_from_row_by_candidates(base_row, direct_product_gid_candidates)
+        )
 
         if direct_product_gid:
             product_row = row_maps["product_by_gid"].get(direct_product_gid)
 
         # 再用 bridge
         if product_row is None:
-            variant_gid = _as_scalar(base_row.get("VARIANT|core.gid", ""))
+            variant_gid = _extract_gid_like(base_row.get("VARIANT|core.gid", ""))
             product_gid = variant_product_bridge.get(variant_gid, "")
             if product_gid:
                 product_row = row_maps["product_by_gid"].get(product_gid)
@@ -1088,51 +1090,83 @@ def ensure_columns_from_long(
     needed_cols: List[str],
     long_value_map: Dict[Tuple[str, str, str], str],
 ) -> pd.DataFrame:
+    """
+    Ensure configured metafield columns can be resolved from DL__ValuesLong.
+
+    v6 behavior:
+    - add a configured mf./v_mf./custom. column when it is absent;
+    - backfill individual blank cells when the column already exists in IDX;
+    - preserve every non-blank IDX value as the first-priority source.
+
+    The previous implementation only added completely missing columns. Therefore,
+    an existing-but-empty VARIANT|v_mf.* column blocked the DL__ValuesLong fallback.
+    """
     if df is None or df.empty or not needed_cols:
         return df
 
-    cols_missing = [c for c in needed_cols if c not in df.columns]
-    if not cols_missing:
-        return df
+    work = df.copy()
 
     var_gid_col = "VARIANT|core.gid"
     prd_gid_col = "PRODUCT|core.gid"
     var_prd_gid = "VARIANT|core.product_gid"
 
-    has_var_gid = var_gid_col in df.columns
-    has_prd_gid = prd_gid_col in df.columns
-    has_var_prd = var_prd_gid in df.columns
+    has_var_gid = var_gid_col in work.columns
+    has_prd_gid = prd_gid_col in work.columns
+    has_var_prd = var_prd_gid in work.columns
 
-    var_gids = [_extract_gid_like(x) for x in df[var_gid_col].tolist()] if has_var_gid else None
+    var_gids = (
+        [_extract_gid_like(x) for x in work[var_gid_col].tolist()]
+        if has_var_gid else None
+    )
     prd_gids = (
-        [_extract_gid_like(x) for x in df[prd_gid_col].tolist()] if has_prd_gid
-        else ([_extract_gid_like(x) for x in df[var_prd_gid].tolist()] if has_var_prd else None)
+        [_extract_gid_like(x) for x in work[prd_gid_col].tolist()]
+        if has_prd_gid
+        else (
+            [_extract_gid_like(x) for x in work[var_prd_gid].tolist()]
+            if has_var_prd else None
+        )
     )
 
-    add_cols = {}
-    for col in cols_missing:
+    for col in needed_cols:
         if not isinstance(col, str) or "|" not in col:
             continue
 
         ent = _safe_str(col.split("|", 1)[0]).upper()
         fk = _field_id_to_long_field_key(col)
-        if not (fk.startswith("mf.") or fk.startswith("v_mf.") or fk.startswith("custom.")):
+        if not (
+            fk.startswith("mf.")
+            or fk.startswith("v_mf.")
+            or fk.startswith("custom.")
+        ):
             continue
 
+        gids = None
+        owner_type = ""
         if ent == "VARIANT":
-            if not var_gids:
-                continue
-            add_cols[col] = [long_value_map.get(("VARIANT", gid, fk), "") for gid in var_gids]
+            gids = var_gids
+            owner_type = "VARIANT"
         elif ent == "PRODUCT":
-            if not prd_gids:
-                continue
-            add_cols[col] = [long_value_map.get(("PRODUCT", gid, fk), "") for gid in prd_gids]
+            gids = prd_gids
+            owner_type = "PRODUCT"
 
-    if not add_cols:
-        return df
+        if not gids:
+            continue
 
-    add_df = pd.DataFrame(add_cols, index=df.index)
-    return pd.concat([df, add_df], axis=1).copy()
+        fallback = pd.Series(
+            [long_value_map.get((owner_type, gid, fk), "") for gid in gids],
+            index=work.index,
+            dtype="object",
+        )
+
+        if col not in work.columns:
+            work[col] = fallback
+            continue
+
+        blank_mask = work[col].map(lambda x: _safe_str(x) == "")
+        if blank_mask.any():
+            work.loc[blank_mask, col] = fallback.loc[blank_mask]
+
+    return work
 
 
 # =========================================================
@@ -1294,6 +1328,14 @@ def build_and_write_view(
     # EXPAND rows are intentionally converted into multiple physical columns.
     field_rows = _expand_field_rows_for_output(field_rows_raw)
 
+    # Build related Product/Variant row maps after metafield backfill so every
+    # RAW field can use IDX first and DL__ValuesLong as a cell-level fallback.
+    row_maps = _build_row_maps(df_products, df_variants)
+    variant_product_bridge = _build_variant_product_bridge(
+        df_variants,
+        row_maps,
+    )
+
     required_expand_sources = sorted(
         expand_dependencies["PRODUCT"] | expand_dependencies["VARIANT"]
     )
@@ -1317,12 +1359,17 @@ def build_and_write_view(
     out_rows = []
     for _, base_row in base_df.iterrows():
         base_row = base_row.copy()
+        related_rows = _resolve_related_rows(
+            base_entity_type=base_entity_type,
+            base_row=base_row,
+            row_maps=row_maps,
+            variant_product_bridge=variant_product_bridge,
+        )
         one = {}
 
         for fr in field_rows:
             field_type = _safe_str(fr["field_type"]).upper()
             output_key = fr["output_key"]
-            fid = _safe_str(fr.get("field_id"))
 
             if field_type == "EXPAND_ITEM":
                 source_field_id = _safe_str(fr.get("source_field_id"))
@@ -1337,7 +1384,12 @@ def build_and_write_view(
             elif field_type == "CALC" and _safe_str(fr["expr"]).startswith("="):
                 one[output_key] = ""
             else:
-                one[output_key] = _as_scalar(base_row.get(fid, "")) if fid else ""
+                one[output_key] = _resolve_raw_value(
+                    field_row=fr,
+                    related_rows=related_rows,
+                    long_value_map=long_value_map,
+                    base_row=base_row,
+                )
 
         out_rows.append(one)
 
