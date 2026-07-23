@@ -37,6 +37,21 @@ class OverviewRunError(RuntimeError):
 
 
 # ============================================
+# Module identity
+# ============================================
+
+MODULE_NAME = "build_overview_refs"
+MODULE_VERSION = "2026.07.23.01"
+MODULE_FILENAME = "build_overview_refs_v20260723_01.py"
+MODULE_CHANGE = "Ops__RunLog auto-resize before append"
+
+print(
+    f"✅ Loaded module: {MODULE_FILENAME} | "
+    f"version={MODULE_VERSION} | change={MODULE_CHANGE}"
+)
+
+
+# ============================================
 # Constants
 # ============================================
 
@@ -488,9 +503,11 @@ class OverviewRefsRunner:
     def flush_runlog(self):
         if not self.runlog_rows:
             return
+
         runlog_ws = self.state.get("runlog_ws")
         if runlog_ws is None:
             return
+
         existing = runlog_ws.get_all_values()
         if not existing:
             runlog_ws.update("A1", [RUNLOG_COLUMNS], value_input_option="USER_ENTERED")
@@ -502,7 +519,21 @@ class OverviewRefsRunner:
                     f"Ops__RunLog header mismatch. Expected={RUNLOG_COLUMNS}, Existing={header}"
                 )
             start_row = len(existing) + 1
+
         values = [[row.get(c, "") for c in RUNLOG_COLUMNS] for row in self.runlog_rows]
+        required_rows = start_row + len(values) - 1
+        required_cols = len(RUNLOG_COLUMNS)
+
+        # Google Sheets 不会在 update() 时自动突破现有网格边界。
+        # 预留额外行，避免每次追加日志都触发一次 resize API 请求。
+        current_rows = int(getattr(runlog_ws, "row_count", 0) or 0)
+        current_cols = int(getattr(runlog_ws, "col_count", 0) or 0)
+        target_rows = max(required_rows, current_rows + 100)
+        target_cols = max(required_cols, current_cols)
+
+        if current_rows < required_rows or current_cols < required_cols:
+            runlog_ws.resize(rows=target_rows, cols=target_cols)
+
         runlog_ws.update(f"A{start_row}", values, value_input_option="USER_ENTERED")
         self.runlog_rows = []
 
@@ -1609,7 +1640,7 @@ ORDER BY day ASC
         try:
             self.derive_ranges()
             self.bootstrap()
-            self.log_row("start", log_type="system", status="success", message="run started")
+            self.log_row("start", log_type="system", status="success", message=f"run started | module={MODULE_FILENAME} | version={MODULE_VERSION}")
             self.pull_shopify()
             self.pull_external_ads()
             self.write_outputs()
@@ -1642,6 +1673,14 @@ ORDER BY day ASC
 # ============================================
 
 def run(**kwargs):
+    print(
+        f"🚀 Running module: {MODULE_FILENAME} | "
+        f"version={MODULE_VERSION} | change={MODULE_CHANGE}"
+    )
     runner = OverviewRefsRunner(**kwargs)
-    return runner.execute()
+    result = runner.execute()
+    if isinstance(result, dict):
+        result["module_version"] = MODULE_VERSION
+        result["module_filename"] = MODULE_FILENAME
+    return result
 
