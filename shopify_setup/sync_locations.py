@@ -1,30 +1,21 @@
 # -*- coding: utf-8 -*-
-"""Shopify Location setup sync for the Commerce Operations System.
+"""Central Shopify Location registry synchronization.
 
-This setup module synchronizes Shopify Admin GraphQL Location records into
-Console Core / Cfg__Locations while preserving human-governed fields.
+GitHub target: ``ecom/shopify_setup/sync_locations.py``
+Import path: ``shopify_setup.sync_locations``
 
-It belongs to the site bootstrap/setup layer rather than the field-schema
-configuration layer. The same module is intended for every Shopify project.
+The module synchronizes Shopify Admin GraphQL locations into
+Console Core / ``Cfg__Locations`` while preserving human-governed fields.
+It supports both Colab and local Jupyter/CLI execution without OAuth popups.
 
-Designed for both:
-- Colab: secrets from ``google.colab.userdata``.
-- Local Python: explicit values, environment variables, or files in SECRET_HOME.
+Secret resolution order:
+- explicit value passed by the caller;
+- Colab Secrets when running in Colab;
+- environment variable when running locally;
+- local Secret files under ``SECRET_HOME``;
+- configured local aliases, including the existing PBS Google SA file pattern.
 
-Local preview example::
-
-    python -m shopify_setup.sync_locations \
-      --site-code PBS \
-      --console-core-url "https://docs.google.com/spreadsheets/d/.../edit" \
-      --bootstrap-gsheet-secret PBS_GSHEET
-
-Local apply example::
-
-    python -m shopify_setup.sync_locations \
-      --site-code PBS \
-      --console-core-url "https://docs.google.com/spreadsheets/d/.../edit" \
-      --bootstrap-gsheet-secret PBS_GSHEET \
-      --apply --confirmed
+Real writes require ``dry_run=False`` and ``confirmed=True``.
 """
 from __future__ import annotations
 
@@ -34,12 +25,14 @@ import datetime as dt
 import json
 import math
 import os
+import platform
 import random
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import gspread
 import pandas as pd
@@ -48,9 +41,19 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "1.1.0"
-DEFAULT_JOB_NAME = "sync_locations"
+MODULE_VERSION = "2.1.0"
 MODULE_PATH = "shopify_setup.sync_locations"
+DEFAULT_JOB_NAME = "config_locations"
+DEFAULT_LOCAL_SECRET_HOME = Path(
+    "/Users/nikki/Documents/Projects/_Secrets"
+).expanduser()
+
+DEFAULT_LOCAL_SECRET_ALIASES: Dict[str, Dict[str, str]] = {
+    "PBS_GSHEET": {
+        "mode": "WHOLE_FILE",
+        "relative_pattern": "Google/PBS_GSHEET_keys-*.json",
+    },
+}
 
 LOCATION_HEADERS = [
     "site_code",
@@ -146,13 +149,22 @@ class AccountConfig:
     shopify_token_secret: str
 
 
+@dataclass(frozen=True)
+class SecretValue:
+    value: str
+    source_type: str
+    source_detail: str
+
+
 class ShopifyGraphQLClient:
     def __init__(
         self,
         shop_domain: str,
         api_version: str,
         access_token: str,
+        *,
         timeout: int = 90,
+        print_progress: bool = True,
     ) -> None:
         self.url = f"https://{shop_domain}/admin/api/{api_version}/graphql.json"
         self.headers = {
@@ -160,18 +172,20 @@ class ShopifyGraphQLClient:
             "Content-Type": "application/json",
         }
         self.timeout = int(timeout)
+        self.print_progress = bool(print_progress)
         self.session = requests.Session()
 
     def gql(
         self,
         query: str,
         variables: Optional[Dict[str, Any]] = None,
+        *,
         retry: int = 6,
     ) -> Dict[str, Any]:
         payload = {"query": query, "variables": variables or {}}
-        last_error: Optional[Exception] = None
+        last_error: Optional[BaseException] = None
 
-        for attempt in range(max(1, int(retry))):
+        for attempt in range(1, max(1, int(retry)) + 1):
             try:
                 response = self.session.post(
                     self.url,
@@ -180,25 +194,44 @@ class ShopifyGraphQLClient:
                     timeout=self.timeout,
                 )
                 if response.status_code in {429, 500, 502, 503, 504}:
-                    delay = min(2**attempt, 20) + random.random()
+                    delay = min(2 ** (attempt - 1), 20) + random.random()
+                    if self.print_progress:
+                        print(
+                            "[Shopify retry] "
+                            f"attempt={attempt}/{retry} "
+                            f"http={response.status_code} "
+                            f"sleep={delay:.1f}s"
+                        )
                     time.sleep(delay)
                     continue
                 response.raise_for_status()
                 body = response.json()
                 if body.get("errors"):
-                    raise RuntimeError(json.dumps(body["errors"], ensure_ascii=False))
+                    raise RuntimeError(
+                        "Shopify GraphQL errors: "
+                        + json.dumps(body["errors"], ensure_ascii=False)
+                    )
                 data = body.get("data")
                 if not isinstance(data, dict):
                     raise RuntimeError("Shopify GraphQL response has no data object.")
                 return data
-            except Exception as exc:  # noqa: BLE001
+            except BaseException as exc:  # noqa: BLE001
                 last_error = exc
-                if attempt >= retry - 1:
+                if attempt >= retry:
                     break
-                delay = min(2**attempt, 20) + random.random()
+                delay = min(2 ** (attempt - 1), 20) + random.random()
+                if self.print_progress:
+                    print(
+                        "[Shopify retry] "
+                        f"attempt={attempt}/{retry} "
+                        f"error={type(exc).__name__} "
+                        f"sleep={delay:.1f}s"
+                    )
                 time.sleep(delay)
 
-        raise RuntimeError(f"Shopify GraphQL failed after retries: {last_error}")
+        raise RuntimeError(
+            f"Shopify GraphQL failed after {retry} attempts: {last_error}"
+        ) from last_error
 
 
 class RunLogger18:
@@ -266,6 +299,15 @@ class RunLogger18:
         self.buffer.clear()
 
 
+def _runtime_mode() -> str:
+    try:
+        import google.colab  # type: ignore  # noqa: F401
+
+        return "COLAB"
+    except Exception:
+        return "LOCAL"
+
+
 def _now_str(tz_name: str) -> str:
     return dt.datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -284,14 +326,13 @@ def _safe_str(value: Any) -> str:
     return str(value).strip()
 
 
-def _normalize_header(value: Any) -> str:
-    text = _safe_str(value)
-    alias = LEGACY_HEADER_ALIASES.get(text.lower())
-    return alias or text
-
-
 def _normalize_site_code(value: Any) -> str:
     return _safe_str(value).upper()
+
+
+def _normalize_header(value: Any) -> str:
+    text = _safe_str(value)
+    return LEGACY_HEADER_ALIASES.get(text.lower(), text)
 
 
 def _normalize_bool(value: Any, *, default: bool = False) -> bool:
@@ -311,92 +352,239 @@ def _bool_cell(value: Any, *, default: bool = False) -> str:
     return "TRUE" if _normalize_bool(value, default=default) else "FALSE"
 
 
-def _read_text_file(path: Path) -> str:
-    return path.read_text(encoding="utf-8").strip()
+def _contained_secret_path(secret_home: Path, candidate: Path) -> Path:
+    resolved = candidate.resolve(strict=True)
+    try:
+        resolved.relative_to(secret_home)
+    except ValueError as exc:
+        raise RuntimeError("Local Secret path escapes SECRET_HOME.") from exc
+    if not resolved.is_file():
+        raise RuntimeError(f"Local Secret target is not a file: {resolved}")
+    return resolved
 
 
-def _secret_file_candidates(secret_home: Path, secret_name: str) -> Iterable[Path]:
-    yield secret_home / secret_name
-    yield secret_home / f"{secret_name}.txt"
-    yield secret_home / f"{secret_name}.secret"
-    yield secret_home / f"{secret_name}.json"
+def _parse_dotenv_values(path: Path) -> Dict[str, List[str]]:
+    values: Dict[str, List[str]] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        normalized = value.strip()
+        if (
+            len(normalized) >= 2
+            and normalized[0] == normalized[-1]
+            and normalized[0] in {"'", '"'}
+        ):
+            normalized = normalized[1:-1]
+        if key:
+            values.setdefault(key, []).append(normalized)
+    return values
 
 
-def _load_secret(
+def _local_secret_home(secret_home: Optional[str]) -> Path:
+    configured = _safe_str(secret_home) or os.environ.get("SECRET_HOME", "").strip()
+    path = Path(configured).expanduser() if configured else DEFAULT_LOCAL_SECRET_HOME
+    if not path.is_dir():
+        raise RuntimeError(
+            "Local Secret directory was not found. Expected: "
+            f"{path}. Set SECRET_HOME to override it."
+        )
+    return path.resolve()
+
+
+def _merge_secret_aliases(
+    aliases: Optional[Mapping[str, Mapping[str, str]]],
+) -> Dict[str, Dict[str, str]]:
+    merged = {key: dict(value) for key, value in DEFAULT_LOCAL_SECRET_ALIASES.items()}
+    if aliases:
+        for key, value in aliases.items():
+            merged[str(key)] = dict(value)
+    return merged
+
+
+def _read_local_secret(
     secret_name: str,
     *,
-    explicit_value: Optional[str] = None,
-    secret_home: Optional[str] = None,
-) -> str:
-    """Load a secret in Colab or local Python without changing job logic."""
-    if explicit_value is not None and _safe_str(explicit_value):
-        return str(explicit_value).strip()
+    secret_home: Optional[str],
+    local_secret_aliases: Optional[Mapping[str, Mapping[str, str]]],
+) -> SecretValue:
+    home = _local_secret_home(secret_home)
 
-    env_value = os.environ.get(secret_name)
-    if env_value and env_value.strip():
-        return env_value.strip()
+    direct_candidates = [
+        home / secret_name,
+        home / f"{secret_name}.txt",
+        home / f"{secret_name}.secret",
+        home / f"{secret_name}.json",
+    ]
+    direct_matches = [path for path in direct_candidates if path.is_file()]
+    if len(direct_matches) > 1:
+        raise RuntimeError(
+            f"Local Secret {secret_name!r} has multiple direct-file matches: "
+            + ", ".join(path.name for path in direct_matches)
+        )
+    if direct_matches:
+        path = _contained_secret_path(home, direct_matches[0])
+        value = path.read_text(encoding="utf-8").strip()
+        if not value:
+            raise RuntimeError(f"Local Secret file for {secret_name!r} is empty.")
+        return SecretValue(value, "LOCAL_SECRET_FILE", str(path))
 
-    try:
-        from google.colab import userdata  # type: ignore
+    aliases = _merge_secret_aliases(local_secret_aliases)
+    alias = aliases.get(secret_name)
+    if alias:
+        relative_pattern = _safe_str(alias.get("relative_pattern"))
+        pattern_path = Path(relative_pattern)
+        if (
+            not relative_pattern
+            or pattern_path.is_absolute()
+            or ".." in pattern_path.parts
+        ):
+            raise RuntimeError(
+                f"Invalid Local Secret relative pattern for {secret_name!r}."
+            )
+        matches = list(home.glob(relative_pattern))
+        if not matches:
+            raise RuntimeError(
+                f"Local Secret file for {secret_name!r} was not found under "
+                f"{home} using {relative_pattern!r}."
+            )
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"Local Secret alias for {secret_name!r} is ambiguous; "
+                f"found {len(matches)} matches."
+            )
+        path = _contained_secret_path(home, matches[0])
+        mode = _safe_str(alias.get("mode")).upper()
+        if mode == "WHOLE_FILE":
+            value = path.read_text(encoding="utf-8").strip()
+        elif mode == "DOTENV_KEY":
+            key = _safe_str(alias.get("key"))
+            values = _parse_dotenv_values(path).get(key, [])
+            if len(values) != 1 or not values[0]:
+                raise RuntimeError(
+                    f"Expected exactly one non-empty dotenv key {key!r} in {path}."
+                )
+            value = values[0]
+        else:
+            raise RuntimeError(
+                f"Unsupported Local Secret alias mode {mode!r} for {secret_name!r}."
+            )
+        if not value:
+            raise RuntimeError(f"Local Secret {secret_name!r} is empty.")
+        return SecretValue(value, "LOCAL_SECRET_ALIAS", str(path))
 
-        colab_value = userdata.get(secret_name)
-        if colab_value and str(colab_value).strip():
-            return str(colab_value).strip()
-    except Exception:
-        pass
-
-    homes: List[Path] = []
-    if secret_home:
-        homes.append(Path(secret_home).expanduser())
-    for env_key in ("SECRET_HOME", "SHOPIFY_SECRET_HOME"):
-        if os.environ.get(env_key):
-            homes.append(Path(os.environ[env_key]).expanduser())
-    homes.append(Path.home() / "Documents" / "Projects" / "_Secrets")
-
-    seen: set[str] = set()
-    for home in homes:
-        key = str(home)
-        if key in seen:
-            continue
-        seen.add(key)
-        for candidate in _secret_file_candidates(home, secret_name):
-            if candidate.is_file():
-                value = _read_text_file(candidate)
-                if value:
-                    return value
+    # Generic fallback for access-token secrets stored in any .env under SECRET_HOME.
+    dotenv_matches: List[Tuple[Path, str]] = []
+    for env_path in home.rglob("*.env"):
+        path = _contained_secret_path(home, env_path)
+        values = _parse_dotenv_values(path).get(secret_name, [])
+        for value in values:
+            if value:
+                dotenv_matches.append((path, value))
+    if len(dotenv_matches) == 1:
+        path, value = dotenv_matches[0]
+        return SecretValue(value, "LOCAL_DOTENV_KEY", f"{path}::{secret_name}")
+    if len(dotenv_matches) > 1:
+        raise RuntimeError(
+            f"Local Secret key {secret_name!r} appears in multiple .env files under "
+            f"{home}; configure an explicit alias."
+        )
 
     raise RuntimeError(
-        f"Cannot resolve secret '{secret_name}'. Use Colab userdata, an environment "
-        "variable with the same name, an explicit value, or a file under SECRET_HOME."
+        f"Cannot resolve Local Secret {secret_name!r}. Checked direct files, "
+        "configured aliases, and exact keys in .env files under SECRET_HOME."
     )
 
 
-def _parse_service_account(secret_value: str) -> Dict[str, Any]:
-    text = secret_value.strip()
-    if text.startswith("{"):
-        data = json.loads(text)
-    else:
-        padded = text + "=" * (-len(text) % 4)
+def read_secret(
+    name: str,
+    *,
+    explicit_value: Optional[str] = None,
+    secret_home: Optional[str] = None,
+    local_secret_aliases: Optional[Mapping[str, Mapping[str, str]]] = None,
+) -> SecretValue:
+    """Read one secret without printing its value."""
+    secret_name = _safe_str(name)
+    if not secret_name:
+        raise RuntimeError("Secret name is empty.")
+
+    if explicit_value is not None and _safe_str(explicit_value):
+        return SecretValue(str(explicit_value).strip(), "EXPLICIT_VALUE", "caller")
+
+    runtime = _runtime_mode()
+    if runtime == "COLAB":
         try:
-            decoded = base64.b64decode(padded).decode("utf-8")
-            data = json.loads(decoded)
-        except Exception as exc:  # noqa: BLE001
-            raise ValueError(
-                "Google service-account secret must be base64(JSON) or raw JSON."
+            from google.colab import userdata  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("Colab Secret adapter is unavailable.") from exc
+        value = userdata.get(secret_name)
+        if value is None or not str(value).strip():
+            raise RuntimeError(
+                f"Colab Secret {secret_name!r} is missing or not enabled for this notebook."
+            )
+        return SecretValue(str(value).strip(), "COLAB_SECRETS", secret_name)
+
+    environment_value = os.environ.get(secret_name)
+    if environment_value is not None and environment_value.strip():
+        return SecretValue(
+            environment_value.strip(),
+            "ENVIRONMENT_VARIABLE",
+            secret_name,
+        )
+
+    return _read_local_secret(
+        secret_name,
+        secret_home=secret_home,
+        local_secret_aliases=local_secret_aliases,
+    )
+
+
+def _parse_service_account(secret: SecretValue) -> Dict[str, Any]:
+    raw = secret.value.strip()
+    try:
+        info = json.loads(raw)
+        secret_format = "RAW_JSON"
+    except Exception:
+        try:
+            padded = raw + "=" * ((4 - len(raw) % 4) % 4)
+            info = json.loads(base64.b64decode(padded).decode("utf-8"))
+            secret_format = "BASE64_JSON"
+        except Exception as exc:
+            raise RuntimeError(
+                "Google service-account Secret is neither valid raw JSON nor Base64 JSON."
             ) from exc
-    if not isinstance(data, dict) or not data.get("client_email"):
-        raise ValueError("Invalid Google service-account JSON.")
-    return data
+
+    required = {"type", "project_id", "private_key", "client_email", "token_uri"}
+    missing = sorted(key for key in required if not info.get(key))
+    if missing or info.get("type") != "service_account":
+        raise RuntimeError(
+            "Google Secret is not a complete service-account credential; "
+            f"missing={missing}."
+        )
+    info["__secret_format"] = secret_format
+    return info
 
 
-def _build_gspread_client(sa_secret_value: str) -> gspread.Client:
-    info = _parse_service_account(sa_secret_value)
+def _build_gspread_client(secret: SecretValue) -> Tuple[gspread.Client, Dict[str, str]]:
+    info = _parse_service_account(secret)
+    secret_format = str(info.pop("__secret_format"))
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
     credentials = Credentials.from_service_account_info(info, scopes=scopes)
-    return gspread.authorize(credentials)
+    return gspread.authorize(credentials), {
+        "source_type": secret.source_type,
+        "source_detail": secret.source_detail,
+        "secret_format": secret_format,
+        "service_account_email": _safe_str(info.get("client_email")),
+    }
 
 
 def _load_account_config(
@@ -404,17 +592,14 @@ def _load_account_config(
     console_core_url: str,
     tab_cfg_account_id: str,
 ) -> AccountConfig:
-    worksheet = gc.open_by_url(console_core_url).worksheet(tab_cfg_account_id)
-    values = worksheet.get_all_values()
+    values = gc.open_by_url(console_core_url).worksheet(tab_cfg_account_id).get_all_values()
     if not values:
         raise ValueError(f"{tab_cfg_account_id} is empty.")
 
     config: Dict[str, str] = {}
     duplicates: List[str] = []
     for row_number, row in enumerate(values, start=1):
-        if not row:
-            continue
-        key = _safe_str(row[0]).upper()
+        key = _safe_str(row[0] if row else "").upper()
         value = _safe_str(row[1] if len(row) > 1 else "")
         if not key:
             continue
@@ -450,19 +635,13 @@ def _resolve_sheet_url_by_label(
     site_code: str,
     label: str,
 ) -> str:
-    worksheet = gc.open_by_url(console_core_url).worksheet(tab_cfg_sites)
-    records = worksheet.get_all_records()
-    if not records:
-        raise ValueError(f"{tab_cfg_sites} is empty.")
-
-    matches = []
-    for row in records:
-        if _normalize_site_code(row.get("site_code")) != _normalize_site_code(site_code):
-            continue
-        if _safe_str(row.get("label")) != label:
-            continue
-        matches.append(row)
-
+    records = gc.open_by_url(console_core_url).worksheet(tab_cfg_sites).get_all_records()
+    matches = [
+        row
+        for row in records
+        if _normalize_site_code(row.get("site_code")) == _normalize_site_code(site_code)
+        and _safe_str(row.get("label")) == _safe_str(label)
+    ]
     if not matches:
         raise ValueError(
             f"No route in {tab_cfg_sites} for site_code={site_code}, label={label}."
@@ -492,7 +671,7 @@ def _ensure_runlog_header(worksheet: gspread.Worksheet) -> None:
         )
 
 
-def _get_or_none_worksheet(
+def _get_optional_worksheet(
     spreadsheet: gspread.Spreadsheet,
     title: str,
 ) -> Optional[gspread.Worksheet]:
@@ -502,15 +681,16 @@ def _get_or_none_worksheet(
         return None
 
 
-def _records_from_matrix(values: Sequence[Sequence[Any]]) -> Tuple[List[str], List[Dict[str, str]]]:
+def _records_from_matrix(
+    values: Sequence[Sequence[Any]],
+) -> Tuple[List[str], List[Dict[str, str]]]:
     if not values:
         return LOCATION_HEADERS.copy(), []
 
-    raw_headers = [_normalize_header(x) for x in values[0]]
+    raw_headers = [_normalize_header(value) for value in values[0]]
     headers: List[str] = []
-    for header in raw_headers:
-        if not header:
-            header = f"extra_col_{len(headers) + 1}"
+    for index, header in enumerate(raw_headers, start=1):
+        header = header or f"extra_col_{index}"
         if header in headers:
             raise ValueError(f"Duplicate column in Cfg__Locations: {header}")
         headers.append(header)
@@ -519,9 +699,8 @@ def _records_from_matrix(values: Sequence[Sequence[Any]]) -> Tuple[List[str], Li
     for row in values[1:]:
         padded = list(row) + [""] * max(0, len(headers) - len(row))
         record = {headers[i]: _safe_str(padded[i]) for i in range(len(headers))}
-        if any(_safe_str(v) for v in record.values()):
+        if any(record.values()):
             records.append(record)
-
     return headers, records
 
 
@@ -530,11 +709,7 @@ def _load_existing_locations(
 ) -> Tuple[List[str], List[Dict[str, str]]]:
     if worksheet is None:
         return LOCATION_HEADERS.copy(), []
-    headers, records = _records_from_matrix(worksheet.get_all_values())
-
-    # Legacy Ref-Location rows have no site_code. They are accepted only when the
-    # caller later supplies the current site_code during normalization.
-    return headers, records
+    return _records_from_matrix(worksheet.get_all_values())
 
 
 def _fetch_all_locations(
@@ -551,7 +726,6 @@ def _fetch_all_locations(
     rows: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
     page = 0
-
     while True:
         page += 1
         data = client.gql(
@@ -566,17 +740,18 @@ def _fetch_all_locations(
         connection = data.get("locations") or {}
         nodes = connection.get("nodes") or []
         rows.extend(nodes)
-
         if print_progress:
-            print(f"      Shopify page={page} fetched={len(nodes)} total={len(rows)}")
+            print(
+                "[Location fetch] "
+                f"page={page} fetched={len(nodes)} total={len(rows)}"
+            )
 
         page_info = connection.get("pageInfo") or {}
         if not page_info.get("hasNextPage"):
             break
         cursor = _safe_str(page_info.get("endCursor")) or None
         if not cursor:
-            raise RuntimeError("locations.hasNextPage is true but endCursor is empty.")
-
+            raise RuntimeError("locations.hasNextPage=true but endCursor is empty.")
     return rows
 
 
@@ -585,21 +760,17 @@ def _clean_location_code(value: Any) -> str:
     if code.startswith("在仓-"):
         code = code[3:]
     code = re.sub(r"[^A-Z0-9_-]+", "-", code)
-    code = re.sub(r"-+", "-", code).strip("-_")
-    return code
+    return re.sub(r"-+", "-", code).strip("-_")
 
 
-def _base_code(location_name: str, province_code: str) -> str:
+def _base_location_code(location_name: str, province_code: str) -> str:
     province = _clean_location_code(province_code)
     if province:
         return province
-
     tokens = re.findall(r"[A-Za-z0-9]+", location_name.upper())
     ignored = {"WAREHOUSE", "LOCATION", "STORE", "FULFILLMENT", "CENTER"}
-    tokens = [token for token in tokens if token not in ignored]
-    if tokens:
-        return _clean_location_code(tokens[0])[:16]
-    return "LOC"
+    usable = [token for token in tokens if token not in ignored]
+    return _clean_location_code(usable[0] if usable else "LOC")[:16] or "LOC"
 
 
 def _next_unique_code(base: str, used: set[str]) -> str:
@@ -610,275 +781,217 @@ def _next_unique_code(base: str, used: set[str]) -> str:
     index = 2
     while f"{base}-{index}" in used:
         index += 1
-    code = f"{base}-{index}"
-    used.add(code)
-    return code
+    value = f"{base}-{index}"
+    used.add(value)
+    return value
 
 
-def _canonical_existing_record(record: Dict[str, str], current_site_code: str) -> Dict[str, str]:
-    out = dict(record)
-    out["site_code"] = _normalize_site_code(out.get("site_code") or current_site_code)
-    out["location_code"] = _clean_location_code(out.get("location_code"))
-    out["location_name"] = _safe_str(out.get("location_name"))
-    out["location_gid"] = _safe_str(out.get("location_gid"))
-    out["province_code"] = _safe_str(out.get("province_code")).upper()
-    out["active"] = _bool_cell(out.get("active"), default=False)
-    out["is_default"] = _bool_cell(out.get("is_default"), default=False)
-    out["notes"] = _safe_str(out.get("notes"))
-    out["synced_at"] = _safe_str(out.get("synced_at"))
-    return out
-
-
-def _shopify_location_record(node: Dict[str, Any]) -> Dict[str, str]:
-    address = node.get("address") or {}
-    return {
-        "location_name": _safe_str(node.get("name")),
-        "location_gid": _safe_str(node.get("id")),
-        "province_code": _safe_str(address.get("provinceCode")).upper(),
-        "active": "TRUE" if bool(node.get("isActive")) else "FALSE",
-    }
-
-
-def _compare_managed_fields(before: Dict[str, str], after: Dict[str, str]) -> bool:
-    # synced_at is refreshed on every successful fetch, but it should not make every
-    # Location look like a business-field update in the run summary.
-    compare_fields = SYSTEM_MANAGED_FIELDS - {"synced_at"}
-    return any(
-        _safe_str(before.get(key)) != _safe_str(after.get(key))
-        for key in compare_fields
+def _canonical_existing_record(
+    record: Mapping[str, Any],
+    current_site_code: str,
+    headers: Sequence[str],
+) -> Dict[str, str]:
+    output = {header: _safe_str(record.get(header)) for header in headers}
+    output["site_code"] = _normalize_site_code(
+        output.get("site_code") or current_site_code
     )
+    output["location_code"] = _clean_location_code(output.get("location_code"))
+    output["active"] = _bool_cell(output.get("active"), default=False)
+    output["is_default"] = _bool_cell(output.get("is_default"), default=False)
+    return output
 
 
 def _build_sync_plan(
     *,
     site_code: str,
-    existing_headers: List[str],
-    existing_records: List[Dict[str, str]],
-    shopify_nodes: List[Dict[str, Any]],
+    existing_headers: Sequence[str],
+    existing_records: Sequence[Mapping[str, Any]],
+    shopify_nodes: Sequence[Mapping[str, Any]],
     synced_at: str,
 ) -> Dict[str, Any]:
     site_code = _normalize_site_code(site_code)
-    if not site_code:
-        raise ValueError("site_code is empty.")
-
-    all_headers = LOCATION_HEADERS.copy()
+    headers = list(LOCATION_HEADERS)
     for header in existing_headers:
-        if header and header not in all_headers:
-            all_headers.append(header)
+        normalized = _normalize_header(header)
+        if normalized and normalized not in headers:
+            headers.append(normalized)
 
-    normalized_existing = [
-        _canonical_existing_record(record, site_code) for record in existing_records
-    ]
-
-    by_gid: Dict[Tuple[str, str], Dict[str, str]] = {}
-    for index, record in enumerate(normalized_existing, start=2):
-        record_site = _normalize_site_code(record.get("site_code"))
-        gid = _safe_str(record.get("location_gid"))
-        if not gid:
-            raise ValueError(f"Cfg__Locations row {index} has empty location_gid.")
-        key = (record_site, gid)
-        if key in by_gid:
-            raise ValueError(f"Duplicate site_code + location_gid in Cfg__Locations: {key}")
-        by_gid[key] = record
-
-    current_site_records = [
-        row for row in normalized_existing if row["site_code"] == site_code
+    canonical_existing = [
+        _canonical_existing_record(record, site_code, headers)
+        for record in existing_records
     ]
     other_site_records = [
-        row for row in normalized_existing if row["site_code"] != site_code
+        record for record in canonical_existing if record["site_code"] != site_code
+    ]
+    current_records = [
+        record for record in canonical_existing if record["site_code"] == site_code
     ]
 
+    by_gid: Dict[str, Dict[str, str]] = {}
+    duplicate_gids: List[str] = []
+    for record in current_records:
+        gid = _safe_str(record.get("location_gid"))
+        if not gid:
+            continue
+        if gid in by_gid:
+            duplicate_gids.append(gid)
+        by_gid[gid] = record
+    if duplicate_gids:
+        raise ValueError(
+            "Cfg__Locations contains duplicate location_gid values for this site: "
+            + ", ".join(sorted(set(duplicate_gids)))
+        )
+
     used_codes = {
-        _clean_location_code(row.get("location_code"))
-        for row in current_site_records
-        if _clean_location_code(row.get("location_code"))
+        _clean_location_code(record.get("location_code"))
+        for record in current_records
+        if _clean_location_code(record.get("location_code"))
     }
 
-    warnings: List[str] = []
-    result_site_records: List[Dict[str, str]] = []
-    fetched_gids: set[str] = set()
-    new_count = 0
-    updated_count = 0
-    unchanged_count = 0
-
-    sorted_nodes = sorted(
-        shopify_nodes,
-        key=lambda node: (
-            _safe_str((node.get("address") or {}).get("provinceCode")),
-            _safe_str(node.get("name")).lower(),
-            _safe_str(node.get("id")),
-        ),
-    )
-
-    for node in sorted_nodes:
-        system_row = _shopify_location_record(node)
-        gid = system_row["location_gid"]
+    normalized_nodes: List[Dict[str, str]] = []
+    node_gids: set[str] = set()
+    for node in shopify_nodes:
+        gid = _safe_str(node.get("id"))
         if not gid:
             raise ValueError("Shopify returned a Location without id.")
-        if gid in fetched_gids:
+        if gid in node_gids:
             raise ValueError(f"Shopify returned duplicate Location GID: {gid}")
-        fetched_gids.add(gid)
+        node_gids.add(gid)
+        address = node.get("address") or {}
+        normalized_nodes.append(
+            {
+                "location_gid": gid,
+                "location_name": _safe_str(node.get("name")),
+                "province_code": _safe_str(address.get("provinceCode")).upper(),
+                "active": _bool_cell(node.get("isActive"), default=False),
+            }
+        )
 
-        existing = by_gid.get((site_code, gid))
-        if existing:
-            merged = dict(existing)
-            before = dict(existing)
-            merged.update(system_row)
-            merged["site_code"] = site_code
-            merged["synced_at"] = synced_at
-            if not _clean_location_code(merged.get("location_code")):
-                merged["location_code"] = _next_unique_code(
-                    _base_code(merged["location_name"], merged["province_code"]),
-                    used_codes,
-                )
-                warnings.append(
-                    f"Generated location_code={merged['location_code']} for existing gid={gid}."
-                )
-            else:
-                merged["location_code"] = _clean_location_code(merged["location_code"])
-            if _compare_managed_fields(before, merged):
-                updated_count += 1
-            else:
-                unchanged_count += 1
-            result_site_records.append(merged)
-        else:
+    final_current: List[Dict[str, str]] = []
+    preview: List[Dict[str, str]] = []
+    stats = {
+        "shopify_locations": len(normalized_nodes),
+        "existing_site_rows": len(current_records),
+        "new": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "missing_preserved": 0,
+    }
+    warnings: List[str] = []
+
+    for node in normalized_nodes:
+        existing = by_gid.get(node["location_gid"])
+        if existing is None:
             code = _next_unique_code(
-                _base_code(system_row["location_name"], system_row["province_code"]),
+                _base_location_code(node["location_name"], node["province_code"]),
                 used_codes,
             )
-            row = {header: "" for header in all_headers}
-            row.update(system_row)
-            row.update(
+            record = {header: "" for header in headers}
+            record.update(
                 {
                     "site_code": site_code,
                     "location_code": code,
+                    "location_name": node["location_name"],
+                    "location_gid": node["location_gid"],
+                    "province_code": node["province_code"],
+                    "active": node["active"],
                     "is_default": "FALSE",
                     "notes": "",
                     "synced_at": synced_at,
                 }
             )
-            result_site_records.append(row)
-            new_count += 1
+            final_current.append(record)
+            stats["new"] += 1
+            preview.append(
+                {
+                    "change_type": "NEW",
+                    "changed_fields": ",".join(SYSTEM_MANAGED_FIELDS | HUMAN_MANAGED_FIELDS),
+                    **{key: record.get(key, "") for key in LOCATION_HEADERS},
+                }
+            )
+            continue
 
-    missing_records = [
-        row for row in current_site_records if row["location_gid"] not in fetched_gids
+        record = dict(existing)
+        if not record.get("location_code"):
+            record["location_code"] = _next_unique_code(
+                _base_location_code(node["location_name"], node["province_code"]),
+                used_codes,
+            )
+
+        changed_fields: List[str] = []
+        desired_system_values = {
+            "site_code": site_code,
+            "location_name": node["location_name"],
+            "location_gid": node["location_gid"],
+            "province_code": node["province_code"],
+            "active": node["active"],
+        }
+        for field, desired in desired_system_values.items():
+            if _safe_str(record.get(field)) != _safe_str(desired):
+                record[field] = _safe_str(desired)
+                changed_fields.append(field)
+        if not existing.get("location_code") and record.get("location_code"):
+            changed_fields.append("location_code")
+
+        if changed_fields:
+            record["synced_at"] = synced_at
+            stats["updated"] += 1
+            change_type = "UPDATED"
+        else:
+            stats["unchanged"] += 1
+            change_type = "UNCHANGED"
+
+        final_current.append(record)
+        preview.append(
+            {
+                "change_type": change_type,
+                "changed_fields": ",".join(changed_fields),
+                **{key: record.get(key, "") for key in LOCATION_HEADERS},
+            }
+        )
+
+    for record in current_records:
+        gid = _safe_str(record.get("location_gid"))
+        if gid and gid in node_gids:
+            continue
+        final_current.append(record)
+        stats["missing_preserved"] += 1
+        warning = (
+            "Existing Cfg__Locations row was not returned by Shopify and was preserved: "
+            f"location_code={record.get('location_code')}, gid={gid or '(blank)'}"
+        )
+        warnings.append(warning)
+        preview.append(
+            {
+                "change_type": "MISSING_PRESERVED",
+                "changed_fields": "",
+                **{key: record.get(key, "") for key in LOCATION_HEADERS},
+            }
+        )
+
+    active_defaults = [
+        record
+        for record in final_current
+        if _normalize_bool(record.get("active"), default=False)
+        and _normalize_bool(record.get("is_default"), default=False)
     ]
-    for row in missing_records:
-        result_site_records.append(dict(row))
+    if len(active_defaults) == 0:
         warnings.append(
-            "Existing row was not returned by Shopify and was preserved unchanged: "
-            f"location_code={row.get('location_code')}, gid={row.get('location_gid')}"
+            f"site_code={site_code} has no active is_default=TRUE Location."
+        )
+    elif len(active_defaults) > 1:
+        warnings.append(
+            f"site_code={site_code} has {len(active_defaults)} active default Locations; expected one."
         )
 
-    merged_records = other_site_records + result_site_records
-    for row in merged_records:
-        for header in all_headers:
-            row.setdefault(header, "")
-
-    # Governance validation for every site represented in the registry.
-    grouped: Dict[str, List[Dict[str, str]]] = {}
-    for row in merged_records:
-        grouped.setdefault(_normalize_site_code(row.get("site_code")), []).append(row)
-
-    for group_site, rows in grouped.items():
-        seen_codes: Dict[str, str] = {}
-        defaults: List[Dict[str, str]] = []
-        for row in rows:
-            code = _clean_location_code(row.get("location_code"))
-            if not code:
-                raise ValueError(
-                    f"Cfg__Locations has empty location_code for site={group_site}, "
-                    f"gid={row.get('location_gid')}"
-                )
-            if code in seen_codes:
-                raise ValueError(
-                    f"Duplicate location_code for site={group_site}: {code}; "
-                    f"gids={seen_codes[code]}, {row.get('location_gid')}"
-                )
-            seen_codes[code] = _safe_str(row.get("location_gid"))
-            row["location_code"] = code
-
-            if _normalize_bool(row.get("is_default"), default=False):
-                defaults.append(row)
-                if not _normalize_bool(row.get("active"), default=False):
-                    raise ValueError(
-                        f"Default location must be active: site={group_site}, code={code}"
-                    )
-
-        if len(defaults) > 1:
-            raise ValueError(
-                f"Only one is_default=TRUE is allowed per site. site={group_site}; "
-                f"codes={[row['location_code'] for row in defaults]}"
-            )
-        if group_site == site_code and not defaults:
-            warnings.append(
-                f"No default location is configured for site={site_code}. "
-                "Create Product must provide a location_code until one row is marked is_default=TRUE."
-            )
-
-    merged_records.sort(
-        key=lambda row: (
-            _normalize_site_code(row.get("site_code")),
-            _clean_location_code(row.get("location_code")),
-            _safe_str(row.get("location_name")).lower(),
-        )
-    )
-
-    preview_rows = []
-    for row in result_site_records:
-        preview_rows.append({header: row.get(header, "") for header in all_headers})
-
+    final_records = other_site_records + final_current
     return {
-        "headers": all_headers,
-        "records": merged_records,
-        "preview_records": preview_rows,
-        "stats": {
-            "shopify_locations": len(shopify_nodes),
-            "existing_site_rows": len(current_site_records),
-            "new": new_count,
-            "updated": updated_count,
-            "unchanged": unchanged_count,
-            "missing_preserved": len(missing_records),
-            "table_rows_after": len(merged_records),
-        },
+        "headers": headers,
+        "records": final_records,
+        "preview_records": preview,
+        "stats": stats,
         "warnings": warnings,
     }
-
-
-def _matrix_from_records(headers: Sequence[str], records: Sequence[Dict[str, str]]) -> List[List[str]]:
-    matrix = [list(headers)]
-    for record in records:
-        matrix.append([_safe_str(record.get(header, "")) for header in headers])
-    return matrix
-
-
-def _write_matrix(
-    spreadsheet: gspread.Spreadsheet,
-    worksheet: Optional[gspread.Worksheet],
-    title: str,
-    matrix: List[List[str]],
-) -> gspread.Worksheet:
-    rows_needed = max(2, len(matrix) + 5)
-    cols_needed = max(2, len(matrix[0]) + 2 if matrix else 2)
-
-    if worksheet is None:
-        worksheet = spreadsheet.add_worksheet(
-            title=title,
-            rows=rows_needed,
-            cols=cols_needed,
-        )
-    else:
-        if worksheet.row_count < rows_needed or worksheet.col_count < cols_needed:
-            worksheet.resize(
-                rows=max(worksheet.row_count, rows_needed),
-                cols=max(worksheet.col_count, cols_needed),
-            )
-
-    existing_rows = max(1, worksheet.row_count)
-    existing_cols = max(1, worksheet.col_count)
-    worksheet.batch_clear([f"A1:{_a1_col(existing_cols)}{existing_rows}"])
-    worksheet.update(range_name="A1", values=matrix, value_input_option="RAW")
-    return worksheet
 
 
 def _a1_col(number: int) -> str:
@@ -888,6 +1001,183 @@ def _a1_col(number: int) -> str:
         n, remainder = divmod(n - 1, 26)
         output = chr(65 + remainder) + output
     return output
+
+
+def _matrix_from_records(
+    headers: Sequence[str],
+    records: Sequence[Mapping[str, Any]],
+) -> List[List[str]]:
+    return [list(headers)] + [
+        [_safe_str(record.get(header)) for header in headers]
+        for record in records
+    ]
+
+
+def _write_matrix(
+    spreadsheet: gspread.Spreadsheet,
+    worksheet: Optional[gspread.Worksheet],
+    title: str,
+    matrix: Sequence[Sequence[Any]],
+) -> gspread.Worksheet:
+    rows_needed = max(2, len(matrix) + 20)
+    cols_needed = max(2, len(matrix[0]) if matrix else len(LOCATION_HEADERS))
+    if worksheet is None:
+        worksheet = spreadsheet.add_worksheet(
+            title=title,
+            rows=rows_needed,
+            cols=cols_needed,
+        )
+    elif worksheet.row_count < rows_needed or worksheet.col_count < cols_needed:
+        worksheet.resize(
+            rows=max(worksheet.row_count, rows_needed),
+            cols=max(worksheet.col_count, cols_needed),
+        )
+
+    worksheet.batch_clear(
+        [f"A1:{_a1_col(max(worksheet.col_count, cols_needed))}{worksheet.row_count}"]
+    )
+    worksheet.update(range_name="A1", values=list(matrix), value_input_option="RAW")
+    return worksheet
+
+
+def _normalize_registry_header(value: Any) -> str:
+    return re.sub(r"[\s_]+", " ", _safe_str(value).lower()).strip()
+
+
+def update_existing_notebook_registry_row(
+    *,
+    registry_mode: str,
+    console_core_url: str,
+    bootstrap_gsheet_secret_name: str,
+    registry_tab: str,
+    job_name: str,
+    sheet_label: str,
+    tab_name: str,
+    current_colab_url: str = "",
+    current_colab_name: str = "",
+    secret_home: Optional[str] = None,
+    local_secret_aliases: Optional[Mapping[str, Mapping[str, str]]] = None,
+    explicit_sa_value: Optional[str] = None,
+    print_progress: bool = True,
+) -> Dict[str, Any]:
+    """Check or update one existing registry row; never append a row."""
+    mode = _safe_str(registry_mode).upper() or "OFF"
+    allowed = {"OFF", "CHECK", "UPDATE_URL", "UPDATE_URL_AND_NAME"}
+    if mode not in allowed:
+        raise ValueError(f"registry_mode must be one of {sorted(allowed)}.")
+    if mode == "OFF":
+        if print_progress:
+            print("[Registry] mode=OFF; no registry read or write")
+        return {"status": "OFF", "changed_fields": [], "target_row": None}
+
+    if mode in {"UPDATE_URL", "UPDATE_URL_AND_NAME"} and not _safe_str(
+        current_colab_url
+    ):
+        raise ValueError(f"registry_mode={mode} requires current_colab_url.")
+    if mode == "UPDATE_URL_AND_NAME" and not _safe_str(current_colab_name):
+        raise ValueError("UPDATE_URL_AND_NAME requires current_colab_name.")
+
+    if print_progress:
+        print(
+            "[Registry] resolving target | "
+            f"job_name={job_name} | sheet_label={sheet_label} | tab_name={tab_name}"
+        )
+
+    sa_secret = read_secret(
+        bootstrap_gsheet_secret_name,
+        explicit_value=explicit_sa_value,
+        secret_home=secret_home,
+        local_secret_aliases=local_secret_aliases,
+    )
+    gc, auth_meta = _build_gspread_client(sa_secret)
+    worksheet = gc.open_by_url(console_core_url).worksheet(registry_tab)
+    values = worksheet.get_all_values()
+    if not values:
+        raise ValueError(f"Registry tab {registry_tab!r} is empty.")
+
+    header_map: Dict[str, int] = {}
+    for index, raw_header in enumerate(values[0]):
+        normalized = _normalize_registry_header(raw_header)
+        if normalized:
+            header_map[normalized] = index
+
+    def require_column(*aliases: str) -> int:
+        for alias in aliases:
+            key = _normalize_registry_header(alias)
+            if key in header_map:
+                return header_map[key]
+        raise ValueError(
+            f"Registry tab is missing required column; accepted aliases={aliases}."
+        )
+
+    job_col = require_column("job_name", "job name")
+    label_col = require_column("sheet_label", "sheet label")
+    tab_col = require_column("Tab name", "sheet name", "sheet_name")
+    url_col = require_column("colab_url", "colab url")
+    name_col = require_column("colab_name", "colab name")
+
+    wanted = (
+        _safe_str(job_name).lower(),
+        _safe_str(sheet_label).lower(),
+        _safe_str(tab_name).lower(),
+    )
+    matches: List[int] = []
+    for row_index, row in enumerate(values[1:], start=2):
+        padded = list(row) + [""] * max(0, len(values[0]) - len(row))
+        logical_key = (
+            _safe_str(padded[job_col]).lower(),
+            _safe_str(padded[label_col]).lower(),
+            _safe_str(padded[tab_col]).lower(),
+        )
+        if logical_key == wanted:
+            matches.append(row_index)
+
+    if not matches:
+        raise ValueError(
+            "Registry target row was not found. This function never appends. "
+            f"logical_key={wanted}"
+        )
+    if len(matches) > 1:
+        raise ValueError(
+            f"Registry logical key is duplicated at rows={matches}; no row was changed."
+        )
+
+    row_number = matches[0]
+    current_row = values[row_number - 1] + [""] * max(
+        0, len(values[0]) - len(values[row_number - 1])
+    )
+    changes: List[Tuple[str, int, str, str]] = []
+
+    provided_url = _safe_str(current_colab_url)
+    provided_name = _safe_str(current_colab_name)
+    if provided_url and _safe_str(current_row[url_col]) != provided_url:
+        changes.append(("colab_url", url_col + 1, _safe_str(current_row[url_col]), provided_url))
+    if provided_name and _safe_str(current_row[name_col]) != provided_name:
+        changes.append(("colab_name", name_col + 1, _safe_str(current_row[name_col]), provided_name))
+
+    if mode == "CHECK":
+        status = "CHANGE_DETECTED" if changes else "NO_CHANGE"
+    else:
+        permitted = {"colab_url"} if mode == "UPDATE_URL" else {"colab_url", "colab_name"}
+        applied = [change for change in changes if change[0] in permitted]
+        for _, column_number, _, new_value in applied:
+            worksheet.update_cell(row_number, column_number, new_value)
+        changes = applied
+        status = "UPDATED" if changes else "NO_CHANGE"
+
+    if print_progress:
+        print(
+            "[Registry] "
+            f"row={row_number} | status={status} | "
+            f"changed_fields={[item[0] for item in changes]}"
+        )
+
+    return {
+        "status": status,
+        "target_row": row_number,
+        "changed_fields": [item[0] for item in changes],
+        "auth_source_type": auth_meta["source_type"],
+    }
 
 
 def run(
@@ -911,14 +1201,11 @@ def run(
     job_name: str = DEFAULT_JOB_NAME,
     print_progress: bool = True,
     secret_home: Optional[str] = None,
+    local_secret_aliases: Optional[Mapping[str, Mapping[str, str]]] = None,
     sa_b64_value: Optional[str] = None,
     shopify_token_value: Optional[str] = None,
-    shop_domain: Optional[str] = None,
-    api_version: Optional[str] = None,
-    gsheet_sa_b64_secret: Optional[str] = None,
-    shopify_token_secret: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Preview or apply a Shopify Location registry synchronization."""
+    """Preview or apply the Shopify Location registry synchronization."""
     site_code = _normalize_site_code(site_code)
     if not site_code:
         raise ValueError("site_code is required.")
@@ -931,45 +1218,56 @@ def run(
 
     run_id = run_id or _make_run_id(job_name, tz_name)
     phase = "preview" if dry_run else "apply"
+    started = time.monotonic()
 
     def progress(step: int, total: int, message: str) -> None:
         if print_progress:
             print(f"[{step}/{total}] {message}")
 
-    progress(1, 7, f"Load bootstrap Google credential | site={site_code} | phase={phase}")
-    bootstrap_secret_value = _load_secret(
+    progress(1, 8, f"Resolve bootstrap Google Secret | site={site_code} | phase={phase}")
+    bootstrap_secret = read_secret(
         bootstrap_gsheet_sa_b64_secret,
         explicit_value=sa_b64_value,
         secret_home=secret_home,
+        local_secret_aliases=local_secret_aliases,
     )
-    gc = _build_gspread_client(bootstrap_secret_value)
+    gc, google_auth_meta = _build_gspread_client(bootstrap_secret)
     console = gc.open_by_url(console_core_url)
+    progress(
+        2,
+        8,
+        "Google Console access ready | "
+        f"source={google_auth_meta['source_type']} | "
+        f"format={google_auth_meta['secret_format']}",
+    )
 
-    progress(2, 7, f"Read {tab_cfg_account_id} and resolve site account")
     account = _load_account_config(gc, console_core_url, tab_cfg_account_id)
-    resolved_shop_domain = _safe_str(shop_domain or account.shop_domain)
-    resolved_api_version = _safe_str(api_version or account.api_version)
-    resolved_gsheet_secret = _safe_str(
-        gsheet_sa_b64_secret or account.gsheet_sa_b64_secret
-    )
-    resolved_shopify_secret = _safe_str(
-        shopify_token_secret or account.shopify_token_secret
-    )
-
-    if resolved_gsheet_secret != bootstrap_gsheet_sa_b64_secret:
+    if account.gsheet_sa_b64_secret != bootstrap_gsheet_sa_b64_secret:
         raise ValueError(
-            "BOOTSTRAP_GSHEET_SA_B64_SECRET does not match "
-            "Cfg__account_id.GSHEET_SA_B64_SECRET. "
-            f"bootstrap={bootstrap_gsheet_sa_b64_secret}, cfg={resolved_gsheet_secret}"
+            "Bootstrap Google Secret name does not match Cfg__account_id. "
+            f"bootstrap={bootstrap_gsheet_sa_b64_secret}; "
+            f"cfg={account.gsheet_sa_b64_secret}"
         )
+    progress(
+        3,
+        8,
+        f"Account config ready | shop={account.shop_domain} | api={account.api_version}",
+    )
 
-    token = _load_secret(
-        resolved_shopify_secret,
+    shopify_secret = read_secret(
+        account.shopify_token_secret,
         explicit_value=shopify_token_value,
         secret_home=secret_home,
+        local_secret_aliases=local_secret_aliases,
+    )
+    progress(
+        4,
+        8,
+        "Shopify token ready | "
+        f"secret_name={account.shopify_token_secret} | "
+        f"source={shopify_secret.source_type}",
     )
 
-    progress(3, 7, f"Resolve RunLog route | label={runlog_sheet_label}")
     runlog_url = _resolve_sheet_url_by_label(
         gc,
         console_core_url,
@@ -985,14 +1283,15 @@ def run(
         site_code=site_code,
         tz_name=tz_name,
     )
+    target_ws = _get_optional_worksheet(console, tab_cfg_locations)
 
-    target_ws = _get_or_none_worksheet(console, tab_cfg_locations)
     try:
-        progress(4, 7, "Fetch Shopify Locations with pagination")
+        progress(5, 8, "Fetch Shopify Locations with pagination")
         client = ShopifyGraphQLClient(
-            shop_domain=resolved_shop_domain,
-            api_version=resolved_api_version,
-            access_token=token,
+            shop_domain=account.shop_domain,
+            api_version=account.api_version,
+            access_token=shopify_secret.value,
+            print_progress=print_progress,
         )
         shopify_nodes = _fetch_all_locations(
             client,
@@ -1003,10 +1302,10 @@ def run(
         )
         if not shopify_nodes:
             raise ValueError(
-                "Shopify returned zero Locations. Check token scopes and include filters."
+                "Shopify returned zero Locations. Check token scope and include filters."
             )
 
-        progress(5, 7, f"Compare Shopify with Console Core / {tab_cfg_locations}")
+        progress(6, 8, f"Build sync plan | target={tab_cfg_locations}")
         existing_headers, existing_records = _load_existing_locations(target_ws)
         plan = _build_sync_plan(
             site_code=site_code,
@@ -1017,38 +1316,41 @@ def run(
         )
         stats = plan["stats"]
         warnings = plan["warnings"]
+        changed_rows = stats["new"] + stats["updated"]
+        print(
+            "[Plan] "
+            f"shopify={stats['shopify_locations']} "
+            f"existing={stats['existing_site_rows']} "
+            f"new={stats['new']} updated={stats['updated']} "
+            f"unchanged={stats['unchanged']} "
+            f"missing_preserved={stats['missing_preserved']} "
+            f"warnings={len(warnings)}"
+        )
 
-        if print_progress:
-            print(
-                "      "
-                f"shopify={stats['shopify_locations']} "
-                f"existing={stats['existing_site_rows']} "
-                f"new={stats['new']} updated={stats['updated']} "
-                f"unchanged={stats['unchanged']} "
-                f"missing_preserved={stats['missing_preserved']}"
-            )
-
-        planned_changes = stats["new"] + stats["updated"]
-        rows_written = 0
+        sheet_rows_written = 0
         if dry_run:
-            progress(6, 7, "Preview only; no Cfg__Locations values changed")
+            progress(7, 8, "Preview only | Cfg__Locations not changed")
         else:
-            progress(6, 7, f"Write Cfg__Locations | changed={planned_changes}")
+            progress(
+                7,
+                8,
+                f"Write complete Cfg__Locations matrix | changed_rows={changed_rows}",
+            )
             matrix = _matrix_from_records(plan["headers"], plan["records"])
             _write_matrix(console, target_ws, tab_cfg_locations, matrix)
-            rows_written = planned_changes
+            sheet_rows_written = len(plan["records"])
 
-        status = "OK" if not warnings else "WARN"
+        status = "SUCCESS_WITH_WARNINGS" if warnings else "SUCCESS"
         logger.log(
             phase=phase,
             log_type="summary",
             status=status,
             rows_loaded=stats["shopify_locations"],
-            rows_pending=planned_changes,
+            rows_pending=changed_rows,
             rows_recognized=stats["shopify_locations"],
-            rows_planned=planned_changes,
-            rows_written=rows_written,
-            rows_skipped=planned_changes if dry_run else stats["unchanged"],
+            rows_planned=changed_rows,
+            rows_written=sheet_rows_written,
+            rows_skipped=stats["unchanged"],
             message=(
                 f"{'preview' if dry_run else 'applied'} | "
                 f"new={stats['new']} | updated={stats['updated']} | "
@@ -1057,7 +1359,7 @@ def run(
                 f"warnings={len(warnings)}"
             ),
         )
-        for warning in warnings[:2]:
+        for warning in warnings[:5]:
             logger.log(
                 phase=phase,
                 log_type="detail",
@@ -1067,12 +1369,12 @@ def run(
             )
         logger.flush()
 
+        elapsed = round(time.monotonic() - started, 2)
         progress(
-            7,
-            7,
-            f"Completed | status={status} written={rows_written} warnings={len(warnings)} errors=0",
+            8,
+            8,
+            f"Completed | status={status} | elapsed={elapsed}s | errors=0",
         )
-
         preview_df = pd.DataFrame(plan["preview_records"])
         if preview_rows >= 0:
             preview_df = preview_df.head(int(preview_rows))
@@ -1086,10 +1388,11 @@ def run(
             "site_code": site_code,
             "summary": {
                 **stats,
-                "rows_planned": planned_changes,
-                "rows_written": rows_written,
-                "warnings_count": len(warnings),
+                "changed_rows": changed_rows,
+                "sheet_rows_written": sheet_rows_written,
+                "warning_count": len(warnings),
                 "error_count": 0,
+                "elapsed_seconds": elapsed,
             },
             "preview": preview_df,
             "warnings": warnings,
@@ -1098,30 +1401,44 @@ def run(
                 "target_tab": tab_cfg_locations,
                 "runlog_sheet_url": runlog_url,
                 "runlog_tab": tab_runlog,
-                "shop_domain": resolved_shop_domain,
-                "api_version": resolved_api_version,
-                "include_inactive": bool(include_inactive),
-                "include_legacy": bool(include_legacy),
+                "shop_domain": account.shop_domain,
+                "api_version": account.api_version,
+                "module_path": MODULE_PATH,
                 "module_version": MODULE_VERSION,
+            },
+            "runtime": {
+                "runtime_mode": _runtime_mode(),
+                "python": sys.version.split()[0],
+                "platform": platform.platform(),
+                "google_secret_source": google_auth_meta["source_type"],
+                "google_secret_format": google_auth_meta["secret_format"],
+                "shopify_secret_source": shopify_secret.source_type,
+                "service_account_email": google_auth_meta["service_account_email"],
             },
         }
 
-    except Exception as exc:  # noqa: BLE001
-        logger.log(
-            phase=phase,
-            log_type="summary",
-            status="FAIL",
-            message=str(exc),
-            error_reason="JOB_FAILED",
-        )
-        logger.flush()
+    except BaseException as exc:  # noqa: BLE001
+        try:
+            logger.log(
+                phase=phase,
+                log_type="summary",
+                status="FAILED",
+                message=str(exc),
+                error_reason=type(exc).__name__,
+            )
+            logger.flush()
+        except Exception as log_exc:  # noqa: BLE001
+            if print_progress:
+                print(f"[RunLog warning] failed to write failure log: {log_exc}")
         if print_progress:
-            print(f"[FAILED] {exc}")
+            print(f"[FAILED] {type(exc).__name__}: {exc}")
         raise
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Sync Shopify Locations into Console Core / Cfg__Locations.")
+    parser = argparse.ArgumentParser(
+        description="Sync Shopify Locations into Console Core / Cfg__Locations."
+    )
     parser.add_argument("--site-code", required=True)
     parser.add_argument("--console-core-url", required=True)
     parser.add_argument("--bootstrap-gsheet-secret", required=True)
@@ -1130,7 +1447,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preview-rows", type=int, default=50)
     parser.add_argument("--include-legacy", action="store_true")
     parser.add_argument("--exclude-inactive", action="store_true")
-    parser.add_argument("--apply", action="store_true", help="Write Cfg__Locations.")
+    parser.add_argument("--apply", action="store_true")
     parser.add_argument("--confirmed", action="store_true")
     parser.add_argument("--tz-name", default="America/New_York")
     return parser
@@ -1151,7 +1468,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tz_name=args.tz_name,
         secret_home=args.secret_home,
     )
-    print(json.dumps(result["summary"], ensure_ascii=False, indent=2))
+    print(json.dumps({"status": result["status"], "summary": result["summary"]}, indent=2))
     return 0
 
 
