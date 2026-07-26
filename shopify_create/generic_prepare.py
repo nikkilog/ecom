@@ -6,7 +6,9 @@ Import path: ``shopify_create.generic_prepare``
 
 Scope
 -----
-- Read ``Input`` with two header rows: display name + field_key.
+- Read ``Input`` with two header rows: display name + optional field_key.
+- Resolve missing Row-2 field_key values from system definitions and
+  ``Cfg__Fields``, then optionally write the generated mapping row back.
 - Read ``Defaults`` as configurable fallback/derivation rules.
 - Resolve the target workbook through Console Core / ``Cfg__Sites`` label
   ``create_generic``.
@@ -58,7 +60,7 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "1.0.0"
+MODULE_VERSION = "1.1.0"
 MODULE_PATH = "shopify_create.generic_prepare"
 DEFAULT_JOB_NAME = "generic_create_prepare"
 
@@ -252,6 +254,67 @@ SYSTEM_FIELD_DEFINITIONS: Dict[str, Dict[str, str]] = {
     },
 }
 
+SYSTEM_DISPLAY_ALIASES: Dict[str, str] = {
+    # Generic Create human labels.
+    "Action": "sys.action",
+    "Product Key": "sys.product_key",
+    "Variant Key": "sys.variant_key",
+    "Title": "core.title",
+    "Product Title": "core.title",
+    "Handle": "core.handle",
+    "Product Handle": "core.handle",
+    "Description HTML": "core.description_html",
+    "Product Description (HTML)": "core.description_html",
+    "Vendor": "core.vendor",
+    "Product Type": "core.product_type",
+    "Tags": "core.tags",
+    "Template Suffix": "core.template_suffix",
+    "Status": "core.status",
+    "Product Status": "core.status",
+    "SEO Title": "core.seo_title",
+    "Product SEO Title": "core.seo_title",
+    "SEO Description": "core.seo_description",
+    "Product SEO Description": "core.seo_description",
+    "Option 1 Name": "core.option1_name",
+    "Option1 Name": "core.option1_name",
+    "Option 1 Value": "core.option1_value",
+    "Option1 Value": "core.option1_value",
+    "Option 2 Name": "core.option2_name",
+    "Option2 Name": "core.option2_name",
+    "Option 2 Value": "core.option2_value",
+    "Option2 Value": "core.option2_value",
+    "Option 3 Name": "core.option3_name",
+    "Option3 Name": "core.option3_name",
+    "Option 3 Value": "core.option3_value",
+    "Option3 Value": "core.option3_value",
+    "SKU": "core.sku",
+    "Variant SKU": "core.sku",
+    "Barcode": "core.barcode",
+    "Variant Barcode": "core.barcode",
+    "Price": "core.price",
+    "Variant Price": "core.price",
+    "Compare-at Price": "core.compare_at_price",
+    "Compare At Price": "core.compare_at_price",
+    "Variant Compare At Price": "core.compare_at_price",
+    "Cost": "core.cost",
+    "Cost per item": "core.cost",
+    "Weight": "core.weight",
+    "Variant Weight": "core.weight",
+    "Weight Unit": "core.weight_unit",
+    "Variant Weight Unit": "core.weight_unit",
+    "Inventory Policy": "core.inventory_policy",
+    "Variant Inventory Policy": "core.inventory_policy",
+    "Requires Shipping": "core.requires_shipping",
+    "Variant Requires Shipping": "core.requires_shipping",
+    "Taxable": "core.taxable",
+    "Variant Taxable": "core.taxable",
+    "Inventory Location": "inventory.location_code",
+    "Inventory Quantity": "inventory.quantity",
+}
+
+AUTO_RESOLVE_ENTITY_PRIORITY = ("PRODUCT", "VARIANT")
+
+
 PRODUCT_CORE_FIELDS = {
     key
     for key, definition in SYSTEM_FIELD_DEFINITIONS.items()
@@ -305,6 +368,7 @@ PREVIEW_SYSTEM_FIELDS = [
     ("Warning Count", "sys.warning_count"),
     ("Validation Messages", "sys.validation_messages"),
     ("Defaulted Fields", "sys.defaulted_fields"),
+    ("Inherited Fields", "sys.inherited_fields"),
     ("Product Variant Count", "sys.product_variant_count"),
 ]
 
@@ -469,6 +533,26 @@ def _make_run_id(job_name: str, tz_name: str) -> str:
 
 def _normalize_header(value: Any) -> str:
     return re.sub(r"\s+", " ", _safe_str(value)).strip()
+
+
+def _normalize_display_lookup(value: Any) -> str:
+    text = html.unescape(_safe_str(value)).casefold()
+    text = text.replace("–", "-").replace("—", "-")
+    text = re.sub(r"[\s_]+", " ", text)
+    text = re.sub(r"\s*-\s*", "-", text)
+    return text.strip()
+
+
+def _normalize_owner_entity(value: Any, field_key: str = "") -> str:
+    key = _safe_str(field_key)
+    if key.startswith("mf."):
+        return "PRODUCT"
+    if key.startswith("v_mf."):
+        return "VARIANT"
+    entity = _safe_str(value).upper().replace(" ", "")
+    if entity in {"PRODUCTVARIANT", "VARIANT"}:
+        return "VARIANT"
+    return entity
 
 
 def _normalize_registry_header(value: Any) -> str:
@@ -925,13 +1009,232 @@ def _a1_col(number: int) -> str:
     return result
 
 
+def _build_system_display_map() -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for field_key, definition in SYSTEM_FIELD_DEFINITIONS.items():
+        display_name = _safe_str(definition.get("display_name"))
+        if display_name:
+            mapping[_normalize_display_lookup(display_name)] = field_key
+    for display_name, field_key in SYSTEM_DISPLAY_ALIASES.items():
+        normalized = _normalize_display_lookup(display_name)
+        existing = mapping.get(normalized)
+        if existing and existing != field_key:
+            raise RuntimeError(
+                "SYSTEM_DISPLAY_ALIASES conflict for "
+                f"{display_name!r}: {existing!r} vs {field_key!r}."
+            )
+        mapping[normalized] = field_key
+    return mapping
+
+
+def _build_cfg_display_index(
+    cfg_fields: Mapping[str, Mapping[str, str]],
+) -> Dict[str, Dict[str, List[Dict[str, str]]]]:
+    """Index writable metafields by owner and normalized display_name."""
+    index: Dict[str, Dict[str, List[Dict[str, str]]]] = {
+        "PRODUCT": {},
+        "VARIANT": {},
+    }
+    for field_key, raw in cfg_fields.items():
+        # Generic Create V1 accepts Config-driven metafields only. Core,
+        # derived, and raw fields must be part of SYSTEM_FIELD_DEFINITIONS.
+        if not field_key.startswith(("mf.", "v_mf.")):
+            continue
+        display_name = _safe_str(raw.get("display_name"))
+        if not display_name:
+            continue
+        owner = _normalize_owner_entity(
+            raw.get("entity_type"),
+            field_key,
+        )
+        if owner not in index:
+            continue
+        display_key = _normalize_display_lookup(display_name)
+        record = {
+            "display_name": display_name,
+            "field_key": field_key,
+            "entity_type": owner,
+            "data_type": _safe_str(raw.get("data_type")),
+            "source_type": _safe_str(raw.get("source_type")),
+            "source_row": _safe_str(raw.get("source_row")),
+        }
+        index[owner].setdefault(display_key, []).append(record)
+
+    for owner, by_display in index.items():
+        for display_key, records in by_display.items():
+            deduped: Dict[str, Dict[str, str]] = {}
+            for record in records:
+                deduped[record["field_key"]] = record
+            by_display[display_key] = list(deduped.values())
+    return index
+
+
+def _resolve_input_field_keys(
+    display_headers: Sequence[str],
+    provided_field_keys: Sequence[str],
+    cfg_fields: Mapping[str, Mapping[str, str]],
+    *,
+    entity_priority: Sequence[str] = AUTO_RESOLVE_ENTITY_PRIORITY,
+) -> Dict[str, Any]:
+    system_map = _build_system_display_map()
+    cfg_index = _build_cfg_display_index(cfg_fields)
+
+    resolved: List[str] = []
+    mapping_records: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    for index, (display_name, provided_key) in enumerate(
+        zip(display_headers, provided_field_keys),
+        start=1,
+    ):
+        display_name = _normalize_header(display_name)
+        provided_key = _safe_str(provided_key)
+
+        if not display_name and not provided_key:
+            resolved.append("")
+            continue
+
+        if provided_key:
+            resolved.append(provided_key)
+            mapping_records.append(
+                {
+                    "column_number": index,
+                    "display_name": display_name,
+                    "field_key": provided_key,
+                    "mapping_source": "EXPLICIT_ROW_2",
+                    "entity_type": _safe_str(
+                        (_field_definition(provided_key, cfg_fields) or {}).get(
+                            "scope"
+                        )
+                    ),
+                }
+            )
+            continue
+
+        if not display_name:
+            errors.append(
+                f"column={index}: Row 2 has no field_key and Row 1 has no "
+                "display name."
+            )
+            resolved.append("")
+            continue
+
+        display_key = _normalize_display_lookup(display_name)
+        system_key = system_map.get(display_key)
+        if system_key:
+            resolved.append(system_key)
+            mapping_records.append(
+                {
+                    "column_number": index,
+                    "display_name": display_name,
+                    "field_key": system_key,
+                    "mapping_source": "SYSTEM_DISPLAY_NAME",
+                    "entity_type": _safe_str(
+                        SYSTEM_FIELD_DEFINITIONS[system_key].get("scope")
+                    ),
+                }
+            )
+            continue
+
+        matched = False
+        for raw_owner in entity_priority:
+            owner = _normalize_owner_entity(raw_owner)
+            candidates = cfg_index.get(owner, {}).get(display_key, [])
+            if not candidates:
+                continue
+            if len(candidates) == 1:
+                candidate = candidates[0]
+                field_key = candidate["field_key"]
+                resolved.append(field_key)
+                mapping_records.append(
+                    {
+                        "column_number": index,
+                        "display_name": display_name,
+                        "field_key": field_key,
+                        "mapping_source": f"CFG_FIELDS_{owner}",
+                        "entity_type": owner,
+                    }
+                )
+                matched = True
+                break
+
+            candidate_text = [
+                {
+                    "field_key": candidate["field_key"],
+                    "display_name": candidate["display_name"],
+                    "entity_type": candidate["entity_type"],
+                    "source_row": candidate["source_row"],
+                }
+                for candidate in candidates
+            ]
+            errors.append(
+                f"column={index}, display_name={display_name!r}: "
+                f"Cfg__Fields has multiple {owner} candidates="
+                f"{candidate_text}. Fill Row 2 explicitly for this column."
+            )
+            resolved.append("")
+            matched = True
+            break
+
+        if matched:
+            continue
+
+        errors.append(
+            f"column={index}, display_name={display_name!r}: no matching "
+            "Generic Create system field or writable PRODUCT/VARIANT "
+            "metafield was found in Cfg__Fields."
+        )
+        resolved.append("")
+
+    if errors:
+        raise ValueError(
+            "Input header resolution failed. " + " | ".join(errors)
+        )
+
+    active_keys = [field_key for field_key in resolved if field_key]
+    duplicate_keys = sorted(
+        field_key
+        for field_key in set(active_keys)
+        if active_keys.count(field_key) > 1
+    )
+    if duplicate_keys:
+        duplicate_columns = {
+            field_key: [
+                record["column_number"]
+                for record in mapping_records
+                if record["field_key"] == field_key
+            ]
+            for field_key in duplicate_keys
+        }
+        raise ValueError(
+            "Input resolves multiple columns to the same field_key. "
+            f"duplicates={duplicate_columns}"
+        )
+
+    source_counts: Dict[str, int] = {}
+    for record in mapping_records:
+        source = str(record["mapping_source"])
+        source_counts[source] = source_counts.get(source, 0) + 1
+
+    return {
+        "resolved_field_keys": resolved,
+        "mapping_records": mapping_records,
+        "mapping_source_counts": source_counts,
+    }
+
+
 def _read_input_matrix(
     values: Sequence[Sequence[Any]],
+    cfg_fields: Mapping[str, Mapping[str, str]],
+    *,
+    entity_priority: Sequence[str] = AUTO_RESOLVE_ENTITY_PRIORITY,
 ) -> Dict[str, Any]:
     if len(values) < 2:
         raise ValueError(
-            "Input requires two header rows: display name and field_key."
+            "Input requires two header rows: Row 1 display name and "
+            "Row 2 optional/generated field_key."
         )
+
     max_cols = max(len(values[0]), len(values[1]))
     display_headers = [
         _normalize_header(
@@ -939,58 +1242,52 @@ def _read_input_matrix(
         )
         for index in range(max_cols)
     ]
-    field_keys = [
+    provided_field_keys = [
         _safe_str(values[1][index] if index < len(values[1]) else "")
         for index in range(max_cols)
     ]
 
-    while max_cols and not display_headers[-1] and not field_keys[-1]:
+    while (
+        max_cols
+        and not display_headers[-1]
+        and not provided_field_keys[-1]
+    ):
         display_headers.pop()
-        field_keys.pop()
+        provided_field_keys.pop()
         max_cols -= 1
 
-    if not field_keys:
-        raise ValueError("Input field_key row is empty.")
+    if not display_headers:
+        raise ValueError("Input Row 1 display-name header is empty.")
 
-    blank_key_columns = [
-        index + 1
-        for index, (display_name, field_key) in enumerate(
-            zip(display_headers, field_keys)
-        )
-        if display_name and not field_key
-    ]
-    if blank_key_columns:
-        raise ValueError(
-            "Input has display headers without field_key at columns="
-            f"{blank_key_columns}."
-        )
-
-    active_keys = [key for key in field_keys if key]
-    duplicate_keys = sorted(
-        key for key in set(active_keys) if active_keys.count(key) > 1
+    resolution = _resolve_input_field_keys(
+        display_headers,
+        provided_field_keys,
+        cfg_fields,
+        entity_priority=entity_priority,
     )
-    if duplicate_keys:
-        raise ValueError(
-            f"Input contains duplicate field_key values: {duplicate_keys}"
-        )
+    resolved_field_keys = resolution["resolved_field_keys"]
 
     columns = [
         {
             "display_name": display_headers[index]
-            or SYSTEM_FIELD_DEFINITIONS.get(field_keys[index], {}).get(
-                "display_name",
-                field_keys[index],
-            ),
-            "field_key": field_keys[index],
+            or SYSTEM_FIELD_DEFINITIONS.get(
+                resolved_field_keys[index],
+                {},
+            ).get("display_name", resolved_field_keys[index]),
+            "field_key": resolved_field_keys[index],
+            "provided_field_key": provided_field_keys[index],
             "column_number": index + 1,
         }
         for index in range(max_cols)
-        if field_keys[index]
+        if resolved_field_keys[index]
     ]
 
     rows: List[Dict[str, Any]] = []
     for sheet_row, raw_row in enumerate(values[2:], start=3):
-        padded = list(raw_row) + [""] * max(0, max_cols - len(raw_row))
+        padded = list(raw_row) + [""] * max(
+            0,
+            max_cols - len(raw_row),
+        )
         row_values = {
             column["field_key"]: _safe_str(
                 padded[column["column_number"] - 1]
@@ -1006,11 +1303,67 @@ def _read_input_matrix(
             }
         )
 
+    changed_columns = [
+        index + 1
+        for index, (before, after) in enumerate(
+            zip(provided_field_keys, resolved_field_keys)
+        )
+        if _safe_str(before) != _safe_str(after)
+    ]
+
     return {
         "display_headers": display_headers,
+        "provided_field_keys": provided_field_keys,
+        "resolved_field_keys": resolved_field_keys,
         "field_keys": [column["field_key"] for column in columns],
         "columns": columns,
         "rows": rows,
+        "mapping_records": resolution["mapping_records"],
+        "mapping_source_counts": resolution[
+            "mapping_source_counts"
+        ],
+        "mapping_changed_columns": changed_columns,
+    }
+
+
+def _write_input_field_key_row_if_changed(
+    worksheet: gspread.Worksheet,
+    *,
+    provided_field_keys: Sequence[str],
+    resolved_field_keys: Sequence[str],
+) -> Dict[str, Any]:
+    before = [_safe_str(value) for value in provided_field_keys]
+    after = [_safe_str(value) for value in resolved_field_keys]
+    if len(before) != len(after):
+        raise ValueError(
+            "Input mapping row length mismatch: "
+            f"before={len(before)}, after={len(after)}."
+        )
+    changed_columns = [
+        index + 1
+        for index, (old, new) in enumerate(zip(before, after))
+        if old != new
+    ]
+    if not changed_columns:
+        return {
+            "field_key_row_written": False,
+            "mapping_cells_changed": 0,
+            "changed_columns": [],
+        }
+    if worksheet.col_count < len(after):
+        worksheet.resize(
+            rows=max(worksheet.row_count, 3),
+            cols=len(after),
+        )
+    worksheet.update(
+        range_name=f"A2:{_a1_col(len(after))}2",
+        values=[after],
+        value_input_option="RAW",
+    )
+    return {
+        "field_key_row_written": True,
+        "mapping_cells_changed": len(changed_columns),
+        "changed_columns": changed_columns,
     }
 
 
@@ -1138,8 +1491,17 @@ def _read_cfg_fields(
     header_map = {
         header: index for index, header in enumerate(headers) if header
     }
-    if "field_key" not in header_map:
-        raise ValueError("Cfg__Fields has no field_key column.")
+    required = {
+        "display_name",
+        "field_key",
+        "entity_type",
+        "data_type",
+    }
+    missing = sorted(required - set(header_map))
+    if missing:
+        raise ValueError(
+            f"Cfg__Fields missing required columns: {missing}"
+        )
 
     result: Dict[str, Dict[str, str]] = {}
     for source_row, row in enumerate(values[1:], start=2):
@@ -1156,6 +1518,10 @@ def _read_cfg_fields(
             header: _safe_str(padded[index])
             for header, index in header_map.items()
         }
+        record["entity_type"] = _normalize_owner_entity(
+            record.get("entity_type"),
+            field_key,
+        )
         record["source_row"] = str(source_row)
         result[field_key] = record
     return result
@@ -1251,6 +1617,11 @@ def _field_definition(
 
     cfg = cfg_fields.get(field_key)
     if not cfg:
+        return None
+    if not field_key.startswith(("mf.", "v_mf.")):
+        # Generic Create accepts only the explicit system contract plus
+        # Config-driven metafields. Read-only core/raw/derived registry fields
+        # are not writable create inputs.
         return None
     definition = {
         key: _safe_str(value)
@@ -1867,6 +2238,9 @@ def _build_prepare_plan(
         defaulted_text = ";".join(
             sorted(set(row_state["defaulted_fields"]))
         )
+        inherited_text = ";".join(
+            sorted(set(row_state["inherited_fields"]))
+        )
         system_values = [
             row_state["status"],
             str(row_state["source_row"]),
@@ -1874,6 +2248,7 @@ def _build_prepare_plan(
             str(len(row_state["warnings"])),
             message_text,
             defaulted_text,
+            inherited_text,
             str(product_variant_counts.get(product_key, 0)),
         ]
         normalized_values = [
@@ -2175,6 +2550,7 @@ def run(
     tab_preview: str = "Preview",
     tab_result: str = "Result",
     tab_runlog: str = "Ops__RunLog",
+    write_input_field_key_row: bool = True,
     write_preview: bool = True,
     preview_rows: int = 50,
     tz_name: str = "America/New_York",
@@ -2206,7 +2582,7 @@ def run(
 
     progress(
         1,
-        9,
+        10,
         f"Resolve Google Secret | site={site_code} | phase={phase}",
     )
     secret = read_secret(
@@ -2220,7 +2596,7 @@ def run(
 
     progress(
         2,
-        9,
+        10,
         "Google access ready | "
         f"source={auth_meta['source_type']} | "
         f"format={auth_meta['secret_format']}",
@@ -2247,7 +2623,7 @@ def run(
 
     progress(
         3,
-        9,
+        10,
         "Resolve routed workbooks | "
         f"create={create_sheet_label} | config={config_sheet_label}",
     )
@@ -2284,25 +2660,23 @@ def run(
     try:
         progress(
             4,
-            9,
+            10,
             f"Read Input and Defaults | tabs={tab_input}, {tab_defaults}",
         )
-        input_values = _require_worksheet(
+        input_ws = _require_worksheet(
             create_book,
             tab_input,
-        ).get_all_values()
+        )
+        input_values = input_ws.get_all_values()
         defaults_values = _require_worksheet(
             create_book,
             tab_defaults,
         ).get_all_values()
-        input_contract = _read_input_matrix(input_values)
         defaults = _read_defaults_matrix(defaults_values)
-        if not input_contract["rows"]:
-            raise ValueError("Input contains no data rows.")
 
         progress(
             5,
-            9,
+            10,
             f"Read field dictionary | tab={tab_cfg_fields}",
         )
         cfg_fields = _read_cfg_fields(
@@ -2314,7 +2688,52 @@ def run(
 
         progress(
             6,
-            9,
+            10,
+            "Resolve Input Row-2 field_key mapping from Row 1 / Cfg__Fields",
+        )
+        input_contract = _read_input_matrix(
+            input_values,
+            cfg_fields,
+        )
+        if not input_contract["rows"]:
+            raise ValueError("Input contains no data rows.")
+        mapping_counts = input_contract["mapping_source_counts"]
+        print(
+            "[Field Mapping] "
+            f"columns={len(input_contract['field_keys'])} | "
+            f"explicit={mapping_counts.get('EXPLICIT_ROW_2', 0)} | "
+            f"system={mapping_counts.get('SYSTEM_DISPLAY_NAME', 0)} | "
+            f"cfg_product={mapping_counts.get('CFG_FIELDS_PRODUCT', 0)} | "
+            f"cfg_variant={mapping_counts.get('CFG_FIELDS_VARIANT', 0)} | "
+            f"changed_columns="
+            f"{input_contract['mapping_changed_columns']}"
+        )
+
+        mapping_write = {
+            "field_key_row_written": False,
+            "mapping_cells_changed": 0,
+            "changed_columns": [],
+        }
+        if write_input_field_key_row:
+            mapping_write = _write_input_field_key_row_if_changed(
+                input_ws,
+                provided_field_keys=input_contract[
+                    "provided_field_keys"
+                ],
+                resolved_field_keys=input_contract[
+                    "resolved_field_keys"
+                ],
+            )
+        print(
+            "[Field Mapping Write] "
+            f"enabled={write_input_field_key_row} | "
+            f"written={mapping_write['field_key_row_written']} | "
+            f"cells_changed={mapping_write['mapping_cells_changed']}"
+        )
+
+        progress(
+            7,
+            10,
             f"Resolve default Location | tab={tab_cfg_locations}",
         )
         locations = _read_locations(
@@ -2333,8 +2752,8 @@ def run(
         )
 
         progress(
-            7,
-            9,
+            8,
+            10,
             "Normalize, apply Defaults, group Products, and validate",
         )
         plan = _build_prepare_plan(
@@ -2357,8 +2776,8 @@ def run(
         preview_rows_written = 0
         if write_preview:
             progress(
-                8,
                 9,
+                10,
                 f"Overwrite Preview | tab={tab_preview}",
             )
             preview_rows_written = _write_matrix_overwrite(
@@ -2368,8 +2787,8 @@ def run(
             )
         else:
             progress(
-                8,
                 9,
+                10,
                 "Preview write disabled; no Sheet change",
             )
 
@@ -2391,7 +2810,11 @@ def run(
                 f"{stats['business_objects_planned']} | "
                 f"warnings={stats['warning_count']} | "
                 f"errors={stats['error_count']} | "
-                f"preview_rows_written={preview_rows_written}"
+                f"preview_rows_written={preview_rows_written} | "
+                f"mapping_row_written="
+                f"{mapping_write['field_key_row_written']} | "
+                f"mapping_cells_changed="
+                f"{mapping_write['mapping_cells_changed']}"
             ),
             error_reason=(
                 "INPUT_VALIDATION_FAILED"
@@ -2411,8 +2834,8 @@ def run(
 
         elapsed = round(time.monotonic() - started, 2)
         progress(
-            9,
-            9,
+            10,
+            10,
             f"Completed | status={status} | "
             f"ready_for_apply={plan['ready_for_apply']} | "
             f"elapsed={elapsed}s",
@@ -2432,6 +2855,29 @@ def run(
             "site_code": site_code,
             "summary": {
                 **stats,
+                "input_columns": len(input_contract["field_keys"]),
+                "field_keys_explicit": mapping_counts.get(
+                    "EXPLICIT_ROW_2",
+                    0,
+                ),
+                "field_keys_resolved_system": mapping_counts.get(
+                    "SYSTEM_DISPLAY_NAME",
+                    0,
+                ),
+                "field_keys_resolved_cfg_product": mapping_counts.get(
+                    "CFG_FIELDS_PRODUCT",
+                    0,
+                ),
+                "field_keys_resolved_cfg_variant": mapping_counts.get(
+                    "CFG_FIELDS_VARIANT",
+                    0,
+                ),
+                "field_key_row_written": mapping_write[
+                    "field_key_row_written"
+                ],
+                "mapping_cells_changed": mapping_write[
+                    "mapping_cells_changed"
+                ],
                 "preview_rows_written": preview_rows_written,
                 "api_operations_planned": 0,
                 "api_operations_succeeded": 0,
@@ -2439,6 +2885,9 @@ def run(
                 "elapsed_seconds": elapsed,
             },
             "preview": preview_df,
+            "field_mapping": pd.DataFrame(
+                input_contract["mapping_records"]
+            ),
             "warnings": plan["warnings"],
             "errors": plan["errors"],
             "targets": {
@@ -2528,6 +2977,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="config",
     )
     parser.add_argument(
+        "--no-write-input-field-key-row",
+        action="store_true",
+    )
+    parser.add_argument(
         "--no-write-preview",
         action="store_true",
     )
@@ -2545,6 +2998,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ),
         create_sheet_label=args.create_sheet_label,
         config_sheet_label=args.config_sheet_label,
+        write_input_field_key_row=(
+            not args.no_write_input_field_key_row
+        ),
         write_preview=not args.no_write_preview,
         secret_home=args.secret_home or None,
     )
