@@ -9,7 +9,7 @@ Safety model
 1. Re-read Input, Defaults, Cfg__Fields and Cfg__Locations.
 2. Rebuild the Prepare plan using ``shopify_create.generic_prepare``.
 3. Compare the rebuilt plan with the existing Preview snapshot.
-4. Query Shopify again for Handle, SKU and Barcode conflicts.
+4. Query Shopify again for Handle conflicts only.
 5. DRY_RUN produces a final execution plan without Shopify writes.
 6. Live writes require ``dry_run=False`` and ``confirmed=True``.
 7. Live mode requires explicit product selection unless
@@ -19,7 +19,9 @@ Safety model
 9. Result and RunLog retain execution evidence.
 10. Images/media are intentionally out of scope.
 
-The module uses Shopify Admin GraphQL ``productSet`` synchronously to create
+SKU and Barcode are not duplicate identities and do not participate in
+conflict blocking. The module uses Shopify Admin GraphQL ``productSet``
+synchronously to create
 a Product with its options, variants, product/variant metafields, inventory
 item attributes, and initial inventory quantities in one product operation.
 """
@@ -47,10 +49,10 @@ from zoneinfo import ZoneInfo
 from shopify_create import generic_prepare as gp
 
 
-MODULE_VERSION = "1.0.0"
+MODULE_VERSION = "1.1.0"
 MODULE_PATH = "shopify_create.generic_apply"
 DEFAULT_JOB_NAME = "generic_create_apply"
-EXPECTED_PREPARE_MODULE_VERSION = "1.2.0"
+EXPECTED_PREPARE_MODULE_VERSION = "1.3.0"
 
 RESULT_HEADERS = [
     "run_id",
@@ -95,23 +97,6 @@ query ProductByHandle($identifier: ProductIdentifierInput!) {
     handle
     title
     status
-  }
-}
-"""
-
-Q_VARIANT_CONFLICT = """
-query VariantConflict($query: String!) {
-  productVariants(first: 100, query: $query) {
-    nodes {
-      id
-      sku
-      barcode
-      product {
-        id
-        handle
-        title
-      }
-    }
   }
 }
 """
@@ -1045,66 +1030,25 @@ def _attach_location_gids(
             )
 
 
-def _exact_variant_conflicts(
-    nodes: Sequence[Mapping[str, Any]],
-    *,
-    field_name: str,
-    expected_value: str,
-) -> List[Dict[str, str]]:
-    result = []
-    for node in nodes:
-        actual = gp._safe_str(node.get(field_name))
-        if actual != expected_value:
-            continue
-        product = node.get("product") or {}
-        result.append(
-            {
-                "variant_gid": gp._safe_str(node.get("id")),
-                "product_gid": gp._safe_str(product.get("id")),
-                "product_handle": gp._safe_str(
-                    product.get("handle")
-                ),
-                "product_title": gp._safe_str(
-                    product.get("title")
-                ),
-                field_name: actual,
-            }
-        )
-    return result
-
-
-def _preflight_shopify_conflicts(
+def _preflight_shopify_handle_conflicts(
     *,
     client: ShopifyClient,
     product_rows: Mapping[str, Sequence[Mapping[str, str]]],
-    barcode_conflict_mode: str,
     progress_every: int,
 ) -> Dict[str, Any]:
-    errors: List[Dict[str, Any]] = []
-    warnings: List[Dict[str, Any]] = []
+    """Block only when the target Product Handle already exists.
 
+    SKU and Barcode are intentionally excluded from duplicate checks.
+    """
+    errors: List[Dict[str, Any]] = []
     handles = sorted({
         gp._safe_str(rows[0].get("core.handle"))
         for rows in product_rows.values()
         if rows and gp._safe_str(rows[0].get("core.handle"))
     })
-    skus = sorted({
-        gp._safe_str(row.get("core.sku"))
-        for rows in product_rows.values()
-        for row in rows
-        if gp._safe_str(row.get("core.sku"))
-    })
-    barcodes = sorted({
-        gp._safe_str(row.get("core.barcode"))
-        for rows in product_rows.values()
-        for row in rows
-        if gp._safe_str(row.get("core.barcode"))
-    })
 
-    total_checks = len(handles) + len(skus) + len(barcodes)
-    completed = 0
-
-    for handle in handles:
+    total_checks = len(handles)
+    for completed, handle in enumerate(handles, start=1):
         data = client.gql(
             Q_PRODUCT_BY_HANDLE,
             {"identifier": {"handle": handle}},
@@ -1119,7 +1063,7 @@ def _preflight_shopify_conflicts(
                     "matches": [product],
                 }
             )
-        completed += 1
+
         if progress_every and (
             completed % progress_every == 0
             or completed == total_checks
@@ -1127,100 +1071,89 @@ def _preflight_shopify_conflicts(
             print(
                 "[Preflight] "
                 f"{completed}/{total_checks} | "
-                f"errors={len(errors)} | "
-                f"warnings={len(warnings)}"
-            )
-
-    for sku in skus:
-        data = client.gql(
-            Q_VARIANT_CONFLICT,
-            {"query": f'sku:"{sku}"'},
-            operation_name="preflight_sku",
-        )
-        nodes = (
-            data.get("productVariants", {}).get("nodes", [])
-        )
-        matches = _exact_variant_conflicts(
-            nodes,
-            field_name="sku",
-            expected_value=sku,
-        )
-        if matches:
-            errors.append(
-                {
-                    "code": "SKU_ALREADY_EXISTS",
-                    "value": sku,
-                    "matches": matches,
-                }
-            )
-        completed += 1
-        if progress_every and (
-            completed % progress_every == 0
-            or completed == total_checks
-        ):
-            print(
-                "[Preflight] "
-                f"{completed}/{total_checks} | "
-                f"errors={len(errors)} | "
-                f"warnings={len(warnings)}"
-            )
-
-    normalized_barcode_mode = (
-        gp._safe_str(barcode_conflict_mode).upper()
-        or "ERROR"
-    )
-    if normalized_barcode_mode not in {
-        "ERROR",
-        "WARNING",
-        "IGNORE",
-    }:
-        raise ValueError(
-            "barcode_conflict_mode must be "
-            "ERROR, WARNING, or IGNORE."
-        )
-
-    for barcode in barcodes:
-        data = client.gql(
-            Q_VARIANT_CONFLICT,
-            {"query": f'barcode:"{barcode}"'},
-            operation_name="preflight_barcode",
-        )
-        nodes = (
-            data.get("productVariants", {}).get("nodes", [])
-        )
-        matches = _exact_variant_conflicts(
-            nodes,
-            field_name="barcode",
-            expected_value=barcode,
-        )
-        if matches and normalized_barcode_mode != "IGNORE":
-            issue = {
-                "code": "BARCODE_ALREADY_EXISTS",
-                "value": barcode,
-                "matches": matches,
-            }
-            if normalized_barcode_mode == "ERROR":
-                errors.append(issue)
-            else:
-                warnings.append(issue)
-        completed += 1
-        if progress_every and (
-            completed % progress_every == 0
-            or completed == total_checks
-        ):
-            print(
-                "[Preflight] "
-                f"{completed}/{total_checks} | "
-                f"errors={len(errors)} | "
-                f"warnings={len(warnings)}"
+                f"handle_errors={len(errors)}"
             )
 
     return {
         "errors": errors,
-        "warnings": warnings,
+        "warnings": [],
         "checks": total_checks,
+        "identity_field": "core.handle",
+        "sku_checked": False,
+        "barcode_checked": False,
     }
 
+
+def _source_option_signature(
+    variant_input: Mapping[str, Any],
+) -> Tuple[Tuple[str, str], ...]:
+    return tuple(
+        (
+            gp._safe_str(item.get("optionName")),
+            gp._safe_str(item.get("name")),
+        )
+        for item in variant_input.get("optionValues", [])
+    )
+
+
+def _returned_option_signature(
+    variant: Mapping[str, Any],
+) -> Tuple[Tuple[str, str], ...]:
+    return tuple(
+        (
+            gp._safe_str(item.get("name")),
+            gp._safe_str(item.get("value")),
+        )
+        for item in variant.get("selectedOptions", [])
+    )
+
+
+def _match_returned_variants_by_options(
+    *,
+    source_rows: Sequence[Mapping[str, str]],
+    product_input: Mapping[str, Any],
+    returned_variants: Sequence[Mapping[str, Any]],
+) -> List[Mapping[str, Any]]:
+    """Match Shopify Variants by option values, never by SKU or Barcode."""
+    input_variants = list(product_input.get("variants", []))
+    if len(input_variants) != len(source_rows):
+        raise RuntimeError(
+            "Internal variant payload/source row count mismatch."
+        )
+
+    returned_by_signature: Dict[
+        Tuple[Tuple[str, str], ...],
+        List[Mapping[str, Any]],
+    ] = {}
+    for variant in returned_variants:
+        signature = _returned_option_signature(variant)
+        returned_by_signature.setdefault(signature, []).append(variant)
+
+    matched: List[Mapping[str, Any]] = []
+    used_ids = set()
+    for source, variant_input in zip(source_rows, input_variants):
+        signature = _source_option_signature(variant_input)
+        candidates = [
+            item
+            for item in returned_by_signature.get(signature, [])
+            if gp._safe_str(item.get("id")) not in used_ids
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError(
+                "Post-write Variant option verification failed. "
+                f"variant_key={source.get('sys.variant_key')!r}; "
+                f"signature={signature}; matches={len(candidates)}"
+            )
+        matched_variant = candidates[0]
+        used_ids.add(gp._safe_str(matched_variant.get("id")))
+        matched.append(matched_variant)
+
+    if len(matched) != len(returned_variants):
+        raise RuntimeError(
+            "Post-write returned Variant count does not match "
+            "the source plan."
+        )
+    return matched
 
 def _ensure_result_header(
     spreadsheet: gspread.Spreadsheet,
@@ -1366,11 +1299,15 @@ def _result_rows_for_product(
         if product_response
         else []
     )
-    returned_by_sku = {
-        gp._safe_str(variant.get("sku")): variant
-        for variant in returned_variants
-        if gp._safe_str(variant.get("sku"))
-    }
+    matched_returned_variants: List[Mapping[str, Any]] = []
+    if product_response:
+        matched_returned_variants = (
+            _match_returned_variants_by_options(
+                source_rows=source_rows,
+                product_input=product_input,
+                returned_variants=returned_variants,
+            )
+        )
 
     admin_url = ""
     storefront_url = ""
@@ -1396,7 +1333,11 @@ def _result_rows_for_product(
 
     for index, source in enumerate(source_rows):
         sku = gp._safe_str(source.get("core.sku"))
-        returned = returned_by_sku.get(sku, {})
+        returned = (
+            matched_returned_variants[index]
+            if matched_returned_variants
+            else {}
+        )
         inventory_item = returned.get("inventoryItem") or {}
         location_gid = gp._safe_str(
             source.get("sys.inventory_location_gid")
@@ -1501,7 +1442,6 @@ def run(
     dry_run: bool = True,
     confirmed: bool = False,
     allow_non_draft_status: bool = False,
-    barcode_conflict_mode: str = "ERROR",
     stop_on_first_error: bool = True,
     write_result: bool = True,
     preflight_progress_every: int = 10,
@@ -1778,12 +1718,11 @@ def run(
         progress(
             9,
             12,
-            "Real-time Shopify conflict preflight",
+            "Real-time Shopify Handle conflict preflight",
         )
-        conflict_result = _preflight_shopify_conflicts(
+        conflict_result = _preflight_shopify_handle_conflicts(
             client=client,
             product_rows=product_rows,
-            barcode_conflict_mode=barcode_conflict_mode,
             progress_every=preflight_progress_every,
         )
         if conflict_result["errors"]:
@@ -1878,20 +1817,11 @@ def run(
                             {},
                         ).get("nodes", [])
                     )
-                    returned_skus = {
-                        gp._safe_str(item.get("sku"))
-                        for item in returned_variants
-                    }
-                    expected_skus = {
-                        gp._safe_str(row.get("core.sku"))
-                        for row in rows
-                    }
-                    if returned_skus != expected_skus:
-                        raise RuntimeError(
-                            "Post-write SKU verification mismatch. "
-                            f"expected={sorted(expected_skus)}; "
-                            f"returned={sorted(returned_skus)}"
-                        )
+                    _match_returned_variants_by_options(
+                        source_rows=rows,
+                        product_input=product_input,
+                        returned_variants=returned_variants,
+                    )
 
                     status = "SUCCESS"
                     message = (

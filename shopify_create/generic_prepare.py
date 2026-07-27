@@ -17,6 +17,8 @@ Scope
   ``Cfg__Locations``.
 - Normalize, validate, group variants by ``sys.product_key`` and overwrite
   ``Preview`` with a machine-readable two-row-header plan.
+- ``core.handle`` is the Product duplicate identity. SKU and Barcode are
+  business values and are not treated as duplicate identities.
 - Write RunLog evidence.
 
 This module never creates or changes Shopify products. ``Result`` is untouched.
@@ -60,7 +62,7 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "1.2.0"
+MODULE_VERSION = "1.3.0"
 MODULE_PATH = "shopify_create.generic_prepare"
 DEFAULT_JOB_NAME = "generic_create_prepare"
 
@@ -2148,8 +2150,6 @@ def _build_prepare_plan(
     _apply_product_inheritance(active_rows, product_fields)
 
     variant_key_rows: Dict[str, List[Dict[str, Any]]] = {}
-    sku_rows: Dict[str, List[Dict[str, Any]]] = {}
-    barcode_rows: Dict[str, List[Dict[str, Any]]] = {}
 
     for row_state in active_rows:
         values = row_state["values"]
@@ -2230,12 +2230,6 @@ def _build_prepare_plan(
         variant_key = _safe_str(values.get("sys.variant_key"))
         if variant_key:
             variant_key_rows.setdefault(variant_key, []).append(row_state)
-        sku = _safe_str(values.get("core.sku"))
-        if sku:
-            sku_rows.setdefault(sku, []).append(row_state)
-        barcode = _safe_str(values.get("core.barcode"))
-        if barcode:
-            barcode_rows.setdefault(barcode, []).append(row_state)
 
     for value, rows in variant_key_rows.items():
         if len(rows) > 1:
@@ -2245,26 +2239,6 @@ def _build_prepare_plan(
                     "ERROR",
                     "DUPLICATE_VARIANT_KEY",
                     f"Duplicate sys.variant_key={value!r}.",
-                )
-
-    for value, rows in sku_rows.items():
-        if len(rows) > 1:
-            for row_state in rows:
-                _add_issue(
-                    row_state,
-                    "ERROR",
-                    "DUPLICATE_SKU",
-                    f"Duplicate core.sku={value!r} within Input.",
-                )
-
-    for value, rows in barcode_rows.items():
-        if len(rows) > 1:
-            for row_state in rows:
-                _add_issue(
-                    row_state,
-                    "WARNING",
-                    "DUPLICATE_BARCODE",
-                    f"Duplicate core.barcode={value!r} within Input.",
                 )
 
     handle_groups: Dict[str, List[str]] = {}
