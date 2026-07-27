@@ -49,7 +49,7 @@ from zoneinfo import ZoneInfo
 from shopify_create import generic_prepare as gp
 
 
-MODULE_VERSION = "1.1.0"
+MODULE_VERSION = "1.2.0"
 MODULE_PATH = "shopify_create.generic_apply"
 DEFAULT_JOB_NAME = "generic_create_apply"
 EXPECTED_PREPARE_MODULE_VERSION = "1.3.0"
@@ -1155,10 +1155,55 @@ def _match_returned_variants_by_options(
         )
     return matched
 
+def _matrix_has_nonempty_value(
+    values: Sequence[Sequence[Any]],
+) -> bool:
+    return any(
+        gp._safe_str(cell)
+        for row in values
+        for cell in row
+    )
+
+
+def _write_result_header(
+    worksheet: gspread.Worksheet,
+) -> None:
+    required_cols = len(RESULT_HEADERS)
+    if (
+        worksheet.row_count < 2
+        or worksheet.col_count < required_cols
+    ):
+        worksheet.resize(
+            rows=max(worksheet.row_count, 200),
+            cols=max(worksheet.col_count, required_cols),
+        )
+
+    worksheet.update(
+        range_name=(
+            f"A1:{gp._a1_col(required_cols)}1"
+        ),
+        values=[RESULT_HEADERS],
+        value_input_option="RAW",
+    )
+    try:
+        worksheet.freeze(rows=1)
+    except Exception:
+        pass
+
+
 def _ensure_result_header(
     spreadsheet: gspread.Spreadsheet,
     tab_name: str,
 ) -> gspread.Worksheet:
+    """Return a Result worksheet with the exact standard header.
+
+    Supported initialization states:
+    - Tab does not exist: create it and write the header.
+    - Tab exists and is completely blank: write the header.
+    - Tab contains only blank rows/cells: clear and write the header.
+    - Tab already has the exact header: reuse it.
+    - Tab contains any non-empty incompatible content: fail explicitly.
+    """
     try:
         worksheet = spreadsheet.worksheet(tab_name)
     except gspread.WorksheetNotFound:
@@ -1167,25 +1212,16 @@ def _ensure_result_header(
             rows=200,
             cols=len(RESULT_HEADERS),
         )
+        _write_result_header(worksheet)
+        return worksheet
 
     values = worksheet.get_all_values()
-    if not values:
-        if worksheet.col_count < len(RESULT_HEADERS):
-            worksheet.resize(
-                rows=max(worksheet.row_count, 200),
-                cols=len(RESULT_HEADERS),
-            )
-        worksheet.update(
-            range_name=(
-                f"A1:{gp._a1_col(len(RESULT_HEADERS))}1"
-            ),
-            values=[RESULT_HEADERS],
-            value_input_option="RAW",
-        )
-        try:
-            worksheet.freeze(rows=1)
-        except Exception:
-            pass
+
+    # gspread can return [], [[]], or multiple empty rows for a visually
+    # blank worksheet. All of these are valid initialization states.
+    if not values or not _matrix_has_nonempty_value(values):
+        worksheet.clear()
+        _write_result_header(worksheet)
         return worksheet
 
     current = [
@@ -1195,8 +1231,11 @@ def _ensure_result_header(
     if current != RESULT_HEADERS:
         raise ValueError(
             f"Result header mismatch in {tab_name}. "
-            f"Expected={RESULT_HEADERS}; actual={current}"
+            f"Expected={RESULT_HEADERS}; actual={current}. "
+            "The Result tab contains non-empty incompatible content, "
+            "so it was not overwritten."
         )
+
     return worksheet
 
 
