@@ -1,1 +1,46 @@
 .DS_Store
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter transient state
+.ipynb_checkpoints/
+
+# Local runtime and tool caches
+.runtime/
+.cache/
+
+# Editor and OS transient files
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+
+# Local environment and credential material
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*.json
+*credential*.json
+*service-account*.json
+*service_account*.json
