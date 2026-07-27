@@ -63,7 +63,7 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "1.5.0"
+MODULE_VERSION = "1.6.0"
 MODULE_PATH = "shopify_create.generic_prepare"
 DEFAULT_JOB_NAME = "generic_create_prepare"
 
@@ -235,6 +235,16 @@ SYSTEM_FIELD_DEFINITIONS: Dict[str, Dict[str, str]] = {
         "scope": "VARIANT",
         "data_type": "string",
     },
+    "core.inventory_tracker": {
+        "display_name": "Inventory Tracker",
+        "scope": "VARIANT",
+        "data_type": "string",
+    },
+    "core.fulfillment_service": {
+        "display_name": "Fulfillment Service",
+        "scope": "VARIANT",
+        "data_type": "string",
+    },
     "core.requires_shipping": {
         "display_name": "Requires Shipping",
         "scope": "VARIANT",
@@ -313,6 +323,11 @@ SYSTEM_DISPLAY_ALIASES: Dict[str, str] = {
     "Variant Weight Unit": "core.weight_unit",
     "Inventory Policy": "core.inventory_policy",
     "Variant Inventory Policy": "core.inventory_policy",
+    "Inventory Tracker": "core.inventory_tracker",
+    "Inventory Tracking": "core.inventory_tracker",
+    "Variant Inventory Tracker": "core.inventory_tracker",
+    "Fulfillment Service": "core.fulfillment_service",
+    "Variant Fulfillment Service": "core.fulfillment_service",
     "Requires Shipping": "core.requires_shipping",
     "Variant Requires Shipping": "core.requires_shipping",
     "Taxable": "core.taxable",
@@ -359,6 +374,8 @@ REQUIRED_DEFAULT_FIELDS = {
     "inventory.quantity",
     "core.weight_unit",
     "core.inventory_policy",
+    "core.inventory_tracker",
+    "core.fulfillment_service",
     "core.requires_shipping",
     "core.taxable",
     "core.status",
@@ -1881,6 +1898,31 @@ def _normalize_typed_value(
         if normalized not in {"deny", "continue"}:
             raise ValueError(
                 "Inventory Policy must be deny or continue."
+            )
+        return normalized
+
+    if field_key == "core.inventory_tracker":
+        normalized = text.lower()
+        aliases = {
+            "shopify": "shopify",
+            "tracked": "shopify",
+            "true": "shopify",
+            "yes": "shopify",
+            "1": "shopify",
+        }
+        if normalized not in aliases:
+            raise ValueError(
+                "Inventory Tracker currently supports only shopify."
+            )
+        return aliases[normalized]
+
+    if field_key == "core.fulfillment_service":
+        normalized = text.lower()
+        if normalized != "manual":
+            raise ValueError(
+                "Fulfillment Service currently supports only manual. "
+                "Shopify derives fulfillment ownership from the "
+                "selected inventory Location."
             )
         return normalized
 

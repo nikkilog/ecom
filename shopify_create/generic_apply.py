@@ -51,10 +51,10 @@ from zoneinfo import ZoneInfo
 from shopify_create import generic_prepare as gp
 
 
-MODULE_VERSION = "1.4.0"
+MODULE_VERSION = "1.5.0"
 MODULE_PATH = "shopify_create.generic_apply"
 DEFAULT_JOB_NAME = "generic_create_apply"
-EXPECTED_PREPARE_MODULE_VERSION = "1.5.0"
+EXPECTED_PREPARE_MODULE_VERSION = "1.6.0"
 
 LEGACY_RESULT_HEADERS = [
     "run_id",
@@ -178,9 +178,12 @@ mutation GenericCreateProduct(
             name
             value
           }
+          taxable
           inventoryItem {
             id
             sku
+            tracked
+            requiresShipping
             unitCost {
               amount
               currencyCode
@@ -196,6 +199,10 @@ mutation GenericCreateProduct(
                 location {
                   id
                   name
+                  isFulfillmentService
+                  fulfillmentService {
+                    handle
+                  }
                 }
                 quantities(names: ["available"]) {
                   name
@@ -1002,6 +1009,31 @@ def _build_product_set_input(
         if compare_at:
             variant["compareAtPrice"] = compare_at
 
+        inventory_tracker = (
+            gp._safe_str(
+                row.get("core.inventory_tracker")
+            ).lower()
+            or "shopify"
+        )
+        if inventory_tracker != "shopify":
+            raise ValueError(
+                "core.inventory_tracker currently supports only "
+                "shopify."
+            )
+
+        fulfillment_service = (
+            gp._safe_str(
+                row.get("core.fulfillment_service")
+            ).lower()
+            or "manual"
+        )
+        if fulfillment_service != "manual":
+            raise ValueError(
+                "core.fulfillment_service currently supports only "
+                "manual. Shopify derives fulfillment ownership from "
+                "the selected inventory Location."
+            )
+
         inventory_item: Dict[str, Any] = {
             "requiresShipping": bool(
                 gp._normalize_bool(
@@ -1482,6 +1514,114 @@ def _inventory_quantity_from_variant(
             if gp._safe_str(quantity.get("name")) == "available":
                 return gp._safe_str(quantity.get("quantity"))
     return ""
+
+
+def _verify_inventory_delivery_fields(
+    *,
+    source_rows: Sequence[Mapping[str, str]],
+    product_input: Mapping[str, Any],
+    returned_variants: Sequence[Mapping[str, Any]],
+) -> None:
+    """Verify Shopify readback for inventory and delivery fields.
+
+    ``core.fulfillment_service=manual`` is represented by stocking the
+    InventoryItem at the configured ordinary Shopify Location. Shopify's
+    current ProductVariantSetInput has no direct fulfillment-service field.
+    """
+    matched = _match_returned_variants_by_options(
+        source_rows=source_rows,
+        product_input=product_input,
+        returned_variants=returned_variants,
+    )
+
+    mismatches: List[str] = []
+    for index, source in enumerate(source_rows):
+        returned = matched[index]
+        inventory_item = returned.get("inventoryItem") or {}
+        expected_taxable = bool(
+            gp._normalize_bool(source.get("core.taxable"))
+        )
+        expected_requires_shipping = bool(
+            gp._normalize_bool(
+                source.get("core.requires_shipping")
+            )
+        )
+        expected_tracked = (
+            gp._safe_str(
+                source.get("core.inventory_tracker")
+            ).lower()
+            or "shopify"
+        ) == "shopify"
+
+        actual_taxable = bool(returned.get("taxable"))
+        actual_requires_shipping = bool(
+            inventory_item.get("requiresShipping")
+        )
+        actual_tracked = bool(inventory_item.get("tracked"))
+
+        sku = gp._safe_str(source.get("core.sku"))
+        if actual_taxable != expected_taxable:
+            mismatches.append(
+                f"SKU={sku} taxable expected={expected_taxable} "
+                f"actual={actual_taxable}"
+            )
+        if actual_requires_shipping != expected_requires_shipping:
+            mismatches.append(
+                f"SKU={sku} requiresShipping "
+                f"expected={expected_requires_shipping} "
+                f"actual={actual_requires_shipping}"
+            )
+        if actual_tracked != expected_tracked:
+            mismatches.append(
+                f"SKU={sku} tracked expected={expected_tracked} "
+                f"actual={actual_tracked}"
+            )
+
+        fulfillment_service = (
+            gp._safe_str(
+                source.get("core.fulfillment_service")
+            ).lower()
+            or "manual"
+        )
+        if fulfillment_service == "manual":
+            location_gid = gp._safe_str(
+                source.get("sys.inventory_location_gid")
+            )
+            levels = (
+                inventory_item.get("inventoryLevels", {})
+                .get("nodes", [])
+            )
+            matching_levels = [
+                level
+                for level in levels
+                if gp._safe_str(
+                    (level.get("location") or {}).get("id")
+                ) == location_gid
+            ]
+            if not matching_levels:
+                mismatches.append(
+                    f"SKU={sku} manual fulfillment location "
+                    f"was not returned for {location_gid}"
+                )
+            else:
+                location = matching_levels[0].get("location") or {}
+                if bool(location.get("isFulfillmentService")):
+                    handle = gp._safe_str(
+                        (location.get("fulfillmentService") or {}).get(
+                            "handle"
+                        )
+                    )
+                    mismatches.append(
+                        f"SKU={sku} expected ordinary manual Location; "
+                        f"returned fulfillment-service Location "
+                        f"handle={handle or '(unknown)'}"
+                    )
+
+    if mismatches:
+        raise RuntimeError(
+            "Shopify readback mismatch for inventory/delivery fields: "
+            + " | ".join(mismatches[:20])
+        )
 
 
 def _result_rows_for_product(
@@ -2112,7 +2252,7 @@ def run(
                             {},
                         ).get("nodes", [])
                     )
-                    _match_returned_variants_by_options(
+                    _verify_inventory_delivery_fields(
                         source_rows=rows,
                         product_input=product_input,
                         returned_variants=returned_variants,
