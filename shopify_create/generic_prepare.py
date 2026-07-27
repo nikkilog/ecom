@@ -60,7 +60,7 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "1.1.0"
+MODULE_VERSION = "1.2.0"
 MODULE_PATH = "shopify_create.generic_prepare"
 DEFAULT_JOB_NAME = "generic_create_prepare"
 
@@ -1027,30 +1027,96 @@ def _build_system_display_map() -> Dict[str, str]:
     return mapping
 
 
+def _cfg_records(
+    cfg_fields: Mapping[str, Any],
+) -> List[Dict[str, str]]:
+    records = cfg_fields.get("records", [])
+    if not isinstance(records, list):
+        raise TypeError("Cfg__Fields registry records must be a list.")
+    return [
+        {
+            str(key): _safe_str(value)
+            for key, value in record.items()
+        }
+        for record in records
+    ]
+
+
+def _cfg_get_exact(
+    cfg_fields: Mapping[str, Any],
+    *,
+    entity_type: str,
+    field_key: str,
+) -> Optional[Dict[str, str]]:
+    owner = _normalize_owner_entity(entity_type, field_key)
+    canonical_field_id = f"{owner}|{_safe_str(field_key)}"
+    record = cfg_fields.get("by_field_id", {}).get(
+        canonical_field_id
+    )
+    if record is None:
+        return None
+    return {
+        str(key): _safe_str(value)
+        for key, value in record.items()
+    }
+
+
+def _cfg_records_for_field_key(
+    cfg_fields: Mapping[str, Any],
+    field_key: str,
+) -> List[Dict[str, str]]:
+    records = cfg_fields.get("by_field_key", {}).get(
+        _safe_str(field_key),
+        [],
+    )
+    return [
+        {
+            str(key): _safe_str(value)
+            for key, value in record.items()
+        }
+        for record in records
+    ]
+
+
 def _build_cfg_display_index(
-    cfg_fields: Mapping[str, Mapping[str, str]],
+    cfg_fields: Mapping[str, Any],
 ) -> Dict[str, Dict[str, List[Dict[str, str]]]]:
-    """Index writable metafields by owner and normalized display_name."""
+    """Index writable metafields by owner and normalized display_name.
+
+    Cfg__Fields identity is ``field_id = entity_type|field_key``.
+    ``field_key`` may repeat across different entities.
+    """
     index: Dict[str, Dict[str, List[Dict[str, str]]]] = {
         "PRODUCT": {},
         "VARIANT": {},
     }
-    for field_key, raw in cfg_fields.items():
-        # Generic Create V1 accepts Config-driven metafields only. Core,
-        # derived, and raw fields must be part of SYSTEM_FIELD_DEFINITIONS.
+
+    for raw in _cfg_records(cfg_fields):
+        field_key = _safe_str(raw.get("field_key"))
         if not field_key.startswith(("mf.", "v_mf.")):
             continue
+
         display_name = _safe_str(raw.get("display_name"))
         if not display_name:
             continue
+
         owner = _normalize_owner_entity(
             raw.get("entity_type"),
             field_key,
         )
         if owner not in index:
             continue
+
+        # Prefix and owner must agree. This prevents a PRODUCT mf.* field
+        # from being confused with a VARIANT v_mf.* field.
+        if field_key.startswith("mf.") and owner != "PRODUCT":
+            continue
+        if field_key.startswith("v_mf.") and owner != "VARIANT":
+            continue
+
         display_key = _normalize_display_lookup(display_name)
         record = {
+            "field_id": _safe_str(raw.get("field_id")),
             "display_name": display_name,
             "field_key": field_key,
             "entity_type": owner,
@@ -1064,15 +1130,15 @@ def _build_cfg_display_index(
         for display_key, records in by_display.items():
             deduped: Dict[str, Dict[str, str]] = {}
             for record in records:
-                deduped[record["field_key"]] = record
+                deduped[record["field_id"]] = record
             by_display[display_key] = list(deduped.values())
-    return index
 
+    return index
 
 def _resolve_input_field_keys(
     display_headers: Sequence[str],
     provided_field_keys: Sequence[str],
-    cfg_fields: Mapping[str, Mapping[str, str]],
+    cfg_fields: Mapping[str, Any],
     *,
     entity_priority: Sequence[str] = AUTO_RESOLVE_ENTITY_PRIORITY,
 ) -> Dict[str, Any]:
@@ -1107,6 +1173,11 @@ def _resolve_input_field_keys(
                             "scope"
                         )
                     ),
+                    "field_id": _safe_str(
+                        (_field_definition(provided_key, cfg_fields) or {}).get(
+                            "field_id"
+                        )
+                    ),
                 }
             )
             continue
@@ -1132,6 +1203,10 @@ def _resolve_input_field_keys(
                     "entity_type": _safe_str(
                         SYSTEM_FIELD_DEFINITIONS[system_key].get("scope")
                     ),
+                    "field_id": (
+                        f"{_safe_str(SYSTEM_FIELD_DEFINITIONS[system_key].get('scope'))}"
+                        f"|{system_key}"
+                    ),
                 }
             )
             continue
@@ -1153,6 +1228,7 @@ def _resolve_input_field_keys(
                         "field_key": field_key,
                         "mapping_source": f"CFG_FIELDS_{owner}",
                         "entity_type": owner,
+                        "field_id": candidate["field_id"],
                     }
                 )
                 matched = True
@@ -1160,6 +1236,7 @@ def _resolve_input_field_keys(
 
             candidate_text = [
                 {
+                    "field_id": candidate["field_id"],
                     "field_key": candidate["field_key"],
                     "display_name": candidate["display_name"],
                     "entity_type": candidate["entity_type"],
@@ -1225,7 +1302,7 @@ def _resolve_input_field_keys(
 
 def _read_input_matrix(
     values: Sequence[Sequence[Any]],
-    cfg_fields: Mapping[str, Mapping[str, str]],
+    cfg_fields: Mapping[str, Any],
     *,
     entity_priority: Sequence[str] = AUTO_RESOLVE_ENTITY_PRIORITY,
 ) -> Dict[str, Any]:
@@ -1484,17 +1561,28 @@ def _read_defaults_matrix(
 
 def _read_cfg_fields(
     values: Sequence[Sequence[Any]],
-) -> Dict[str, Dict[str, str]]:
+) -> Dict[str, Any]:
+    """Read Cfg__Fields using field_id as the primary identity.
+
+    Formal identity:
+        field_id = entity_type + "|" + field_key
+
+    ``field_key`` is intentionally allowed to repeat across entities.
+    """
     if not values:
         raise ValueError("Cfg__Fields is empty.")
+
     headers = [_safe_str(value) for value in values[0]]
     header_map = {
-        header: index for index, header in enumerate(headers) if header
+        header: index
+        for index, header in enumerate(headers)
+        if header
     }
     required = {
+        "field_id",
         "display_name",
-        "field_key",
         "entity_type",
+        "field_key",
         "data_type",
     }
     missing = sorted(required - set(header_map))
@@ -1503,29 +1591,114 @@ def _read_cfg_fields(
             f"Cfg__Fields missing required columns: {missing}"
         )
 
-    result: Dict[str, Dict[str, str]] = {}
+    records: List[Dict[str, str]] = []
+    by_field_id: Dict[str, Dict[str, str]] = {}
+    by_field_key: Dict[str, List[Dict[str, str]]] = {}
+    by_entity_field_key: Dict[
+        Tuple[str, str],
+        Dict[str, str],
+    ] = {}
+
     for source_row, row in enumerate(values[1:], start=2):
-        padded = list(row) + [""] * max(0, len(headers) - len(row))
-        field_key = _safe_str(padded[header_map["field_key"]])
-        if not field_key:
-            continue
-        if field_key in result:
-            raise ValueError(
-                f"Cfg__Fields duplicate field_key {field_key!r} "
-                f"at rows {result[field_key]['source_row']} and {source_row}."
-            )
+        padded = list(row) + [""] * max(
+            0,
+            len(headers) - len(row),
+        )
         record = {
             header: _safe_str(padded[index])
             for header, index in header_map.items()
         }
-        record["entity_type"] = _normalize_owner_entity(
-            record.get("entity_type"),
+
+        raw_field_id = _safe_str(record.get("field_id"))
+        field_key = _safe_str(record.get("field_key"))
+        raw_entity = _safe_str(record.get("entity_type"))
+
+        if not raw_field_id and not field_key and not raw_entity:
+            continue
+        if not raw_field_id:
+            raise ValueError(
+                f"Cfg__Fields row {source_row} has no field_id."
+            )
+        if not field_key:
+            raise ValueError(
+                f"Cfg__Fields row {source_row} has no field_key."
+            )
+        if not raw_entity:
+            raise ValueError(
+                f"Cfg__Fields row {source_row} has no entity_type."
+            )
+
+        entity_type = _normalize_owner_entity(
+            raw_entity,
             field_key,
         )
-        record["source_row"] = str(source_row)
-        result[field_key] = record
-    return result
+        if not entity_type:
+            raise ValueError(
+                f"Cfg__Fields row {source_row} has an invalid "
+                f"entity_type={raw_entity!r}."
+            )
 
+        if "|" not in raw_field_id:
+            raise ValueError(
+                f"Cfg__Fields row {source_row} field_id must be "
+                f"entity_type|field_key; got={raw_field_id!r}."
+            )
+
+        field_id_entity, field_id_key = raw_field_id.split("|", 1)
+        normalized_field_id_entity = _normalize_owner_entity(
+            field_id_entity,
+            field_key,
+        )
+        if (
+            normalized_field_id_entity != entity_type
+            or _safe_str(field_id_key) != field_key
+        ):
+            raise ValueError(
+                f"Cfg__Fields row {source_row} field_id mismatch. "
+                f"field_id={raw_field_id!r}; "
+                f"entity_type={raw_entity!r}; "
+                f"field_key={field_key!r}."
+            )
+
+        canonical_field_id = f"{entity_type}|{field_key}"
+        if canonical_field_id in by_field_id:
+            previous = by_field_id[canonical_field_id]
+            raise ValueError(
+                "Cfg__Fields duplicate field_id "
+                f"{canonical_field_id!r} at rows "
+                f"{previous['source_row']} and {source_row}."
+            )
+
+        record["raw_field_id"] = raw_field_id
+        record["field_id"] = canonical_field_id
+        record["entity_type"] = entity_type
+        record["field_key"] = field_key
+        record["source_row"] = str(source_row)
+
+        records.append(record)
+        by_field_id[canonical_field_id] = record
+        by_field_key.setdefault(field_key, []).append(record)
+        by_entity_field_key[(entity_type, field_key)] = record
+
+    if not records:
+        raise ValueError("Cfg__Fields contains no usable rows.")
+
+    return {
+        "records": records,
+        "by_field_id": by_field_id,
+        "by_field_key": by_field_key,
+        "by_entity_field_key": by_entity_field_key,
+        "stats": {
+            "records": len(records),
+            "unique_field_ids": len(by_field_id),
+            "distinct_field_keys": len(by_field_key),
+            "repeated_field_keys": sum(
+                1
+                for matches in by_field_key.values()
+                if len(matches) > 1
+            ),
+        },
+    }
 
 def _read_locations(
     values: Sequence[Sequence[Any]],
@@ -1602,59 +1775,66 @@ def _read_locations(
 
 def _field_definition(
     field_key: str,
-    cfg_fields: Mapping[str, Mapping[str, str]],
+    cfg_fields: Mapping[str, Any],
 ) -> Optional[Dict[str, str]]:
+    field_key = _safe_str(field_key)
+
     if field_key in SYSTEM_FIELD_DEFINITIONS:
         definition = dict(SYSTEM_FIELD_DEFINITIONS[field_key])
-        if field_key in cfg_fields:
-            definition.update(
-                {
-                    key: _safe_str(value)
-                    for key, value in cfg_fields[field_key].items()
-                }
-            )
+        owner = _safe_str(definition.get("scope")).upper()
+        definition["field_id"] = f"{owner}|{field_key}"
+
+        exact = _cfg_get_exact(
+            cfg_fields,
+            entity_type=owner,
+            field_key=field_key,
+        )
+        if exact:
+            # Cfg__Fields can enrich the built-in writable contract with
+            # data_type/source metadata, but cannot change its owner.
+            definition.update(exact)
+            definition["scope"] = owner
+            definition["field_id"] = f"{owner}|{field_key}"
         return definition
 
-    cfg = cfg_fields.get(field_key)
+    if field_key.startswith("mf."):
+        owner = "PRODUCT"
+    elif field_key.startswith("v_mf."):
+        owner = "VARIANT"
+    else:
+        # Generic Create accepts only the explicit system contract plus
+        # Config-driven Product/Variant metafields.
+        return None
+
+    cfg = _cfg_get_exact(
+        cfg_fields,
+        entity_type=owner,
+        field_key=field_key,
+    )
     if not cfg:
         return None
-    if not field_key.startswith(("mf.", "v_mf.")):
-        # Generic Create accepts only the explicit system contract plus
-        # Config-driven metafields. Read-only core/raw/derived registry fields
-        # are not writable create inputs.
-        return None
+
     definition = {
         key: _safe_str(value)
         for key, value in cfg.items()
     }
-    entity = _safe_str(definition.get("entity_type")).upper()
-    if field_key.startswith("mf."):
-        definition["scope"] = "PRODUCT"
-        if entity not in {"", "PRODUCT"}:
-            definition["scope_error"] = (
-                f"{field_key} is mf.* but Cfg__Fields entity_type={entity}."
-            )
-    elif field_key.startswith("v_mf."):
-        definition["scope"] = "VARIANT"
-        if entity not in {"", "VARIANT", "PRODUCTVARIANT"}:
-            definition["scope_error"] = (
-                f"{field_key} is v_mf.* but "
-                f"Cfg__Fields entity_type={entity}."
-            )
-    elif field_key.startswith("core."):
-        definition["scope"] = (
-            "VARIANT"
-            if entity in {"VARIANT", "PRODUCTVARIANT"}
-            else "PRODUCT"
-        )
-    else:
-        definition["scope"] = "CONFIG"
-    return definition
+    definition["scope"] = owner
+    definition["field_id"] = f"{owner}|{field_key}"
 
+    actual_entity = _normalize_owner_entity(
+        definition.get("entity_type"),
+        field_key,
+    )
+    if actual_entity != owner:
+        definition["scope_error"] = (
+            f"{definition['field_id']} owner mismatch: "
+            f"expected={owner}; actual={actual_entity}."
+        )
+    return definition
 
 def _validate_known_fields(
     field_keys: Iterable[str],
-    cfg_fields: Mapping[str, Mapping[str, str]],
+    cfg_fields: Mapping[str, Any],
 ) -> None:
     unknown: List[str] = []
     scope_errors: List[str] = []
@@ -1691,7 +1871,7 @@ def _evaluate_default(
 
 def _field_scope(
     field_key: str,
-    cfg_fields: Mapping[str, Mapping[str, str]],
+    cfg_fields: Mapping[str, Any],
 ) -> str:
     definition = _field_definition(field_key, cfg_fields)
     return _safe_str((definition or {}).get("scope")).upper()
@@ -1700,7 +1880,7 @@ def _field_scope(
 def _normalize_typed_value(
     field_key: str,
     value: str,
-    cfg_fields: Mapping[str, Mapping[str, str]],
+    cfg_fields: Mapping[str, Any],
 ) -> str:
     text = _safe_str(value)
     if not text:
@@ -1799,7 +1979,7 @@ def _add_issue(
 
 def _product_level_fields(
     all_field_keys: Iterable[str],
-    cfg_fields: Mapping[str, Mapping[str, str]],
+    cfg_fields: Mapping[str, Any],
 ) -> List[str]:
     result = []
     for field_key in all_field_keys:
@@ -1859,7 +2039,7 @@ def _build_prepare_plan(
     *,
     input_contract: Mapping[str, Any],
     defaults: Mapping[str, DefaultSpec],
-    cfg_fields: Mapping[str, Mapping[str, str]],
+    cfg_fields: Mapping[str, Any],
     locations: Mapping[str, Any],
 ) -> Dict[str, Any]:
     input_field_keys = list(input_contract["field_keys"])
@@ -2200,11 +2380,13 @@ def _build_prepare_plan(
             ),
         )
     for field_key in all_field_keys:
+        definition = _field_definition(
+            field_key,
+            cfg_fields,
+        ) or {}
         display_by_key.setdefault(
             field_key,
-            _safe_str(
-                cfg_fields.get(field_key, {}).get("display_name")
-            )
+            _safe_str(definition.get("display_name"))
             or SYSTEM_FIELD_DEFINITIONS.get(field_key, {}).get(
                 "display_name",
                 field_key,
@@ -2684,6 +2866,16 @@ def run(
                 config_book,
                 tab_cfg_fields,
             ).get_all_values()
+        )
+        print(
+            "[Cfg__Fields] "
+            f"records={cfg_fields['stats']['records']} | "
+            f"unique_field_ids="
+            f"{cfg_fields['stats']['unique_field_ids']} | "
+            f"distinct_field_keys="
+            f"{cfg_fields['stats']['distinct_field_keys']} | "
+            f"repeated_field_keys="
+            f"{cfg_fields['stats']['repeated_field_keys']}"
         )
 
         progress(
