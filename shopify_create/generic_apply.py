@@ -21,8 +21,10 @@ Safety model
 9. Result and RunLog retain execution evidence.
 10. Images/media are intentionally out of scope.
 
-SKU and Barcode are not duplicate identities and do not participate in
-conflict blocking. The module uses Shopify Admin GraphQL ``productSet``
+``core.handle`` is the Product identity. ``sys.product_key``,
+``sys.variant_key``, SKU, and Barcode are trace/business values and do not
+participate in duplicate blocking. The module uses Shopify Admin GraphQL
+``productSet``
 synchronously to create
 a Product with its options, variants, product/variant metafields, inventory
 item attributes, and initial inventory quantities in one product operation.
@@ -51,10 +53,10 @@ from zoneinfo import ZoneInfo
 from shopify_create import generic_prepare as gp
 
 
-MODULE_VERSION = "1.5.2"
+MODULE_VERSION = "1.5.3"
 MODULE_PATH = "shopify_create.generic_apply"
 DEFAULT_JOB_NAME = "generic_create_apply"
-EXPECTED_PREPARE_MODULE_VERSION = "1.6.3"
+EXPECTED_PREPARE_MODULE_VERSION = "1.6.4"
 
 LEGACY_RESULT_HEADERS = [
     "run_id",
@@ -578,36 +580,44 @@ def _verify_preview_snapshot(
     prepare_plan: Mapping[str, Any],
     preview_contract: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    current_by_variant: Dict[str, Dict[str, str]] = {}
+    """Verify the Preview by physical source row.
+
+    sys.variant_key is a trace value and may repeat across different Products.
+    """
+    current_by_source_row: Dict[str, Dict[str, str]] = {}
     for record in prepare_plan["preview_records"]:
-        variant_key = gp._safe_str(
-            record.get("sys.variant_key")
+        source_row = gp._safe_str(
+            record.get("sys.source_row")
         )
-        if not variant_key:
+        if not source_row:
             continue
-        current_by_variant[variant_key] = {
+        if source_row in current_by_source_row:
+            raise ValueError(
+                f"Current plan duplicate sys.source_row={source_row!r}."
+            )
+        current_by_source_row[source_row] = {
             str(key): gp._safe_str(value)
             for key, value in record.items()
         }
 
-    preview_by_variant: Dict[str, Dict[str, str]] = {}
+    preview_by_source_row: Dict[str, Dict[str, str]] = {}
     for record in preview_contract["records"]:
-        variant_key = gp._safe_str(
-            record.get("sys.variant_key")
+        source_row = gp._safe_str(
+            record.get("sys.source_row")
         )
-        if not variant_key:
+        if not source_row:
             continue
-        if variant_key in preview_by_variant:
+        if source_row in preview_by_source_row:
             raise ValueError(
-                f"Preview duplicate sys.variant_key={variant_key!r}."
+                f"Preview duplicate sys.source_row={source_row!r}."
             )
-        preview_by_variant[variant_key] = record
+        preview_by_source_row[source_row] = record
 
-    current_keys = set(current_by_variant)
-    preview_keys = set(preview_by_variant)
+    current_keys = set(current_by_source_row)
+    preview_keys = set(preview_by_source_row)
     if current_keys != preview_keys:
         raise ValueError(
-            "Preview no longer matches Input. Variant-key sets differ. "
+            "Preview no longer matches Input. Source-row sets differ. "
             f"current_only={sorted(current_keys - preview_keys)}; "
             f"preview_only={sorted(preview_keys - current_keys)}. "
             "Rerun Prepare."
@@ -623,9 +633,9 @@ def _verify_preview_snapshot(
     )
 
     mismatches: List[str] = []
-    for variant_key in sorted(current_keys):
-        current = current_by_variant[variant_key]
-        preview = preview_by_variant[variant_key]
+    for source_row in sorted(current_keys, key=lambda value: int(value)):
+        current = current_by_source_row[source_row]
+        preview = preview_by_source_row[source_row]
         for field_key in compare_fields:
             current_value = gp._safe_str(
                 current.get(field_key)
@@ -635,7 +645,7 @@ def _verify_preview_snapshot(
             )
             if current_value != preview_value:
                 mismatches.append(
-                    f"{variant_key}:{field_key}:"
+                    f"source_row={source_row}:{field_key}:"
                     f"Preview={preview_value!r}:"
                     f"Current={current_value!r}"
                 )
@@ -652,7 +662,7 @@ def _verify_preview_snapshot(
 
     invalid_statuses = {
         gp._safe_str(record.get("sys.plan_status"))
-        for record in preview_by_variant.values()
+        for record in preview_by_source_row.values()
         if gp._safe_str(record.get("sys.plan_status"))
         not in {"READY", "READY_WITH_WARNINGS", "SKIPPED"}
     }
@@ -664,9 +674,10 @@ def _verify_preview_snapshot(
 
     return {
         "variant_count": len(current_keys),
+        "row_count": len(current_keys),
+        "row_identity": "sys.source_row",
         "verified_fields": len(compare_fields),
     }
-
 
 def _select_product_keys(
     *,
@@ -676,48 +687,90 @@ def _select_product_keys(
     max_products: int,
     live_mode: bool,
 ) -> List[str]:
-    ready_keys = sorted({
-        gp._safe_str(record.get("sys.product_key"))
+    """Return selected Product Handles.
+
+    For backward compatibility, ONLY_PRODUCT_KEYS accepts either a Handle or a
+    sys.product_key. A repeated product_key expands to every ready Handle that
+    carries that business key.
+    """
+    ready_records = [
+        record
         for record in prepare_plan["preview_records"]
         if gp._safe_str(record.get("sys.plan_status"))
         in {"READY", "READY_WITH_WARNINGS"}
-        and gp._safe_str(record.get("sys.product_key"))
+        and gp._safe_str(record.get("core.handle"))
+    ]
+    ready_handles = sorted({
+        gp._safe_str(record.get("core.handle"))
+        for record in ready_records
     })
+
+    handles_by_product_key: Dict[str, List[str]] = {}
+    for record in ready_records:
+        product_key = gp._safe_str(
+            record.get("sys.product_key")
+        )
+        handle = gp._safe_str(record.get("core.handle"))
+        if not product_key or not handle:
+            continue
+        bucket = handles_by_product_key.setdefault(product_key, [])
+        if handle not in bucket:
+            bucket.append(handle)
 
     requested = _safe_list(only_product_keys)
     if requested:
-        unknown = sorted(set(requested) - set(ready_keys))
+        selected: List[str] = []
+        unknown: List[str] = []
+        ready_handle_set = set(ready_handles)
+        for value in requested:
+            matches: List[str] = []
+            if value in ready_handle_set:
+                matches = [value]
+            elif value in handles_by_product_key:
+                matches = handles_by_product_key[value]
+            else:
+                unknown.append(value)
+                continue
+            for handle in matches:
+                if handle not in selected:
+                    selected.append(handle)
+
         if unknown:
             raise ValueError(
-                "ONLY_PRODUCT_KEYS contains keys that are not READY: "
-                f"{unknown}"
+                "ONLY_PRODUCT_KEYS contains values that are neither READY "
+                "Handles nor READY sys.product_key values: "
+                f"{sorted(unknown)}"
             )
-        selected = requested
     else:
         if live_mode and not apply_all_ready_products:
             raise ValueError(
-                "Live Apply requires explicit ONLY_PRODUCT_KEYS, or set "
+                "Live Apply requires explicit ONLY_PRODUCT_KEYS "
+                "(Handle or sys.product_key), or set "
                 "APPLY_ALL_READY_PRODUCTS=True."
             )
-        selected = ready_keys
+        selected = ready_handles
 
     if not selected:
-        raise ValueError("No READY Product groups selected.")
+        raise ValueError("No READY Product Handles selected.")
 
     if len(selected) > int(max_products):
         raise ValueError(
-            f"Selected Product groups={len(selected)} exceeds "
+            f"Selected Product Handles={len(selected)} exceeds "
             f"MAX_PRODUCTS_PER_RUN={max_products}."
         )
     return selected
-
 
 def _product_rows(
     *,
     prepare_plan: Mapping[str, Any],
     selected_product_keys: Sequence[str],
 ) -> Dict[str, List[Dict[str, str]]]:
-    selected = set(selected_product_keys)
+    """Group ready rows by core.handle.
+
+    selected_product_keys is retained as the parameter name for Notebook/API
+    compatibility, but its values are resolved Product Handles.
+    """
+    selected_handles = set(selected_product_keys)
     result: Dict[str, List[Dict[str, str]]] = {}
     for record in prepare_plan["preview_records"]:
         if gp._safe_str(record.get("sys.plan_status")) not in {
@@ -725,27 +778,23 @@ def _product_rows(
             "READY_WITH_WARNINGS",
         }:
             continue
-        product_key = gp._safe_str(
-            record.get("sys.product_key")
-        )
-        if product_key not in selected:
+        handle = gp._safe_str(record.get("core.handle"))
+        if handle not in selected_handles:
             continue
-        result.setdefault(product_key, []).append(
+        result.setdefault(handle, []).append(
             {
                 str(key): gp._safe_str(value)
                 for key, value in record.items()
             }
         )
 
-    missing = sorted(
-        set(selected_product_keys) - set(result)
-    )
+    missing = sorted(selected_handles - set(result))
     if missing:
         raise ValueError(
-            f"Selected Product groups have no ready rows: {missing}"
+            f"Selected Product Handles have no ready rows: {missing}"
         )
 
-    for product_key, rows in result.items():
+    for handle, rows in result.items():
         rows.sort(
             key=lambda record: int(
                 gp._safe_str(
@@ -755,7 +804,6 @@ def _product_rows(
             )
         )
     return result
-
 
 def _build_options(
     rows: Sequence[Mapping[str, str]],
@@ -1799,7 +1847,9 @@ def _result_rows_for_product(
                 site_code,
                 runtime_mode,
                 "TRUE" if dry_run else "FALSE",
-                product_key,
+                gp._safe_str(
+                    source.get("sys.product_key")
+                ) or product_key,
                 gp._safe_str(
                     source.get("sys.variant_key")
                 ),
@@ -2077,7 +2127,7 @@ def run(
             "[Selection] "
             f"products={len(selected_product_keys)} | "
             f"variants={sum(len(rows) for rows in product_rows.values())} | "
-            f"keys={selected_product_keys}"
+            f"handles={selected_product_keys}"
         )
 
         progress(
@@ -2413,7 +2463,9 @@ def run(
             )
             product_results.append(
                 {
-                    "product_key": product_key,
+                    "product_key": gp._safe_str(
+                        rows[0].get("sys.product_key")
+                    ),
                     "status": status,
                     "message": message,
                     "product_gid": gp._safe_str(
@@ -2476,7 +2528,10 @@ def run(
                     else 0
                 ),
                 message=(
-                    f"product_key={product_key} | {message}"
+                    f"handle={product_key} | "
+                    f"source_product_key="
+                    f"{gp._safe_str(rows[0].get('sys.product_key'))} | "
+                    f"{message}"
                 ),
                 error_reason=error_reason,
             )
@@ -2597,7 +2652,13 @@ def run(
             "run_id": run_id,
             "dry_run": dry_run,
             "confirmed": confirmed,
-            "selected_product_keys": selected_product_keys,
+            "selected_product_keys": sorted({
+                gp._safe_str(row.get("sys.product_key"))
+                for rows in product_rows.values()
+                for row in rows
+                if gp._safe_str(row.get("sys.product_key"))
+            }),
+            "selected_product_handles": selected_product_keys,
             "summary": {
                 "rows_loaded": prepare_plan["stats"][
                     "rows_loaded"

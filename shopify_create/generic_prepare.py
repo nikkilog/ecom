@@ -15,10 +15,11 @@ Scope
 - Resolve ``Cfg__Fields`` from the routed ``config`` workbook.
 - Resolve the current site's default warehouse from Console Core /
   ``Cfg__Locations``.
-- Normalize, validate, group variants by ``sys.product_key`` and overwrite
+- Normalize, validate, group variants by ``core.handle`` and overwrite
   ``Preview`` with a machine-readable two-row-header plan.
-- ``core.handle`` is the Product duplicate identity. SKU and Barcode are
-  business values and are not treated as duplicate identities.
+- ``core.handle`` is the Product identity. ``sys.product_key``,
+  ``sys.variant_key``, SKU, and Barcode are trace/business values and do
+  not participate in duplicate blocking.
 - Product Category, default theme template, and all-channel publishing are
   driven by Defaults with Input nonblank values taking precedence.
 - Write RunLog evidence.
@@ -63,7 +64,7 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "1.6.3"
+MODULE_VERSION = "1.6.4"
 MODULE_PATH = "shopify_create.generic_prepare"
 DEFAULT_JOB_NAME = "generic_create_prepare"
 
@@ -2007,19 +2008,26 @@ def _product_level_fields(
     return result
 
 
+def _group_active_rows_by_handle(
+    active_rows: Sequence[Dict[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for row_state in active_rows:
+        handle = _safe_str(
+            row_state["values"].get("core.handle")
+        )
+        if handle:
+            groups.setdefault(handle, []).append(row_state)
+    return groups
+
+
 def _apply_product_inheritance(
     active_rows: Sequence[Dict[str, Any]],
     product_fields: Sequence[str],
 ) -> None:
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    for row_state in active_rows:
-        product_key = _safe_str(
-            row_state["values"].get("sys.product_key")
-        )
-        if product_key:
-            groups.setdefault(product_key, []).append(row_state)
+    groups = _group_active_rows_by_handle(active_rows)
 
-    for product_key, group in groups.items():
+    for handle, group in groups.items():
         for field_key in product_fields:
             nonblank = {
                 _safe_str(row["values"].get(field_key))
@@ -2029,7 +2037,7 @@ def _apply_product_inheritance(
             if len(nonblank) > 1:
                 message = (
                     f"Product field {field_key} has conflicting values "
-                    f"within product_key={product_key}: "
+                    f"within core.handle={handle!r}: "
                     f"{sorted(nonblank)}"
                 )
                 for row in group:
@@ -2098,49 +2106,27 @@ def _build_prepare_plan(
             )
         active_rows.append(row_state)
 
+    # Handle is the Product identity. Generate it independently per row
+    # before any Product grouping so repeated business keys cannot merge
+    # otherwise distinct Shopify Products.
+    for row_state in active_rows:
+        values = row_state["values"]
+        if not _safe_str(values.get("core.handle")):
+            generated = _slugify(values.get("core.title"))
+            if generated:
+                values["core.handle"] = generated
+                if "core.handle" not in row_state["defaulted_fields"]:
+                    row_state["defaulted_fields"].append("core.handle")
+                if "core.handle" not in all_field_keys:
+                    all_field_keys.append("core.handle")
+
     product_fields = _product_level_fields(
         all_field_keys,
         cfg_fields,
     )
     _apply_product_inheritance(active_rows, product_fields)
 
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    for row_state in active_rows:
-        product_key = _safe_str(
-            row_state["values"].get("sys.product_key")
-        )
-        if product_key:
-            groups.setdefault(product_key, []).append(row_state)
-
-    for product_key, group in groups.items():
-        handles = {
-            _safe_str(row["values"].get("core.handle"))
-            for row in group
-            if _safe_str(row["values"].get("core.handle"))
-        }
-        if not handles:
-            title = next(
-                (
-                    _safe_str(row["values"].get("core.title"))
-                    for row in group
-                    if _safe_str(row["values"].get("core.title"))
-                ),
-                "",
-            )
-            generated = _slugify(title)
-            if generated:
-                for row in group:
-                    row["values"]["core.handle"] = generated
-                    if "core.handle" not in row["defaulted_fields"]:
-                        row["defaulted_fields"].append("core.handle")
-                if "core.handle" not in all_field_keys:
-                    all_field_keys.append("core.handle")
-        elif len(handles) == 1:
-            handle = next(iter(handles))
-            for row in group:
-                if not _safe_str(row["values"].get("core.handle")):
-                    row["values"]["core.handle"] = handle
-                    row["inherited_fields"].append("core.handle")
+    groups = _group_active_rows_by_handle(active_rows)
 
     for row_state in active_rows:
         for field_key, spec in defaults.items():
@@ -2159,8 +2145,6 @@ def _build_prepare_plan(
         cfg_fields,
     )
     _apply_product_inheritance(active_rows, product_fields)
-
-    variant_key_rows: Dict[str, List[Dict[str, Any]]] = {}
 
     for row_state in active_rows:
         values = row_state["values"]
@@ -2268,48 +2252,12 @@ def _build_prepare_plan(
                     f"{value_key} has a value but {name_key} is empty.",
                 )
 
-        variant_key = _safe_str(values.get("sys.variant_key"))
-        if variant_key:
-            variant_key_rows.setdefault(variant_key, []).append(row_state)
-
-    for value, rows in variant_key_rows.items():
-        if len(rows) > 1:
-            for row_state in rows:
-                _add_issue(
-                    row_state,
-                    "ERROR",
-                    "DUPLICATE_VARIANT_KEY",
-                    f"Duplicate sys.variant_key={value!r}.",
-                )
-
-    handle_groups: Dict[str, List[str]] = {}
-    for product_key, group in groups.items():
-        handles = {
-            _safe_str(row["values"].get("core.handle"))
-            for row in group
-            if _safe_str(row["values"].get("core.handle"))
-        }
-        for handle in handles:
-            handle_groups.setdefault(handle, []).append(product_key)
-
-    for handle, product_keys in handle_groups.items():
-        unique_product_keys = sorted(set(product_keys))
-        if len(unique_product_keys) > 1:
-            message = (
-                f"Duplicate core.handle={handle!r} across "
-                f"product_key values={unique_product_keys}."
-            )
-            for product_key in unique_product_keys:
-                for row_state in groups[product_key]:
-                    _add_issue(
-                        row_state,
-                        "ERROR",
-                        "DUPLICATE_HANDLE",
-                        message,
-                    )
+    # sys.product_key, sys.variant_key, SKU, and Barcode are intentionally
+    # excluded from duplicate blocking. The only Product grouping identity is
+    # core.handle.
 
     # Check option names and option-value combinations within each Product.
-    for product_key, group in groups.items():
+    for handle, group in groups.items():
         for option_number in (1, 2, 3):
             name_key = f"core.option{option_number}_name"
             names = {
@@ -2320,7 +2268,7 @@ def _build_prepare_plan(
             if len(names) > 1:
                 message = (
                     f"{name_key} is inconsistent within "
-                    f"product_key={product_key}: {sorted(names)}"
+                    f"core.handle={handle!r}: {sorted(names)}"
                 )
                 for row_state in group:
                     _add_issue(
@@ -2350,14 +2298,14 @@ def _build_prepare_plan(
                         "ERROR",
                         "DUPLICATE_OPTION_COMBINATION",
                         "Duplicate option-value combination within "
-                        f"product_key={product_key}: {combination}",
+                        f"core.handle={handle!r}: {combination}",
                     )
 
-    for product_key, group in groups.items():
+    for handle, group in groups.items():
         if any(row_state["errors"] for row_state in group):
             message = (
                 "The Product group is blocked because at least one "
-                f"Variant row has an error: product_key={product_key}."
+                f"Variant row has an error: core.handle={handle!r}."
             )
             for row_state in group:
                 if not row_state["errors"]:
@@ -2369,8 +2317,8 @@ def _build_prepare_plan(
                     )
 
     product_variant_counts = {
-        product_key: len(group)
-        for product_key, group in groups.items()
+        handle: len(group)
+        for handle, group in groups.items()
     }
 
     for row_state in active_rows:
@@ -2423,8 +2371,8 @@ def _build_prepare_plan(
     preview_rows: List[List[str]] = []
     preview_records: List[Dict[str, str]] = []
     for row_state in row_states:
-        product_key = _safe_str(
-            row_state["values"].get("sys.product_key")
+        handle = _safe_str(
+            row_state["values"].get("core.handle")
         )
         messages = row_state["errors"] + row_state["warnings"]
         message_text = json.dumps(
@@ -2446,7 +2394,7 @@ def _build_prepare_plan(
             message_text,
             defaulted_text,
             inherited_text,
-            str(product_variant_counts.get(product_key, 0)),
+            str(product_variant_counts.get(handle, 0)),
         ]
         normalized_values = [
             _safe_str(row_state["values"].get(field_key))
@@ -2477,15 +2425,15 @@ def _build_prepare_plan(
         for row_state in active_rows
         if not row_state["errors"]
     ]
-    ready_product_keys = {
-        _safe_str(row_state["values"].get("sys.product_key"))
+    ready_product_handles = {
+        _safe_str(row_state["values"].get("core.handle"))
         for row_state in ready_rows
-        if _safe_str(row_state["values"].get("sys.product_key"))
+        if _safe_str(row_state["values"].get("core.handle"))
         and all(
             not member["errors"]
             for member in groups.get(
                 _safe_str(
-                    row_state["values"].get("sys.product_key")
+                    row_state["values"].get("core.handle")
                 ),
                 [],
             )
@@ -2531,7 +2479,7 @@ def _build_prepare_plan(
             "rows_planned": len(ready_rows),
             "rows_skipped": len(skipped_rows),
             "product_groups": len(groups),
-            "business_objects_planned": len(ready_product_keys),
+            "business_objects_planned": len(ready_product_handles),
             "variant_objects_planned": len(ready_rows),
             "warning_count": len(warnings),
             "error_count": len(errors),
