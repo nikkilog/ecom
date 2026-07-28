@@ -41,7 +41,7 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "2.2.0"
+MODULE_VERSION = "2.3.0"
 MODULE_PATH = "shopify_setup.sync_locations"
 DEFAULT_JOB_NAME = "config_locations"
 LOCATION_HEADERS = [
@@ -920,6 +920,224 @@ def _write_matrix(
 
 def _normalize_registry_header(value: Any) -> str:
     return re.sub(r"[\s_]+", " ", _safe_str(value).lower()).strip()
+
+
+def _extract_spreadsheet_id(value: Any) -> str:
+    """Accept a Google Sheets file ID or a normal spreadsheet URL."""
+    text = _safe_str(value)
+    if not text:
+        raise ValueError("Workspace Project Registry ID/URL is empty.")
+
+    match = re.search(
+        r"/spreadsheets/d/([A-Za-z0-9_-]+)",
+        text,
+    )
+    if match:
+        return match.group(1)
+
+    if re.fullmatch(r"[A-Za-z0-9_-]+", text):
+        return text
+
+    raise ValueError(
+        "Workspace Project Registry must be a Google Sheets ID or URL."
+    )
+
+
+def resolve_workspace_project(
+    *,
+    project_code: str,
+    workspace_registry_id: str,
+    workspace_gsheet_secret_name: str = "WORKSPACE_GSHEET",
+    workspace_registry_tab: str = "Cfg__Projects",
+    secret_home: Optional[str] = None,
+    explicit_workspace_sa_value: Optional[str] = None,
+    print_progress: bool = True,
+) -> Dict[str, str]:
+    """Resolve one active project route from the Workspace Project Registry.
+
+    Authentication is intentionally two-stage:
+
+    1. ``WORKSPACE_GSHEET`` reads only the Workspace Project Registry.
+    2. The selected row returns the project-specific Google Secret and
+       Console Core route used by the actual Location synchronization.
+    """
+    resolved_project_code = _normalize_site_code(project_code)
+    if not resolved_project_code:
+        raise ValueError("project_code is required.")
+
+    registry_tab = _safe_str(workspace_registry_tab)
+    if not registry_tab:
+        raise ValueError("workspace_registry_tab is required.")
+
+    if print_progress:
+        print(
+            "[Workspace Registry] resolve bootstrap Secret | "
+            f"project={resolved_project_code} | "
+            f"secret={workspace_gsheet_secret_name}"
+        )
+
+    workspace_secret = read_secret(
+        workspace_gsheet_secret_name,
+        project_code="WORKSPACE",
+        explicit_value=explicit_workspace_sa_value,
+        secret_home=secret_home,
+    )
+    workspace_gc, auth_meta = _build_gspread_client(workspace_secret)
+
+    registry_file_id = _extract_spreadsheet_id(workspace_registry_id)
+    registry_book = workspace_gc.open_by_key(registry_file_id)
+    try:
+        worksheet = registry_book.worksheet(registry_tab)
+    except gspread.WorksheetNotFound as exc:
+        raise ValueError(
+            f"Workspace Project Registry tab {registry_tab!r} does not exist "
+            f"in {registry_book.title!r}."
+        ) from exc
+
+    values = worksheet.get_all_values()
+    if not values:
+        raise ValueError(
+            f"Workspace Project Registry tab {registry_tab!r} is empty."
+        )
+
+    header_map: Dict[str, int] = {}
+    duplicate_headers: List[str] = []
+    for index, raw_header in enumerate(values[0]):
+        normalized = _normalize_registry_header(raw_header)
+        if not normalized:
+            continue
+        if normalized in header_map:
+            duplicate_headers.append(normalized)
+        header_map[normalized] = index
+
+    if duplicate_headers:
+        raise ValueError(
+            "Workspace Project Registry has duplicate normalized headers: "
+            + ", ".join(sorted(set(duplicate_headers)))
+        )
+
+    def require_column(*aliases: str) -> int:
+        for alias in aliases:
+            normalized = _normalize_registry_header(alias)
+            if normalized in header_map:
+                return header_map[normalized]
+        raise ValueError(
+            "Workspace Project Registry is missing a required column; "
+            f"accepted_aliases={aliases}."
+        )
+
+    project_col = require_column("project_code", "project code")
+    active_col = require_column("active")
+    console_url_col = require_column(
+        "console_core_url",
+        "console core url",
+    )
+    gsheet_secret_col = require_column(
+        "gsheet_secret_name",
+        "gsheet secret name",
+    )
+    account_tab_col = require_column(
+        "account_config_tab",
+        "account config tab",
+    )
+    timezone_col = require_column("timezone", "time zone")
+
+    project_name_col = header_map.get(
+        _normalize_registry_header("project_name")
+    )
+    notes_col = header_map.get(_normalize_registry_header("notes"))
+
+    matches: List[Tuple[int, List[Any]]] = []
+    width = len(values[0])
+    for row_number, raw_row in enumerate(values[1:], start=2):
+        row = list(raw_row) + [""] * max(0, width - len(raw_row))
+        if _normalize_site_code(row[project_col]) == resolved_project_code:
+            matches.append((row_number, row))
+
+    if not matches:
+        raise ValueError(
+            "Workspace Project Registry has no row for "
+            f"project_code={resolved_project_code}."
+        )
+    if len(matches) > 1:
+        raise ValueError(
+            "Workspace Project Registry has duplicate rows for "
+            f"project_code={resolved_project_code}; "
+            f"rows={[row_number for row_number, _ in matches]}."
+        )
+
+    source_row, row = matches[0]
+    try:
+        is_active = _normalize_bool(row[active_col], default=False)
+    except ValueError as exc:
+        raise ValueError(
+            f"Workspace Project Registry row {source_row}: {exc}"
+        ) from exc
+
+    if not is_active:
+        raise ValueError(
+            "Workspace Project Registry project is inactive: "
+            f"project_code={resolved_project_code}, row={source_row}."
+        )
+
+    route = {
+        "project_code": resolved_project_code,
+        "project_name": (
+            _safe_str(row[project_name_col])
+            if project_name_col is not None
+            else ""
+        ),
+        "console_core_url": _safe_str(row[console_url_col]),
+        "gsheet_secret_name": _safe_str(row[gsheet_secret_col]),
+        "account_config_tab": _safe_str(row[account_tab_col]),
+        "timezone": _safe_str(row[timezone_col]),
+        "notes": (
+            _safe_str(row[notes_col])
+            if notes_col is not None
+            else ""
+        ),
+        "registry_id": registry_file_id,
+        "registry_tab": registry_tab,
+        "registry_source_row": str(source_row),
+        "workspace_gsheet_secret_name": _safe_str(
+            workspace_gsheet_secret_name
+        ),
+        "workspace_auth_source_type": _safe_str(
+            auth_meta.get("source_type")
+        ),
+        "workspace_service_account_email": _safe_str(
+            auth_meta.get("service_account_email")
+        ),
+    }
+
+    empty_required = [
+        key
+        for key in (
+            "console_core_url",
+            "gsheet_secret_name",
+            "account_config_tab",
+            "timezone",
+        )
+        if not route[key]
+    ]
+    if empty_required:
+        raise ValueError(
+            "Workspace Project Registry route has empty required values: "
+            f"project_code={resolved_project_code}; "
+            f"fields={empty_required}; row={source_row}."
+        )
+
+    if print_progress:
+        print(
+            "[Workspace Registry] resolved | "
+            f"project={route['project_code']} | "
+            f"row={source_row} | "
+            f"secret={route['gsheet_secret_name']} | "
+            f"account_tab={route['account_config_tab']} | "
+            f"timezone={route['timezone']}"
+        )
+
+    return route
 
 
 def update_existing_notebook_registry_row(
