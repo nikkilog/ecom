@@ -10,10 +10,12 @@ It supports both Colab and local Jupyter/CLI execution without OAuth popups.
 
 Secret resolution order:
 - explicit value passed by the caller;
-- Colab Secrets when running in Colab;
-- environment variable when running locally;
-- local Secret files under ``SECRET_HOME``;
-- configured local aliases, including the existing PBS Google SA file pattern.
+- exact Colab Secret name when running in Colab;
+- the shared ``workspace_secret_resolver`` contract when running locally.
+
+The active ``project_code`` selects the local Secret files. The logical Google
+Secret name remains independently configurable, so a Colab Secret such as
+``Apollo_GSHEET`` can map locally to ``Google/APOLLO_GSHEET_keys-*.json``.
 
 Real writes require ``dry_run=False`` and ``confirmed=True``.
 """
@@ -24,14 +26,12 @@ import base64
 import datetime as dt
 import json
 import math
-import os
 import platform
 import random
 import re
 import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import gspread
@@ -41,20 +41,9 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "2.1.0"
+MODULE_VERSION = "2.2.0"
 MODULE_PATH = "shopify_setup.sync_locations"
 DEFAULT_JOB_NAME = "config_locations"
-DEFAULT_LOCAL_SECRET_HOME = Path(
-    "/Users/nikki/Documents/Projects/_Secrets"
-).expanduser()
-
-DEFAULT_LOCAL_SECRET_ALIASES: Dict[str, Dict[str, str]] = {
-    "PBS_GSHEET": {
-        "mode": "WHOLE_FILE",
-        "relative_pattern": "Google/PBS_GSHEET_keys-*.json",
-    },
-}
-
 LOCATION_HEADERS = [
     "site_code",
     "location_code",
@@ -352,173 +341,53 @@ def _bool_cell(value: Any, *, default: bool = False) -> str:
     return "TRUE" if _normalize_bool(value, default=default) else "FALSE"
 
 
-def _contained_secret_path(secret_home: Path, candidate: Path) -> Path:
-    resolved = candidate.resolve(strict=True)
-    try:
-        resolved.relative_to(secret_home)
-    except ValueError as exc:
-        raise RuntimeError("Local Secret path escapes SECRET_HOME.") from exc
-    if not resolved.is_file():
-        raise RuntimeError(f"Local Secret target is not a file: {resolved}")
-    return resolved
-
-
-def _parse_dotenv_values(path: Path) -> Dict[str, List[str]]:
-    values: Dict[str, List[str]] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:].lstrip()
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        normalized = value.strip()
-        if (
-            len(normalized) >= 2
-            and normalized[0] == normalized[-1]
-            and normalized[0] in {"'", '"'}
-        ):
-            normalized = normalized[1:-1]
-        if key:
-            values.setdefault(key, []).append(normalized)
-    return values
-
-
-def _local_secret_home(secret_home: Optional[str]) -> Path:
-    configured = _safe_str(secret_home) or os.environ.get("SECRET_HOME", "").strip()
-    path = Path(configured).expanduser() if configured else DEFAULT_LOCAL_SECRET_HOME
-    if not path.is_dir():
-        raise RuntimeError(
-            "Local Secret directory was not found. Expected: "
-            f"{path}. Set SECRET_HOME to override it."
-        )
-    return path.resolve()
-
-
-def _merge_secret_aliases(
-    aliases: Optional[Mapping[str, Mapping[str, str]]],
-) -> Dict[str, Dict[str, str]]:
-    merged = {key: dict(value) for key, value in DEFAULT_LOCAL_SECRET_ALIASES.items()}
-    if aliases:
-        for key, value in aliases.items():
-            merged[str(key)] = dict(value)
-    return merged
-
-
-def _read_local_secret(
-    secret_name: str,
-    *,
-    secret_home: Optional[str],
-    local_secret_aliases: Optional[Mapping[str, Mapping[str, str]]],
-) -> SecretValue:
-    home = _local_secret_home(secret_home)
-
-    direct_candidates = [
-        home / secret_name,
-        home / f"{secret_name}.txt",
-        home / f"{secret_name}.secret",
-        home / f"{secret_name}.json",
-    ]
-    direct_matches = [path for path in direct_candidates if path.is_file()]
-    if len(direct_matches) > 1:
-        raise RuntimeError(
-            f"Local Secret {secret_name!r} has multiple direct-file matches: "
-            + ", ".join(path.name for path in direct_matches)
-        )
-    if direct_matches:
-        path = _contained_secret_path(home, direct_matches[0])
-        value = path.read_text(encoding="utf-8").strip()
-        if not value:
-            raise RuntimeError(f"Local Secret file for {secret_name!r} is empty.")
-        return SecretValue(value, "LOCAL_SECRET_FILE", str(path))
-
-    aliases = _merge_secret_aliases(local_secret_aliases)
-    alias = aliases.get(secret_name)
-    if alias:
-        relative_pattern = _safe_str(alias.get("relative_pattern"))
-        pattern_path = Path(relative_pattern)
-        if (
-            not relative_pattern
-            or pattern_path.is_absolute()
-            or ".." in pattern_path.parts
-        ):
-            raise RuntimeError(
-                f"Invalid Local Secret relative pattern for {secret_name!r}."
-            )
-        matches = list(home.glob(relative_pattern))
-        if not matches:
-            raise RuntimeError(
-                f"Local Secret file for {secret_name!r} was not found under "
-                f"{home} using {relative_pattern!r}."
-            )
-        if len(matches) > 1:
-            raise RuntimeError(
-                f"Local Secret alias for {secret_name!r} is ambiguous; "
-                f"found {len(matches)} matches."
-            )
-        path = _contained_secret_path(home, matches[0])
-        mode = _safe_str(alias.get("mode")).upper()
-        if mode == "WHOLE_FILE":
-            value = path.read_text(encoding="utf-8").strip()
-        elif mode == "DOTENV_KEY":
-            key = _safe_str(alias.get("key"))
-            values = _parse_dotenv_values(path).get(key, [])
-            if len(values) != 1 or not values[0]:
-                raise RuntimeError(
-                    f"Expected exactly one non-empty dotenv key {key!r} in {path}."
-                )
-            value = values[0]
-        else:
-            raise RuntimeError(
-                f"Unsupported Local Secret alias mode {mode!r} for {secret_name!r}."
-            )
-        if not value:
-            raise RuntimeError(f"Local Secret {secret_name!r} is empty.")
-        return SecretValue(value, "LOCAL_SECRET_ALIAS", str(path))
-
-    # Generic fallback for access-token secrets stored in any .env under SECRET_HOME.
-    dotenv_matches: List[Tuple[Path, str]] = []
-    for env_path in home.rglob("*.env"):
-        path = _contained_secret_path(home, env_path)
-        values = _parse_dotenv_values(path).get(secret_name, [])
-        for value in values:
-            if value:
-                dotenv_matches.append((path, value))
-    if len(dotenv_matches) == 1:
-        path, value = dotenv_matches[0]
-        return SecretValue(value, "LOCAL_DOTENV_KEY", f"{path}::{secret_name}")
-    if len(dotenv_matches) > 1:
-        raise RuntimeError(
-            f"Local Secret key {secret_name!r} appears in multiple .env files under "
-            f"{home}; configure an explicit alias."
-        )
-
-    raise RuntimeError(
-        f"Cannot resolve Local Secret {secret_name!r}. Checked direct files, "
-        "configured aliases, and exact keys in .env files under SECRET_HOME."
+def _workspace_secret_result_to_value(result: Any) -> SecretValue:
+    source_detail = result.resolved_name
+    if result.path is not None:
+        source_detail = str(result.path)
+        if result.key:
+            source_detail += f"::{result.key}"
+    elif result.key:
+        source_detail = result.key
+    return SecretValue(
+        value=result.value,
+        source_type=result.source_type,
+        source_detail=source_detail,
     )
 
 
 def read_secret(
     name: str,
     *,
+    project_code: str,
     explicit_value: Optional[str] = None,
     secret_home: Optional[str] = None,
     local_secret_aliases: Optional[Mapping[str, Mapping[str, str]]] = None,
 ) -> SecretValue:
-    """Read one secret without printing its value."""
+    """Read one Secret without printing its value.
+
+    Colab keeps the caller-provided logical name exactly as written. Local
+    execution delegates to the independent Workspace Secret Resolver. For a
+    Google Sheets Service Account name, the normalized ``PROJECT_CODE_GSHEET``
+    name is added as a compatibility alias.
+
+    ``local_secret_aliases`` remains in the signature for caller compatibility
+    but local routing is now owned by Workspace Secret Resolver.
+    """
     secret_name = _safe_str(name)
+    resolved_project_code = _normalize_site_code(project_code)
     if not secret_name:
         raise RuntimeError("Secret name is empty.")
+    if not resolved_project_code:
+        raise RuntimeError(
+            "PROJECT_CODE is required for Local Secret resolution. "
+            "Pass the active site/project code explicitly."
+        )
 
     if explicit_value is not None and _safe_str(explicit_value):
         return SecretValue(str(explicit_value).strip(), "EXPLICIT_VALUE", "caller")
 
-    runtime = _runtime_mode()
-    if runtime == "COLAB":
+    if _runtime_mode() == "COLAB":
         try:
             from google.colab import userdata  # type: ignore
         except Exception as exc:
@@ -530,20 +399,29 @@ def read_secret(
             )
         return SecretValue(str(value).strip(), "COLAB_SECRETS", secret_name)
 
-    environment_value = os.environ.get(secret_name)
-    if environment_value is not None and environment_value.strip():
-        return SecretValue(
-            environment_value.strip(),
-            "ENVIRONMENT_VARIABLE",
-            secret_name,
-        )
+    try:
+        from workspace_secret_resolver import WorkspaceSecretResolver
+    except Exception as exc:
+        raise RuntimeError(
+            "Workspace Secret Resolver is required for Local execution. "
+            "Install it once into the active Python environment with:\n"
+            f"{sys.executable} -m pip install -e "
+            "/Users/nikki/Documents/AI_Workspace/Projects/"
+            "Workspace_Secret_Resolver"
+        ) from exc
 
-    return _read_local_secret(
-        secret_name,
+    resolver = WorkspaceSecretResolver(
+        resolved_project_code,
         secret_home=secret_home,
-        local_secret_aliases=local_secret_aliases,
     )
+    aliases: Tuple[str, ...] = ()
+    if secret_name.upper().endswith("_GSHEET"):
+        canonical_name = f"{resolved_project_code}_GSHEET"
+        if canonical_name != secret_name:
+            aliases = (canonical_name,)
 
+    result = resolver.read(secret_name, aliases=aliases)
+    return _workspace_secret_result_to_value(result)
 
 def _parse_service_account(secret: SecretValue) -> Dict[str, Any]:
     raw = secret.value.strip()
@@ -1046,6 +924,7 @@ def _normalize_registry_header(value: Any) -> str:
 
 def update_existing_notebook_registry_row(
     *,
+    project_code: str,
     registry_mode: str,
     console_core_url: str,
     bootstrap_gsheet_secret_name: str,
@@ -1085,6 +964,7 @@ def update_existing_notebook_registry_row(
 
     sa_secret = read_secret(
         bootstrap_gsheet_secret_name,
+        project_code=project_code,
         explicit_value=explicit_sa_value,
         secret_home=secret_home,
         local_secret_aliases=local_secret_aliases,
@@ -1227,6 +1107,7 @@ def run(
     progress(1, 8, f"Resolve bootstrap Google Secret | site={site_code} | phase={phase}")
     bootstrap_secret = read_secret(
         bootstrap_gsheet_sa_b64_secret,
+        project_code=site_code,
         explicit_value=sa_b64_value,
         secret_home=secret_home,
         local_secret_aliases=local_secret_aliases,
@@ -1256,6 +1137,7 @@ def run(
 
     shopify_secret = read_secret(
         account.shopify_token_secret,
+        project_code=site_code,
         explicit_value=shopify_token_value,
         secret_home=secret_home,
         local_secret_aliases=local_secret_aliases,
