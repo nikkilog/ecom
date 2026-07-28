@@ -51,10 +51,10 @@ from zoneinfo import ZoneInfo
 from shopify_create import generic_prepare as gp
 
 
-MODULE_VERSION = "1.5.1"
+MODULE_VERSION = "1.5.2"
 MODULE_PATH = "shopify_create.generic_apply"
 DEFAULT_JOB_NAME = "generic_create_apply"
-EXPECTED_PREPARE_MODULE_VERSION = "1.6.2"
+EXPECTED_PREPARE_MODULE_VERSION = "1.6.3"
 
 LEGACY_RESULT_HEADERS = [
     "run_id",
@@ -948,11 +948,18 @@ def _build_product_set_input(
             first.get("publish.all_channels")
         )
     )
-    if publish_all_channels and requested_status != "ACTIVE":
+
+    # Publication association and customer visibility are separate states.
+    # A Draft Product may be associated with Publications, while remaining
+    # unavailable to customers until its status becomes ACTIVE.
+    if (
+        publish_all_channels
+        and requested_status not in {"ACTIVE", "DRAFT"}
+    ):
         raise ValueError(
             f"Product {product_key} requests all-channel publishing "
-            f"but status={requested_status}. Channel visibility "
-            "requires ACTIVE status."
+            f"with unsupported status={requested_status}. "
+            "Supported statuses are ACTIVE and DRAFT."
         )
 
     product_options, variant_option_values = _build_options(
@@ -2255,8 +2262,16 @@ def run(
                     message = (
                         "DRY_RUN: Shopify productSet was not called. "
                         + (
-                            f"All-channel publication planned for "
-                            f"{len(publications)} Publications."
+                            f"All-channel Publication association "
+                            f"planned for {len(publications)} Publications; "
+                            + (
+                                "the Product will remain unavailable to "
+                                "customers while its status is DRAFT."
+                                if gp._safe_str(
+                                    product_input.get("status")
+                                ).upper() == "DRAFT"
+                                else "the Product is planned as ACTIVE."
+                            )
                             if publish_this_product
                             else "Channel publication is disabled."
                         )
@@ -2330,12 +2345,24 @@ def run(
                             status = "SUCCESS"
                             succeeded_ops = 2
                             products_succeeded += 1
-                            message = (
-                                "Product and Variants created; "
-                                f"published to "
-                                f"{publication_result['planned_count']} "
-                                "Shopify Publications."
-                            )
+                            if gp._safe_str(
+                                product_input.get("status")
+                            ).upper() == "DRAFT":
+                                message = (
+                                    "Product and Variants created as DRAFT; "
+                                    f"associated with "
+                                    f"{publication_result['planned_count']} "
+                                    "Shopify Publications. The Product "
+                                    "remains unavailable to customers until "
+                                    "its status becomes ACTIVE."
+                                )
+                            else:
+                                message = (
+                                    "Product and Variants created as ACTIVE; "
+                                    f"published to "
+                                    f"{publication_result['planned_count']} "
+                                    "Shopify Publications."
+                                )
                     else:
                         status = "SUCCESS"
                         products_succeeded += 1
