@@ -51,10 +51,10 @@ from zoneinfo import ZoneInfo
 from shopify_create import generic_prepare as gp
 
 
-MODULE_VERSION = "1.5.0"
+MODULE_VERSION = "1.5.1"
 MODULE_PATH = "shopify_create.generic_apply"
 DEFAULT_JOB_NAME = "generic_create_apply"
-EXPECTED_PREPARE_MODULE_VERSION = "1.6.1"
+EXPECTED_PREPARE_MODULE_VERSION = "1.6.2"
 
 LEGACY_RESULT_HEADERS = [
     "run_id",
@@ -334,6 +334,35 @@ class ShopifyClient:
             f"{operation_name} failed after "
             f"{self.max_retries} attempts: {last_error}"
         )
+
+
+def _project_secret_name_for_runtime(
+    secret_name: Any,
+    project_code: Any,
+) -> str:
+    """Preserve exact Colab names and use canonical project names locally."""
+    logical_name = gp._safe_str(secret_name)
+    if not logical_name:
+        raise ValueError("Secret name is empty.")
+
+    if gp._runtime_mode() != "LOCAL":
+        return logical_name
+
+    resolved_project_code = gp._normalize_site_code(project_code)
+    if not resolved_project_code:
+        raise ValueError(
+            "PROJECT_CODE is required for Local Secret normalization."
+        )
+
+    normalized_name = logical_name.upper()
+    for suffix in (
+        "_SHOPIFY_ACCESS_TOKEN",
+        "_SHOPIFY_TOKEN",
+    ):
+        if normalized_name.endswith(suffix):
+            return f"{resolved_project_code}{suffix}"
+
+    return logical_name
 
 
 def _safe_list(values: Optional[Iterable[Any]]) -> List[str]:
@@ -2092,8 +2121,19 @@ def run(
             12,
             "Resolve Shopify token and initialize client",
         )
-        shopify_secret = gp.read_secret(
+        runtime_token_secret_name = _project_secret_name_for_runtime(
             token_secret_name,
+            site_code,
+        )
+        if print_progress:
+            print(
+                "[Shopify Secret] "
+                f"configured_name={token_secret_name} | "
+                f"runtime_name={runtime_token_secret_name} | "
+                f"runtime={gp._runtime_mode()}"
+            )
+        shopify_secret = gp.read_secret(
+            runtime_token_secret_name,
             project_code=site_code,
             explicit_value=shopify_token_value,
             secret_home=secret_home,
