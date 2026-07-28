@@ -63,7 +63,7 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "1.6.2"
+MODULE_VERSION = "1.6.3"
 MODULE_PATH = "shopify_create.generic_prepare"
 DEFAULT_JOB_NAME = "generic_create_prepare"
 
@@ -2195,18 +2195,31 @@ def _build_prepare_plan(
         publish_all_channels = _normalize_bool(
             values.get("publish.all_channels")
         )
-        if (
+        product_status = _safe_str(
+            values.get("core.status")
+        ).lower()
+
+        if publish_all_channels is True and product_status == "draft":
+            _add_issue(
+                row_state,
+                "WARNING",
+                "DRAFT_WITH_ALL_CHANNEL_PUBLICATION_INTENT",
+                "publish.all_channels=TRUE is allowed with "
+                "core.status=draft. The Product can be associated "
+                "with Publications, but it remains unavailable to "
+                "customers until its status becomes active.",
+            )
+        elif (
             publish_all_channels is True
-            and _safe_str(values.get("core.status")).lower()
-            != "active"
+            and product_status not in {"active", "draft"}
         ):
             _add_issue(
                 row_state,
                 "ERROR",
-                "PUBLISH_ALL_CHANNELS_REQUIRES_ACTIVE",
-                "publish.all_channels=TRUE requires "
-                "core.status=active. Draft products are not "
-                "visible on sales channels.",
+                "ALL_CHANNEL_PUBLICATION_UNSUPPORTED_STATUS",
+                "publish.all_channels=TRUE currently supports "
+                "core.status=active or draft; "
+                f"received={product_status!r}.",
             )
 
         location_code = _safe_str(
