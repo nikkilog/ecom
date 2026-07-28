@@ -63,7 +63,7 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "1.6.1"
+MODULE_VERSION = "1.6.2"
 MODULE_PATH = "shopify_create.generic_prepare"
 DEFAULT_JOB_NAME = "generic_create_prepare"
 
@@ -573,15 +573,23 @@ def _normalize_display_lookup(value: Any) -> str:
 
 
 def _normalize_owner_entity(value: Any, field_key: str = "") -> str:
-    key = _safe_str(field_key)
-    if key.startswith("mf."):
-        return "PRODUCT"
-    if key.startswith("v_mf."):
-        return "VARIANT"
+    """Normalize an owner entity without overriding an explicit entity_type.
+
+    ``entity_type`` is authoritative when present. Prefix inference is only a
+    fallback for callers that do not provide an entity value.
+    """
     entity = _safe_str(value).upper().replace(" ", "")
     if entity in {"PRODUCTVARIANT", "VARIANT"}:
         return "VARIANT"
-    return entity
+    if entity:
+        return entity
+
+    key = _safe_str(field_key)
+    if key.startswith("v_mf."):
+        return "VARIANT"
+    if key.startswith("mf."):
+        return "PRODUCT"
+    return ""
 
 
 def _normalize_registry_header(value: Any) -> str:
