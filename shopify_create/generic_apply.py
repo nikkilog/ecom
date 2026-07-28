@@ -54,7 +54,7 @@ from shopify_create import generic_prepare as gp
 MODULE_VERSION = "1.5.0"
 MODULE_PATH = "shopify_create.generic_apply"
 DEFAULT_JOB_NAME = "generic_create_apply"
-EXPECTED_PREPARE_MODULE_VERSION = "1.6.0"
+EXPECTED_PREPARE_MODULE_VERSION = "1.6.1"
 
 LEGACY_RESULT_HEADERS = [
     "run_id",

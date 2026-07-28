@@ -63,7 +63,7 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "1.6.0"
+MODULE_VERSION = "1.6.1"
 MODULE_PATH = "shopify_create.generic_prepare"
 DEFAULT_JOB_NAME = "generic_create_prepare"
 
@@ -759,7 +759,13 @@ def read_secret(
         resolved_project_code,
         secret_home=secret_home,
     )
-    result = resolver.read(secret_name)
+    aliases: Tuple[str, ...] = ()
+    if secret_name.upper().endswith("_GSHEET"):
+        canonical_name = f"{resolved_project_code}_GSHEET"
+        if canonical_name != secret_name:
+            aliases = (canonical_name,)
+
+    result = resolver.read(secret_name, aliases=aliases)
     return _workspace_secret_result_to_value(result)
 
 
