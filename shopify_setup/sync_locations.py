@@ -41,7 +41,7 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "2.3.0"
+MODULE_VERSION = "2.3.1"
 MODULE_PATH = "shopify_setup.sync_locations"
 DEFAULT_JOB_NAME = "config_locations"
 LOCATION_HEADERS = [
@@ -415,10 +415,19 @@ def read_secret(
         secret_home=secret_home,
     )
     aliases: Tuple[str, ...] = ()
-    if secret_name.upper().endswith("_GSHEET"):
-        canonical_name = f"{resolved_project_code}_GSHEET"
-        if canonical_name != secret_name:
-            aliases = (canonical_name,)
+    normalized_secret_name = secret_name.upper()
+
+    canonical_suffixes = (
+        "_GSHEET",
+        "_SHOPIFY_ACCESS_TOKEN",
+        "_SHOPIFY_TOKEN",
+    )
+    for suffix in canonical_suffixes:
+        if normalized_secret_name.endswith(suffix):
+            canonical_name = f"{resolved_project_code}{suffix}"
+            if canonical_name != secret_name:
+                aliases = (canonical_name,)
+            break
 
     result = resolver.read(secret_name, aliases=aliases)
     return _workspace_secret_result_to_value(result)
