@@ -166,8 +166,7 @@ current facts.
 The current Handle-existence flow is:
 
 ```text
-Shopify Product facts
-→ external Handle synchronization flow
+operator-maintained target Handle facts
 → create_generic / V_Product_Handle
 → Product Handle snapshot
 → Generic Apply reads the snapshot once
@@ -176,6 +175,12 @@ Shopify Product facts
 → new: Shopify productSet / publication
 → Result / RunLog
 ```
+
+`V_Product_Handle` is a user-created and user-maintained Tab. Console Core
+depends only on the exact Tab name `V_Product_Handle` and the header
+`Product Handle`; it does not own or track an automatic synchronization Job,
+formula source, or Product IDX upstream for this snapshot. The project must
+not describe this Tab as automatically generated or refreshed.
 
 Apply locates `Product Handle` by header name rather than fixed column
 position, ignores blank snapshot values, and silently deduplicates repeated
@@ -231,9 +236,10 @@ write.
 
 Shopify effects and Google Sheets evidence are not one transaction. A Shopify
 Product may exist even if a later Result or RunLog write remains unsuccessful
-after retries. Before recovery or rerun, refresh Shopify Product facts and
-`V_Product_Handle`; the refreshed snapshot lets already-created Handles
-resolve to `SKIPPED_HANDLE_EXISTS`.
+after retries. Before recovery or rerun, the operator must manually bring
+`V_Product_Handle.Product Handle` up to date using the user-owned maintenance
+process; the updated snapshot lets already-created Handles resolve to
+`SKIPPED_HANDLE_EXISTS`. Console Core does not infer or automate that process.
 
 ## Cross-Stage Invariants
 

@@ -8,6 +8,7 @@ Console_Core Git main
 
 Console_Core_Colab
 = thin Notebook Runners and operational launch surfaces
+!= Git repository
 != authoritative Python source
 != Git history
 
@@ -18,6 +19,12 @@ Console_Core_Colab
 ```
 
 Notebook code should progressively shrink to configuration, loading, invocation, and presentation. Core business logic belongs in Git-hosted Python modules.
+
+The Console Core Git repository is Current for Python, tests, and formal
+documentation. `Console_Core_Colab` carries Notebook entry points and Runtime
+copies only. Notebook expected-version gates must align with Console Core
+Current. Notebook Current must have saved outputs cleared; saved output is
+runtime history, not Current acceptance evidence.
 
 Configured Secret names are runtime inputs, not credentials stored in source.
 Colab preserves the exact configured logical name. Local execution derives the
@@ -175,8 +182,11 @@ Planned `inserted`, `written`, or `created` counts must be labeled as planned. A
 Generic Apply does not read or compare Preview as an execution gate. It
 re-reads current Input, Defaults, `Cfg__Fields`, and `Cfg__Locations`, rebuilds
 the plan, and reads `V_Product_Handle.Product Handle` once for local
-target-existence comparison. Prepare's Input-internal `DUPLICATE_HANDLE`
-contract is distinct: Generic Create Input is Variant-grain,
+target-existence comparison. `V_Product_Handle` is a user-created and
+user-maintained Tab; Console Core requires only that exact Tab name and the
+`Product Handle` header. No automatic synchronization Job, formula source, or
+Product IDX upstream belongs to this Runtime contract. Prepare's
+Input-internal `DUPLICATE_HANDLE` contract is distinct: Generic Create Input is Variant-grain,
 `sys.product_key` defines a Product group, and only different Product groups
 sharing one trimmed, case-insensitive Handle conflict.
 
@@ -281,5 +291,6 @@ Quota-safe Result behavior includes:
 - The final result identifies safe resume conditions and does not describe partial work as complete.
 - Shopify mutations and Google Sheets Result/RunLog evidence are not a single
   transaction. If evidence writing fails after Shopify work, do not rerun from
-  a stale Handle snapshot. Refresh Shopify Product facts and
-  `V_Product_Handle`, then rerun so existing Handles are skipped.
+  a stale Handle snapshot. Have the operator update
+  `V_Product_Handle.Product Handle` through the user-owned manual maintenance
+  process, then rerun so existing Handles are skipped.
