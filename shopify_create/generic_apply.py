@@ -1,45 +1,38 @@
 # -*- coding: utf-8 -*-
-"""Apply a validated Generic Shopify Product Creation plan.
+"""Apply Generic Shopify Product Creation rows.
 
 GitHub target: ``ecom/shopify_create/generic_apply.py``
 Import path: ``shopify_create.generic_apply``
 
-Safety model
-------------
-1. Re-read current Input, Defaults, Cfg__Fields and Cfg__Locations.
-2. Rebuild rows from current Input using ``generic_prepare``.
-3. Do not read, compare, or require the Preview tab.
-4. Read existing Handles once from the create workbook Tab
-   ``V_Product_Handle`` and compare the ``Product Handle`` column locally.
-   No Shopify API request is used for duplicate lookup.
-5. Existing Handles are skipped, written to Result, and never treated as
-   Apply errors.
-5. Resolve every accessible Shopify Publication when all-channel
-   publishing is enabled.
-5. DRY_RUN produces a final execution plan without Shopify writes.
-6. Live writes require ``dry_run=False`` and ``confirmed=True``.
-7. Live mode requires explicit product selection unless
-   ``apply_all_ready_products=True``.
-8. Products are Draft by default. Non-Draft creation is blocked unless
-   explicitly enabled.
-9. Result and RunLog retain execution evidence.
-10. Images/media are intentionally out of scope.
+Execution contract
+------------------
+1. Read current Input and Defaults directly; Preview is not required.
+2. Read existing Handles once from ``V_Product_Handle`` column
+   ``Product Handle`` and compare locally.
+3. Only ``core.handle`` participates in existence checking.
+4. Existing Handles are written to Result as ``SKIPPED_HANDLE_EXISTS`` and
+   are not uploaded or treated as errors.
+5. New Handles are created with bounded Product-level concurrency.
+6. Google Sheets writes remain on the main thread and Result rows are flushed
+   periodically in batches.
+7. DRY_RUN performs no Shopify writes.
+8. Live writes require ``dry_run=False`` and ``confirmed=True``.
+9. Images/media are intentionally out of scope.
 
-``core.handle`` is the only existence-check field. Existing Handles are
-loaded once from ``V_Product_Handle`` column ``Product Handle`` and compared
-locally. SKU, Barcode, Product Key, Variant Key, numeric IDs, Title, and
-every other field are ignored. An existing Handle is not uploaded and is
-recorded in Result with status ``SKIPPED_HANDLE_EXISTS``. Shopify Admin
-GraphQL is used only for actual create/publication operations.
-``productSet``
-synchronously to create
-a Product with its options, variants, product/variant metafields, inventory
-item attributes, and initial inventory quantities in one product operation.
+SKU, Barcode, Product Key, Variant Key, numeric IDs, Title, and every other
+field are excluded from duplicate lookup. Shopify Admin GraphQL is used only
+for actual create/publication operations.
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import threading
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ThreadPoolExecutor,
+    wait,
+)
 import json
 import os
 import platform
@@ -60,7 +53,7 @@ from zoneinfo import ZoneInfo
 from shopify_create import generic_prepare as gp
 
 
-MODULE_VERSION = "1.5.8"
+MODULE_VERSION = "1.5.9"
 MODULE_PATH = "shopify_create.generic_apply"
 DEFAULT_JOB_NAME = "generic_create_apply"
 EXPECTED_PREPARE_MODULE_VERSION = "1.6.5"
@@ -248,6 +241,7 @@ class ShopifyClient:
         self.print_progress = bool(print_progress)
         self.request_count = 0
         self.retry_count = 0
+        self._counter_lock = threading.Lock()
 
     def gql(
         self,
@@ -263,7 +257,8 @@ class ShopifyClient:
         last_error: Optional[BaseException] = None
 
         for attempt in range(1, self.max_retries + 1):
-            self.request_count += 1
+            with self._counter_lock:
+                self.request_count += 1
             try:
                 response = requests.post(
                     self.graphql_url,
@@ -280,7 +275,8 @@ class ShopifyClient:
                 }:
                     wait_seconds = min(2 ** (attempt - 1), 20)
                     wait_seconds += random.random()
-                    self.retry_count += 1
+                    with self._counter_lock:
+                        self.retry_count += 1
                     if self.print_progress:
                         print(
                             "[Shopify retry] "
@@ -317,7 +313,8 @@ class ShopifyClient:
                     break
                 wait_seconds = min(2 ** (attempt - 1), 20)
                 wait_seconds += random.random()
-                self.retry_count += 1
+                with self._counter_lock:
+                    self.retry_count += 1
                 if self.print_progress:
                     print(
                         "[Shopify retry] "
@@ -1685,6 +1682,48 @@ def _ensure_result_header(
     )
 
 
+class _ResultBatchWriter:
+    """Append Result batches from the main thread only."""
+
+    def __init__(self, worksheet: gspread.Worksheet) -> None:
+        self.worksheet = worksheet
+        values = worksheet.get_all_values()
+        self.next_row = max(2, len(values) + 1)
+        self.rows_written = 0
+        self.flush_count = 0
+
+    def append(
+        self,
+        rows: Sequence[Sequence[Any]],
+    ) -> int:
+        if not rows:
+            return 0
+        start_row = self.next_row
+        end_row = start_row + len(rows) - 1
+        required_cols = len(RESULT_HEADERS)
+        if (
+            self.worksheet.row_count < end_row
+            or self.worksheet.col_count < required_cols
+        ):
+            self.worksheet.resize(
+                rows=max(self.worksheet.row_count, end_row + 100),
+                cols=max(self.worksheet.col_count, required_cols),
+            )
+        self.worksheet.update(
+            range_name=(
+                f"A{start_row}:"
+                f"{gp._a1_col(required_cols)}{end_row}"
+            ),
+            values=[list(row) for row in rows],
+            value_input_option="RAW",
+        )
+        written = len(rows)
+        self.next_row = end_row + 1
+        self.rows_written += written
+        self.flush_count += 1
+        return written
+
+
 def _append_result_rows(
     worksheet: gspread.Worksheet,
     rows: Sequence[Sequence[Any]],
@@ -2089,6 +2128,221 @@ def _result_only_product_input(
     return result
 
 
+def _execute_product_task(
+    *,
+    product_key: str,
+    rows: Sequence[Mapping[str, str]],
+    product_input: Mapping[str, Any],
+    duplicate_match: Optional[Mapping[str, Any]],
+    publish_this_product: bool,
+    publications: Sequence[Mapping[str, Any]],
+    dry_run: bool,
+    client: ShopifyClient,
+    run_id: str,
+    applied_at: str,
+    site_code: str,
+    admin_product_base_url: str,
+    storefront_product_base_url: str,
+    tab_product_handle: str,
+    product_handle_header: str,
+) -> Dict[str, Any]:
+    """Execute one Product without writing Google Sheets."""
+    product_response: Optional[Dict[str, Any]] = (
+        dict(duplicate_match) if duplicate_match else None
+    )
+    status = ""
+    message = ""
+    error_reason = ""
+    succeeded_ops = 0
+    failed_ops = 0
+    publication_result: Dict[str, Any] = {
+        "publication_ids": [
+            gp._safe_str(item.get("id")) for item in publications
+        ] if publish_this_product else [],
+        "planned_count": len(publications) if publish_this_product else 0,
+        "published_count": 0,
+        "user_errors": [],
+    }
+    products_succeeded = 0
+    products_failed = 0
+    products_skipped_handle_exists = 0
+    variants_succeeded = 0
+    variants_failed = 0
+    variants_skipped_handle_exists = 0
+
+    try:
+        if duplicate_match:
+            status = "SKIPPED_HANDLE_EXISTS"
+            products_skipped_handle_exists = 1
+            variants_skipped_handle_exists = len(rows)
+            publication_result = {
+                "publication_ids": [],
+                "planned_count": 0,
+                "published_count": 0,
+                "user_errors": [],
+            }
+            message = (
+                "Handle exists in V_Product_Handle. "
+                "Product was not uploaded. "
+                f"handle={product_key}; "
+                f"source_tab={tab_product_handle}; "
+                f"source_header={product_handle_header}."
+            )
+        elif dry_run:
+            status = "PLANNED"
+            message = (
+                "DRY_RUN: Shopify productSet was not called. "
+                + (
+                    f"All-channel Publication association planned for "
+                    f"{len(publications)} Publications; "
+                    + (
+                        "the Product will remain unavailable to customers "
+                        "while its status is DRAFT."
+                        if gp._safe_str(product_input.get("status")).upper()
+                        == "DRAFT"
+                        else "the Product is planned as ACTIVE."
+                    )
+                    if publish_this_product
+                    else "Channel publication is disabled."
+                )
+            )
+        else:
+            data = client.gql(
+                M_PRODUCT_SET,
+                {"input": dict(product_input), "synchronous": True},
+                operation_name="productSet_create",
+            )
+            payload = data.get("productSet") or {}
+            user_errors = payload.get("userErrors") or []
+            if user_errors:
+                raise RuntimeError(
+                    "productSet userErrors: "
+                    + json.dumps(user_errors, ensure_ascii=False)
+                )
+            raw_product = payload.get("product")
+            if not raw_product:
+                raise RuntimeError("productSet returned no Product.")
+            product_response = dict(raw_product)
+            returned_variants = product_response.get("variants", {}).get(
+                "nodes", []
+            )
+            _verify_inventory_delivery_fields(
+                source_rows=rows,
+                product_input=product_input,
+                returned_variants=returned_variants,
+            )
+            succeeded_ops = 1
+            variants_succeeded = len(rows)
+            if publish_this_product:
+                publication_result = _publish_product_to_all_publications(
+                    client=client,
+                    product_gid=gp._safe_str(product_response.get("id")),
+                    publications=publications,
+                )
+                if publication_result["user_errors"]:
+                    status = "PARTIAL_FAILURE"
+                    failed_ops = 1
+                    products_failed = 1
+                    message = (
+                        "Product created, but all-channel publication "
+                        "returned errors: "
+                        + json.dumps(
+                            publication_result["user_errors"],
+                            ensure_ascii=False,
+                        )
+                    )
+                    error_reason = "PUBLISHABLE_PUBLISH_USER_ERROR"
+                else:
+                    status = "SUCCESS"
+                    succeeded_ops = 2
+                    products_succeeded = 1
+                    if gp._safe_str(product_input.get("status")).upper() == "DRAFT":
+                        message = (
+                            "Product and Variants created as DRAFT; associated "
+                            f"with {publication_result['planned_count']} Shopify "
+                            "Publications. The Product remains unavailable to "
+                            "customers until its status becomes ACTIVE."
+                        )
+                    else:
+                        message = (
+                            "Product and Variants created as ACTIVE; published "
+                            f"to {publication_result['planned_count']} Shopify "
+                            "Publications."
+                        )
+            else:
+                status = "SUCCESS"
+                products_succeeded = 1
+                message = (
+                    "Product and all Variants created by synchronous "
+                    "productSet; channel publication disabled."
+                )
+    except Exception as exc:
+        status = "FAILED"
+        message = str(exc)
+        error_reason = type(exc).__name__
+        failed_ops = 1
+        products_failed = 1
+        variants_failed = len(rows)
+
+    result_rows = _result_rows_for_product(
+        run_id=run_id,
+        applied_at=applied_at,
+        site_code=site_code,
+        runtime_mode=gp._runtime_mode(),
+        dry_run=dry_run,
+        product_key=product_key,
+        source_rows=rows,
+        status=status,
+        message=message,
+        error_reason=error_reason,
+        product_response=product_response,
+        product_input=product_input,
+        admin_product_base_url=admin_product_base_url,
+        storefront_product_base_url=storefront_product_base_url,
+        api_operations_planned=(
+            0 if duplicate_match else (2 if publish_this_product else 1)
+        ),
+        api_operations_succeeded=succeeded_ops,
+        api_operations_failed=failed_ops,
+        publication_result=publication_result,
+    )
+    product_result = {
+        "product_key": gp._safe_str(rows[0].get("sys.product_key")),
+        "status": status,
+        "message": message,
+        "product_gid": gp._safe_str((product_response or {}).get("id")),
+        "handle": gp._safe_str((product_response or {}).get("handle"))
+        or gp._safe_str(product_input.get("handle")),
+        "variants": len(rows),
+        "category_id": gp._safe_str(product_input.get("category")),
+        "template_suffix": gp._safe_str(
+            product_input.get("templateSuffix")
+        ),
+        "publish_all_channels": publish_this_product,
+        "publications_planned": publication_result.get("planned_count", 0),
+        "publications_published": publication_result.get(
+            "published_count", 0
+        ),
+    }
+    return {
+        "product_key": product_key,
+        "rows": list(rows),
+        "status": status,
+        "message": message,
+        "error_reason": error_reason,
+        "product_response": product_response,
+        "product_input": dict(product_input),
+        "result_rows": result_rows,
+        "product_result": product_result,
+        "products_succeeded": products_succeeded,
+        "products_failed": products_failed,
+        "products_skipped_handle_exists": products_skipped_handle_exists,
+        "variants_succeeded": variants_succeeded,
+        "variants_failed": variants_failed,
+        "variants_skipped_handle_exists": variants_skipped_handle_exists,
+    }
+
+
 def run(
     *,
     site_code: str,
@@ -2118,6 +2372,8 @@ def run(
     write_result: bool = True,
     preflight_progress_every: int = 10,
     product_progress_every: int = 1,
+    product_concurrency: int = 4,
+    result_flush_every: int = 20,
     api_timeout_seconds: int = 120,
     api_max_retries: int = 6,
     tz_name: str = "America/New_York",
@@ -2149,6 +2405,13 @@ def run(
         raise ValueError(
             "Live Apply requires CONFIRMED=True."
         )
+
+    product_concurrency = int(product_concurrency)
+    result_flush_every = int(result_flush_every)
+    if product_concurrency < 1:
+        raise ValueError("PRODUCT_CONCURRENCY must be >= 1.")
+    if result_flush_every < 1:
+        raise ValueError("RESULT_FLUSH_EVERY must be >= 1.")
 
     run_id = run_id or gp._make_run_id(
         job_name,
@@ -2476,12 +2739,16 @@ def run(
             10,
             12,
             (
-                "DRY RUN final plan"
+                "DRY RUN concurrent plan"
                 if dry_run
-                else "Create Shopify Products"
+                else (
+                    "Create Shopify Products concurrently "
+                    f"| workers={product_concurrency}"
+                )
             ),
         )
         result_rows: List[List[Any]] = []
+        result_rows_buffer: List[List[Any]] = []
         product_results: List[Dict[str, Any]] = []
         products_succeeded = 0
         products_failed = 0
@@ -2489,6 +2756,9 @@ def run(
         variants_succeeded = 0
         variants_failed = 0
         variants_skipped_handle_exists = 0
+        result_rows_written = 0
+        result_flush_count = 0
+        products_since_result_flush = 0
 
         applied_at = gp._now_str(tz_name)
         admin_product_base_url = gp._safe_str(
@@ -2497,330 +2767,244 @@ def run(
         storefront_product_base_url = gp._safe_str(
             account.get("STOREFRONT_PRODUCT_BASE_URL")
         )
+        result_writer: Optional[_ResultBatchWriter] = None
+        if write_result:
+            result_ws = _ensure_result_header(create_book, tab_result)
+            result_writer = _ResultBatchWriter(result_ws)
 
         total_products = len(selected_product_keys)
-        for index, product_key in enumerate(
-            selected_product_keys,
-            start=1,
-        ):
+        completed_products = 0
+        stop_requested = False
+        processing_started = time.monotonic()
+
+        def submit_product(executor: ThreadPoolExecutor, product_key: str):
             rows = product_rows[product_key]
-            product_input = product_inputs[product_key]
-            duplicate_match = conflict_result[
-                "duplicates_by_handle"
-            ].get(product_key)
-            product_response: Optional[Dict[str, Any]] = (
-                dict(duplicate_match)
-                if duplicate_match
-                else None
+            duplicate_match = conflict_result["duplicates_by_handle"].get(
+                product_key
             )
-            status = ""
-            message = ""
-            error_reason = ""
-            succeeded_ops = 0
-            failed_ops = 0
             publish_this_product = (
                 product_key in publish_product_keys
                 and duplicate_match is None
             )
-            publication_result: Dict[str, Any] = {
-                "publication_ids": [
-                    item["id"] for item in publications
-                ] if publish_this_product else [],
-                "planned_count": (
-                    len(publications)
-                    if publish_this_product
-                    else 0
-                ),
-                "published_count": 0,
-                "user_errors": [],
-            }
+            return executor.submit(
+                _execute_product_task,
+                product_key=product_key,
+                rows=rows,
+                product_input=product_inputs[product_key],
+                duplicate_match=duplicate_match,
+                publish_this_product=publish_this_product,
+                publications=publications,
+                dry_run=dry_run,
+                client=client,
+                run_id=run_id,
+                applied_at=applied_at,
+                site_code=site_code,
+                admin_product_base_url=admin_product_base_url,
+                storefront_product_base_url=storefront_product_base_url,
+                tab_product_handle=tab_product_handle,
+                product_handle_header=product_handle_header,
+            )
 
-            try:
-                if duplicate_match:
-                    status = "SKIPPED_HANDLE_EXISTS"
-                    products_skipped_handle_exists += 1
-                    variants_skipped_handle_exists += len(rows)
-                    publication_result = {
-                        "publication_ids": [],
-                        "planned_count": 0,
-                        "published_count": 0,
-                        "user_errors": [],
-                    }
-                    message = (
-                        "Handle exists in V_Product_Handle. "
-                        "Product was not uploaded. "
-                        f"handle={product_key}; "
-                        f"source_tab={tab_product_handle}; "
-                        f"source_header={product_handle_header}."
-                    )
-                elif dry_run:
-                    status = "PLANNED"
-                    message = (
-                        "DRY_RUN: Shopify productSet was not called. "
-                        + (
-                            f"All-channel Publication association "
-                            f"planned for {len(publications)} Publications; "
-                            + (
-                                "the Product will remain unavailable to "
-                                "customers while its status is DRAFT."
-                                if gp._safe_str(
-                                    product_input.get("status")
-                                ).upper() == "DRAFT"
-                                else "the Product is planned as ACTIVE."
-                            )
-                            if publish_this_product
-                            else "Channel publication is disabled."
-                        )
-                    )
-                else:
-                    data = client.gql(
-                        M_PRODUCT_SET,
-                        {
-                            "input": product_input,
-                            "synchronous": True,
-                        },
-                        operation_name="productSet_create",
-                    )
-                    payload = data.get("productSet") or {}
-                    user_errors = payload.get("userErrors") or []
-                    if user_errors:
-                        raise RuntimeError(
-                            "productSet userErrors: "
-                            + json.dumps(
-                                user_errors,
-                                ensure_ascii=False,
-                            )
-                        )
-                    product_response = payload.get("product")
-                    if not product_response:
-                        raise RuntimeError(
-                            "productSet returned no Product."
-                        )
+        key_iterator = iter(selected_product_keys)
+        worker_count = min(product_concurrency, max(1, total_products))
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="shopify-create",
+        ) as executor:
+            pending = {}
+            while len(pending) < worker_count:
+                try:
+                    key = next(key_iterator)
+                except StopIteration:
+                    break
+                pending[submit_product(executor, key)] = key
 
-                    returned_variants = (
-                        product_response.get(
-                            "variants",
-                            {},
-                        ).get("nodes", [])
-                    )
-                    _verify_inventory_delivery_fields(
-                        source_rows=rows,
-                        product_input=product_input,
-                        returned_variants=returned_variants,
-                    )
-
-                    succeeded_ops = 1
-                    variants_succeeded += len(rows)
-
-                    if publish_this_product:
-                        publication_result = (
-                            _publish_product_to_all_publications(
-                                client=client,
-                                product_gid=gp._safe_str(
-                                    product_response.get("id")
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    product_key = pending.pop(future)
+                    try:
+                        outcome = future.result()
+                    except BaseException as exc:
+                        rows = product_rows[product_key]
+                        product_input = product_inputs[product_key]
+                        outcome = {
+                            "product_key": product_key,
+                            "rows": list(rows),
+                            "status": "FAILED",
+                            "message": str(exc),
+                            "error_reason": type(exc).__name__,
+                            "product_response": None,
+                            "product_input": product_input,
+                            "result_rows": _result_rows_for_product(
+                                run_id=run_id,
+                                applied_at=applied_at,
+                                site_code=site_code,
+                                runtime_mode=gp._runtime_mode(),
+                                dry_run=dry_run,
+                                product_key=product_key,
+                                source_rows=rows,
+                                status="FAILED",
+                                message=str(exc),
+                                error_reason=type(exc).__name__,
+                                product_response=None,
+                                product_input=product_input,
+                                admin_product_base_url=admin_product_base_url,
+                                storefront_product_base_url=(
+                                    storefront_product_base_url
                                 ),
-                                publications=publications,
-                            )
-                        )
-                        if publication_result["user_errors"]:
-                            status = "PARTIAL_FAILURE"
-                            failed_ops = 1
-                            products_failed += 1
-                            message = (
-                                "Product created, but all-channel "
-                                "publication returned errors: "
-                                + json.dumps(
-                                    publication_result["user_errors"],
-                                    ensure_ascii=False,
-                                )
-                            )
-                            error_reason = (
-                                "PUBLISHABLE_PUBLISH_USER_ERROR"
-                            )
-                        else:
-                            status = "SUCCESS"
-                            succeeded_ops = 2
-                            products_succeeded += 1
-                            if gp._safe_str(
-                                product_input.get("status")
-                            ).upper() == "DRAFT":
-                                message = (
-                                    "Product and Variants created as DRAFT; "
-                                    f"associated with "
-                                    f"{publication_result['planned_count']} "
-                                    "Shopify Publications. The Product "
-                                    "remains unavailable to customers until "
-                                    "its status becomes ACTIVE."
-                                )
-                            else:
-                                message = (
-                                    "Product and Variants created as ACTIVE; "
-                                    f"published to "
-                                    f"{publication_result['planned_count']} "
-                                    "Shopify Publications."
-                                )
-                    else:
-                        status = "SUCCESS"
-                        products_succeeded += 1
-                        message = (
-                            "Product and all Variants created by "
-                            "synchronous productSet; channel "
-                            "publication disabled."
-                        )
+                                api_operations_planned=1,
+                                api_operations_succeeded=0,
+                                api_operations_failed=1,
+                                publication_result={
+                                    "publication_ids": [],
+                                    "planned_count": 0,
+                                    "published_count": 0,
+                                },
+                            ),
+                            "product_result": {
+                                "product_key": gp._safe_str(
+                                    rows[0].get("sys.product_key")
+                                ),
+                                "status": "FAILED",
+                                "message": str(exc),
+                                "product_gid": "",
+                                "handle": product_key,
+                                "variants": len(rows),
+                                "category_id": "",
+                                "template_suffix": "",
+                                "publish_all_channels": False,
+                                "publications_planned": 0,
+                                "publications_published": 0,
+                            },
+                            "products_succeeded": 0,
+                            "products_failed": 1,
+                            "products_skipped_handle_exists": 0,
+                            "variants_succeeded": 0,
+                            "variants_failed": len(rows),
+                            "variants_skipped_handle_exists": 0,
+                        }
 
-                if dry_run:
-                    products_succeeded += 0
+                    completed_products += 1
+                    rows = outcome["rows"]
+                    status = outcome["status"]
+                    products_succeeded += outcome["products_succeeded"]
+                    products_failed += outcome["products_failed"]
+                    products_skipped_handle_exists += outcome[
+                        "products_skipped_handle_exists"
+                    ]
+                    variants_succeeded += outcome["variants_succeeded"]
+                    variants_failed += outcome["variants_failed"]
+                    variants_skipped_handle_exists += outcome[
+                        "variants_skipped_handle_exists"
+                    ]
+                    product_results.append(outcome["product_result"])
+                    result_rows.extend(outcome["result_rows"])
+                    result_rows_buffer.extend(outcome["result_rows"])
+                    products_since_result_flush += 1
 
-            except Exception as exc:
-                status = "FAILED"
-                message = str(exc)
-                error_reason = type(exc).__name__
-                failed_ops = 1
-                products_failed += 1
-                variants_failed += len(rows)
-
-            result_rows.extend(
-                _result_rows_for_product(
-                    run_id=run_id,
-                    applied_at=applied_at,
-                    site_code=site_code,
-                    runtime_mode=gp._runtime_mode(),
-                    dry_run=dry_run,
-                    product_key=product_key,
-                    source_rows=rows,
-                    status=status,
-                    message=message,
-                    error_reason=error_reason,
-                    product_response=product_response,
-                    product_input=product_input,
-                    admin_product_base_url=(
-                        admin_product_base_url
-                    ),
-                    storefront_product_base_url=(
-                        storefront_product_base_url
-                    ),
-                    api_operations_planned=(
-                        0
-                        if duplicate_match
-                        else (2 if publish_this_product else 1)
-                    ),
-                    api_operations_succeeded=succeeded_ops,
-                    api_operations_failed=failed_ops,
-                    publication_result=publication_result,
-                )
-            )
-            product_results.append(
-                {
-                    "product_key": gp._safe_str(
-                        rows[0].get("sys.product_key")
-                    ),
-                    "status": status,
-                    "message": message,
-                    "product_gid": gp._safe_str(
-                        (product_response or {}).get("id")
-                    ),
-                    "handle": gp._safe_str(
-                        (product_response or {}).get(
-                            "handle"
-                        )
+                    logger.log(
+                        phase=phase,
+                        log_type="detail",
+                        status=status,
+                        entity_type="PRODUCT",
+                        gid=gp._safe_str(
+                            (outcome["product_response"] or {}).get("id")
+                        ),
+                        rows_loaded=prepare_plan["stats"]["rows_loaded"],
+                        rows_pending=sum(
+                            len(items) for items in product_rows.values()
+                        ),
+                        rows_recognized=prepare_plan["stats"][
+                            "rows_recognized"
+                        ],
+                        rows_planned=len(rows),
+                        rows_written=len(rows) if status == "SUCCESS" else 0,
+                        rows_skipped=(
+                            len(rows)
+                            if status
+                            in {"PLANNED", "FAILED", "SKIPPED_HANDLE_EXISTS"}
+                            else 0
+                        ),
+                        message=(
+                            f"handle={product_key} | source_product_key="
+                            f"{gp._safe_str(rows[0].get('sys.product_key'))} | "
+                            f"{outcome['message']}"
+                        ),
+                        error_reason=outcome["error_reason"],
                     )
-                    or gp._safe_str(
-                        product_input.get("handle")
-                    ),
-                    "variants": len(rows),
-                    "category_id": gp._safe_str(
-                        product_input.get("category")
-                    ),
-                    "template_suffix": gp._safe_str(
-                        product_input.get("templateSuffix")
-                    ),
-                    "publish_all_channels": publish_this_product,
-                    "publications_planned": publication_result.get(
-                        "planned_count",
-                        0,
-                    ),
-                    "publications_published": publication_result.get(
-                        "published_count",
-                        0,
-                    ),
-                }
-            )
 
-            logger.log(
-                phase=phase,
-                log_type="detail",
-                status=status,
-                entity_type="PRODUCT",
-                gid=gp._safe_str(
-                    (product_response or {}).get("id")
-                ),
-                rows_loaded=prepare_plan["stats"][
-                    "rows_loaded"
-                ],
-                rows_pending=sum(
-                    len(items)
-                    for items in product_rows.values()
-                ),
-                rows_recognized=prepare_plan["stats"][
-                    "rows_recognized"
-                ],
-                rows_planned=len(rows),
-                rows_written=(
-                    len(rows)
-                    if status == "SUCCESS"
-                    else 0
-                ),
-                rows_skipped=(
-                    len(rows)
-                    if status in {
-                        "PLANNED",
-                        "FAILED",
-                        "SKIPPED_HANDLE_EXISTS",
-                    }
-                    else 0
-                ),
-                message=(
-                    f"handle={product_key} | "
-                    f"source_product_key="
-                    f"{gp._safe_str(rows[0].get('sys.product_key'))} | "
-                    f"{message}"
-                ),
-                error_reason=error_reason,
-            )
+                    if (
+                        result_writer is not None
+                        and (
+                            products_since_result_flush >= result_flush_every
+                            or completed_products == total_products
+                        )
+                    ):
+                        written = result_writer.append(result_rows_buffer)
+                        result_rows_written += written
+                        result_flush_count += 1
+                        if print_progress:
+                            print(
+                                "[Result flush] "
+                                f"batch={result_flush_count} | "
+                                f"products={products_since_result_flush} | "
+                                f"rows={written} | total_rows_written="
+                                f"{result_rows_written}"
+                            )
+                        result_rows_buffer.clear()
+                        products_since_result_flush = 0
 
-            if product_progress_every and (
-                index % product_progress_every == 0
-                or index == total_products
-            ):
+                    if status == "FAILED" and stop_on_first_error:
+                        stop_requested = True
+
+                    if product_progress_every and (
+                        completed_products % product_progress_every == 0
+                        or completed_products == total_products
+                    ):
+                        processing_elapsed = max(
+                            0.001, time.monotonic() - processing_started
+                        )
+                        rate = completed_products / processing_elapsed
+                        remaining = max(0, total_products - completed_products)
+                        eta_seconds = remaining / rate if rate > 0 else 0
+                        print(
+                            "[Apply progress] "
+                            f"completed={completed_products}/{total_products} | "
+                            f"running={len(pending)} | "
+                            f"success={products_succeeded} | "
+                            f"failed={products_failed} | "
+                            f"handle_exists_skipped="
+                            f"{products_skipped_handle_exists} | "
+                            f"result_buffer_products="
+                            f"{products_since_result_flush}/"
+                            f"{result_flush_every} | "
+                            f"rate={rate:.2f}/s | eta={eta_seconds:.0f}s"
+                        )
+
+                while not stop_requested and len(pending) < worker_count:
+                    try:
+                        key = next(key_iterator)
+                    except StopIteration:
+                        break
+                    pending[submit_product(executor, key)] = key
+
+        if result_writer is not None and result_rows_buffer:
+            written = result_writer.append(result_rows_buffer)
+            result_rows_written += written
+            result_flush_count += 1
+            if print_progress:
                 print(
-                    "[Apply progress] "
-                    f"{index}/{total_products} | "
-                    f"products_succeeded={products_succeeded} | "
-                    f"products_failed={products_failed} | "
-                    f"handle_exists_skipped="
-                    f"{products_skipped_handle_exists} | "
-                    f"variants_succeeded={variants_succeeded} | "
-                    f"variants_failed={variants_failed}"
+                    "[Result flush] "
+                    f"batch={result_flush_count} | "
+                    f"products={products_since_result_flush} | "
+                    f"rows={written} | total_rows_written="
+                    f"{result_rows_written}"
                 )
+            result_rows_buffer.clear()
+            products_since_result_flush = 0
 
-            if status == "FAILED" and stop_on_first_error:
-                break
-
-        progress(
-            11,
-            12,
-            "Write Result and RunLog evidence",
-        )
-        result_rows_written = 0
-        if write_result:
-            result_ws = _ensure_result_header(
-                create_book,
-                tab_result,
-            )
-            result_rows_written = _append_result_rows(
-                result_ws,
-                result_rows,
-            )
+        progress(11, 12, "Finalize Result and RunLog evidence")
 
         if dry_run:
             final_status = (
@@ -2880,6 +3064,9 @@ def run(
                 f"variants_succeeded={variants_succeeded} | "
                 f"variants_failed={variants_failed} | "
                 f"result_rows_written={result_rows_written} | "
+                f"result_flushes={result_flush_count} | "
+                f"product_concurrency={worker_count} | "
+                f"products_completed={completed_products} | "
                 f"shopify_requests={client.request_count} | "
                 f"shopify_retries={client.retry_count}"
             ),
@@ -2989,6 +3176,13 @@ def run(
                 ),
                 "variants_failed": variants_failed,
                 "result_rows_written": result_rows_written,
+                "result_flush_count": result_flush_count,
+                "result_flush_every": result_flush_every,
+                "product_concurrency": worker_count,
+                "products_completed": completed_products,
+                "products_not_processed": max(
+                    0, total_products - completed_products
+                ),
                 "shopify_requests": client.request_count,
                 "shopify_retries": client.retry_count,
                 "publications_available": len(publications),
@@ -3045,6 +3239,8 @@ def run(
                 ),
                 "shop_domain": shop_domain,
                 "api_version": api_version,
+                "product_concurrency": worker_count,
+                "result_flush_every": result_flush_every,
             },
             "targets": {
                 "create_sheet_url": create_url,
@@ -3111,6 +3307,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
     )
     parser.add_argument("--max-products", type=int, default=5)
+    parser.add_argument("--product-concurrency", type=int, default=4)
+    parser.add_argument("--result-flush-every", type=int, default=20)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--confirmed", action="store_true")
     parser.add_argument("--secret-home", default="")
@@ -3130,6 +3328,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.apply_all_ready_products
         ),
         max_products_per_run=args.max_products,
+        product_concurrency=args.product_concurrency,
+        result_flush_every=args.result_flush_every,
         dry_run=not args.apply,
         confirmed=args.confirmed,
         secret_home=args.secret_home or None,
