@@ -9,7 +9,8 @@ Safety model
 1. Re-read Input, Defaults, Cfg__Fields and Cfg__Locations.
 2. Rebuild the Prepare plan using ``shopify_create.generic_prepare``.
 3. Compare the rebuilt plan with the existing Preview snapshot.
-4. Query Shopify again for Handle conflicts only.
+4. Query Shopify by ``core.handle`` only. Existing Handles are skipped,
+   written to Result, and never treated as Apply errors.
 5. Resolve every accessible Shopify Publication when all-channel
    publishing is enabled.
 5. DRY_RUN produces a final execution plan without Shopify writes.
@@ -21,9 +22,11 @@ Safety model
 9. Result and RunLog retain execution evidence.
 10. Images/media are intentionally out of scope.
 
-``core.handle`` is the sole Preview identity. The paired Prepare module
-reports only missing or duplicated Handles. Other Input differences are
-not Preview blockers. The module uses Shopify Admin GraphQL
+``core.handle`` is the only Shopify existence-check field. SKU, Barcode,
+Product Key, Variant Key, Title, and every other field are excluded from
+duplicate lookup. An existing Handle is not uploaded and is recorded in
+Result with status ``SKIPPED_HANDLE_EXISTS``. The module uses Shopify
+Admin GraphQL
 ``productSet``
 synchronously to create
 a Product with its options, variants, product/variant metafields, inventory
@@ -53,7 +56,7 @@ from zoneinfo import ZoneInfo
 from shopify_create import generic_prepare as gp
 
 
-MODULE_VERSION = "1.5.5"
+MODULE_VERSION = "1.5.6"
 MODULE_PATH = "shopify_create.generic_apply"
 DEFAULT_JOB_NAME = "generic_create_apply"
 EXPECTED_PREPARE_MODULE_VERSION = "1.6.5"
@@ -1286,11 +1289,14 @@ def _preflight_shopify_handle_conflicts(
     product_rows: Mapping[str, Sequence[Mapping[str, str]]],
     progress_every: int,
 ) -> Dict[str, Any]:
-    """Block only when the target Product Handle already exists.
+    """Query Shopify by core.handle only.
 
-    SKU and Barcode are intentionally excluded from duplicate checks.
+    Existing Handles are normal skip results, not errors or warnings.
+    No SKU, Barcode, Product Key, Variant Key, Title, or other field is queried.
     """
-    errors: List[Dict[str, Any]] = []
+    duplicates: List[Dict[str, Any]] = []
+    duplicates_by_handle: Dict[str, Dict[str, Any]] = {}
+
     handles = sorted({
         gp._safe_str(rows[0].get("core.handle"))
         for rows in product_rows.values()
@@ -1302,37 +1308,47 @@ def _preflight_shopify_handle_conflicts(
         data = client.gql(
             Q_PRODUCT_BY_HANDLE,
             {"identifier": {"handle": handle}},
-            operation_name="preflight_handle",
+            operation_name="handle_exists_check",
         )
         product = data.get("product")
         if product:
-            errors.append(
-                {
-                    "code": "HANDLE_ALREADY_EXISTS",
-                    "value": handle,
-                    "matches": [product],
-                }
-            )
+            normalized_product = {
+                "id": gp._safe_str(product.get("id")),
+                "handle": gp._safe_str(product.get("handle")) or handle,
+                "title": gp._safe_str(product.get("title")),
+                "status": gp._safe_str(product.get("status")),
+            }
+            duplicate = {
+                "code": "HANDLE_ALREADY_EXISTS",
+                "handle": handle,
+                "existing_product": normalized_product,
+            }
+            duplicates.append(duplicate)
+            duplicates_by_handle[handle] = normalized_product
 
         if progress_every and (
             completed % progress_every == 0
             or completed == total_checks
         ):
             print(
-                "[Preflight] "
+                "[Handle check] "
                 f"{completed}/{total_checks} | "
-                f"handle_errors={len(errors)}"
+                f"existing={len(duplicates)}"
             )
 
     return {
-        "errors": errors,
-        "warnings": [],
+        "duplicates": duplicates,
+        "duplicates_by_handle": duplicates_by_handle,
         "checks": total_checks,
         "identity_field": "core.handle",
+        "queried_fields": ["core.handle"],
         "sku_checked": False,
         "barcode_checked": False,
+        "product_key_checked": False,
+        "variant_key_checked": False,
+        "errors": [],
+        "warnings": [],
     }
-
 
 def _source_option_signature(
     variant_input: Mapping[str, Any],
@@ -1817,7 +1833,7 @@ def _result_rows_for_product(
         else []
     )
     matched_returned_variants: List[Mapping[str, Any]] = []
-    if product_response:
+    if product_response and status != "SKIPPED_HANDLE_EXISTS":
         matched_returned_variants = (
             _match_returned_variants_by_options(
                 source_rows=source_rows,
@@ -1962,6 +1978,54 @@ def _result_rows_for_product(
             ]
         )
     return result_rows
+
+
+def _result_only_product_input(
+    rows: Sequence[Mapping[str, str]],
+) -> Dict[str, Any]:
+    """Build non-validating Result metadata for an existing Handle."""
+    first = rows[0] if rows else {}
+    variants: List[Dict[str, Any]] = []
+
+    for row in rows:
+        option_values: List[Dict[str, str]] = []
+        for number in (1, 2, 3):
+            name = gp._safe_str(
+                row.get(f"core.option{number}_name")
+            )
+            value = gp._safe_str(
+                row.get(f"core.option{number}_value")
+            )
+            if name and value:
+                option_values.append(
+                    {
+                        "optionName": name,
+                        "name": value,
+                    }
+                )
+        variants.append({"optionValues": option_values})
+
+    result: Dict[str, Any] = {
+        "title": gp._safe_str(first.get("core.title")),
+        "handle": gp._safe_str(first.get("core.handle")),
+        "status": (
+            gp._safe_str(first.get("core.status")).upper()
+            or "DRAFT"
+        ),
+        "variants": variants,
+    }
+
+    category_id = gp._safe_str(first.get("core.category_id"))
+    if category_id:
+        result["category"] = category_id
+
+    template_suffix = gp._safe_str(
+        first.get("core.template_suffix")
+    )
+    if template_suffix:
+        result["templateSuffix"] = template_suffix
+
+    return result
 
 
 def run(
@@ -2192,37 +2256,12 @@ def run(
             prepare_plan=prepare_plan,
             selected_product_keys=selected_product_keys,
         )
-        _attach_location_gids(
-            product_rows=product_rows,
-            locations=locations,
-        )
         print(
             "[Selection] "
             f"products={len(selected_product_keys)} | "
             f"variants={sum(len(rows) for rows in product_rows.values())} | "
             f"handles={selected_product_keys}"
         )
-
-        progress(
-            7,
-            12,
-            "Build final ProductSet execution payloads",
-        )
-        product_inputs: Dict[str, Dict[str, Any]] = {}
-        for product_key in selected_product_keys:
-            product_inputs[product_key] = (
-                _build_product_set_input(
-                    product_key=product_key,
-                    rows=product_rows[product_key],
-                    ordered_field_keys=prepare_plan[
-                        "ordered_field_keys"
-                    ],
-                    cfg_fields=cfg_fields,
-                    allow_non_draft_status=(
-                        allow_non_draft_status
-                    ),
-                )
-            )
 
         shop_domain = gp._safe_str(
             account.get("SHOP_DOMAIN")
@@ -2247,7 +2286,7 @@ def run(
             )
 
         progress(
-            8,
+            7,
             12,
             "Resolve Shopify token and initialize client",
         )
@@ -2278,9 +2317,66 @@ def run(
             print_progress=print_progress,
         )
 
+        progress(
+            8,
+            12,
+            "Query Shopify by core.handle only",
+        )
+        conflict_result = _preflight_shopify_handle_conflicts(
+            client=client,
+            product_rows=product_rows,
+            progress_every=preflight_progress_every,
+        )
+        duplicate_handles = set(
+            conflict_result["duplicates_by_handle"]
+        )
+        print(
+            "[Handle check result] "
+            f"checked={conflict_result['checks']} | "
+            f"existing={len(duplicate_handles)} | "
+            f"new={len(selected_product_keys) - len(duplicate_handles)}"
+        )
+
+        upload_product_rows = {
+            handle: rows
+            for handle, rows in product_rows.items()
+            if handle not in duplicate_handles
+        }
+        if upload_product_rows:
+            _attach_location_gids(
+                product_rows=upload_product_rows,
+                locations=locations,
+            )
+
+        progress(
+            9,
+            12,
+            "Build payloads for new Handles only",
+        )
+        product_inputs: Dict[str, Dict[str, Any]] = {}
+        for handle in selected_product_keys:
+            rows = product_rows[handle]
+            if handle in duplicate_handles:
+                product_inputs[handle] = (
+                    _result_only_product_input(rows)
+                )
+                continue
+
+            product_inputs[handle] = _build_product_set_input(
+                product_key=handle,
+                rows=rows,
+                ordered_field_keys=prepare_plan[
+                    "ordered_field_keys"
+                ],
+                cfg_fields=cfg_fields,
+                allow_non_draft_status=(
+                    allow_non_draft_status
+                ),
+            )
+
         publish_product_keys = {
-            product_key
-            for product_key, rows in product_rows.items()
+            handle
+            for handle, rows in upload_product_rows.items()
             if rows
             and gp._normalize_bool(
                 rows[0].get("publish.all_channels")
@@ -2290,40 +2386,14 @@ def run(
         if publish_product_keys:
             print(
                 "[Publications] resolving all accessible "
-                "Shopify channels..."
+                "Shopify channels for new Handles only..."
             )
             publications = _list_all_publications(client)
             print(
                 "[Publications] "
                 f"count={len(publications)} | "
-                f"auto_publish={sum(1 for item in publications if item['auto_publish'])}"
-            )
-
-        progress(
-            9,
-            12,
-            "Real-time Shopify Handle conflict preflight",
-        )
-        conflict_result = _preflight_shopify_handle_conflicts(
-            client=client,
-            product_rows=product_rows,
-            progress_every=preflight_progress_every,
-        )
-        if conflict_result["errors"]:
-            raise ValueError(
-                "Shopify conflict preflight failed: "
-                + json.dumps(
-                    conflict_result["errors"][:20],
-                    ensure_ascii=False,
-                )
-            )
-        if conflict_result["warnings"]:
-            print(
-                "[Preflight warnings] "
-                + json.dumps(
-                    conflict_result["warnings"][:20],
-                    ensure_ascii=False,
-                )
+                f"auto_publish="
+                f"{sum(1 for item in publications if item['auto_publish'])}"
             )
 
         progress(
@@ -2339,8 +2409,10 @@ def run(
         product_results: List[Dict[str, Any]] = []
         products_succeeded = 0
         products_failed = 0
+        products_skipped_handle_exists = 0
         variants_succeeded = 0
         variants_failed = 0
+        variants_skipped_handle_exists = 0
 
         applied_at = gp._now_str(tz_name)
         admin_product_base_url = gp._safe_str(
@@ -2357,7 +2429,14 @@ def run(
         ):
             rows = product_rows[product_key]
             product_input = product_inputs[product_key]
-            product_response: Optional[Dict[str, Any]] = None
+            duplicate_match = conflict_result[
+                "duplicates_by_handle"
+            ].get(product_key)
+            product_response: Optional[Dict[str, Any]] = (
+                dict(duplicate_match)
+                if duplicate_match
+                else None
+            )
             status = ""
             message = ""
             error_reason = ""
@@ -2365,6 +2444,7 @@ def run(
             failed_ops = 0
             publish_this_product = (
                 product_key in publish_product_keys
+                and duplicate_match is None
             )
             publication_result: Dict[str, Any] = {
                 "publication_ids": [
@@ -2380,7 +2460,28 @@ def run(
             }
 
             try:
-                if dry_run:
+                if duplicate_match:
+                    status = "SKIPPED_HANDLE_EXISTS"
+                    products_skipped_handle_exists += 1
+                    variants_skipped_handle_exists += len(rows)
+                    publication_result = {
+                        "publication_ids": [],
+                        "planned_count": 0,
+                        "published_count": 0,
+                        "user_errors": [],
+                    }
+                    message = (
+                        "Handle already exists in Shopify. "
+                        "Product was not uploaded. "
+                        f"handle={product_key}; "
+                        f"existing_product_gid="
+                        f"{gp._safe_str(duplicate_match.get('id'))}; "
+                        f"existing_title="
+                        f"{gp._safe_str(duplicate_match.get('title'))}; "
+                        f"existing_status="
+                        f"{gp._safe_str(duplicate_match.get('status'))}."
+                    )
+                elif dry_run:
                     status = "PLANNED"
                     message = (
                         "DRY_RUN: Shopify productSet was not called. "
@@ -2527,7 +2628,9 @@ def run(
                         storefront_product_base_url
                     ),
                     api_operations_planned=(
-                        2 if publish_this_product else 1
+                        0
+                        if duplicate_match
+                        else (2 if publish_this_product else 1)
                     ),
                     api_operations_succeeded=succeeded_ops,
                     api_operations_failed=failed_ops,
@@ -2597,7 +2700,11 @@ def run(
                 ),
                 rows_skipped=(
                     len(rows)
-                    if status in {"PLANNED", "FAILED"}
+                    if status in {
+                        "PLANNED",
+                        "FAILED",
+                        "SKIPPED_HANDLE_EXISTS",
+                    }
                     else 0
                 ),
                 message=(
@@ -2618,6 +2725,8 @@ def run(
                     f"{index}/{total_products} | "
                     f"products_succeeded={products_succeeded} | "
                     f"products_failed={products_failed} | "
+                    f"handle_exists_skipped="
+                    f"{products_skipped_handle_exists} | "
                     f"variants_succeeded={variants_succeeded} | "
                     f"variants_failed={variants_failed}"
                 )
@@ -2694,6 +2803,8 @@ def run(
                 f"products_selected={len(selected_product_keys)} | "
                 f"products_succeeded={products_succeeded} | "
                 f"products_failed={products_failed} | "
+                f"products_skipped_handle_exists="
+                f"{products_skipped_handle_exists} | "
                 f"variants_succeeded={variants_succeeded} | "
                 f"variants_failed={variants_failed} | "
                 f"result_rows_written={result_rows_written} | "
@@ -2763,7 +2874,15 @@ def run(
                     selected_product_keys
                 ),
                 "api_operations_planned": sum(
-                    2 if key in publish_product_keys else 1
+                    (
+                        0
+                        if key in duplicate_handles
+                        else (
+                            2
+                            if key in publish_product_keys
+                            else 1
+                        )
+                    )
                     for key in selected_product_keys
                 ),
                 "api_operations_succeeded": sum(
@@ -2789,7 +2908,13 @@ def run(
                 "api_operations_failed": products_failed,
                 "products_succeeded": products_succeeded,
                 "products_failed": products_failed,
+                "products_skipped_handle_exists": (
+                    products_skipped_handle_exists
+                ),
                 "variants_succeeded": variants_succeeded,
+                "variants_skipped_handle_exists": (
+                    variants_skipped_handle_exists
+                ),
                 "variants_failed": variants_failed,
                 "result_rows_written": result_rows_written,
                 "shopify_requests": client.request_count,
@@ -2801,7 +2926,19 @@ def run(
                 "elapsed_seconds": elapsed,
             },
             "products": product_results,
-            "warnings": conflict_result["warnings"],
+            "warnings": [],
+            "handle_check": {
+                "identity_field": "core.handle",
+                "checked": conflict_result["checks"],
+                "existing_count": len(
+                    conflict_result["duplicates"]
+                ),
+                "duplicates": conflict_result["duplicates"],
+                "sku_checked": False,
+                "barcode_checked": False,
+                "product_key_checked": False,
+                "variant_key_checked": False,
+            },
             "preview_verification": preview_verification,
             "runtime": {
                 "runtime_mode": gp._runtime_mode(),
