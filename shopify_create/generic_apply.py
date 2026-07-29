@@ -9,8 +9,11 @@ Safety model
 1. Re-read current Input, Defaults, Cfg__Fields and Cfg__Locations.
 2. Rebuild rows from current Input using ``generic_prepare``.
 3. Do not read, compare, or require the Preview tab.
-4. Query Shopify by ``core.handle`` only. Existing Handles are skipped,
-   written to Result, and never treated as Apply errors.
+4. Read existing Handles once from the create workbook Tab
+   ``V_Product_Handle`` and compare the ``Product Handle`` column locally.
+   No Shopify API request is used for duplicate lookup.
+5. Existing Handles are skipped, written to Result, and never treated as
+   Apply errors.
 5. Resolve every accessible Shopify Publication when all-channel
    publishing is enabled.
 5. DRY_RUN produces a final execution plan without Shopify writes.
@@ -22,11 +25,12 @@ Safety model
 9. Result and RunLog retain execution evidence.
 10. Images/media are intentionally out of scope.
 
-``core.handle`` is the only Shopify existence-check field. SKU, Barcode,
-Product Key, Variant Key, Title, and every other field are excluded from
-duplicate lookup. An existing Handle is not uploaded and is recorded in
-Result with status ``SKIPPED_HANDLE_EXISTS``. The module uses Shopify
-Admin GraphQL
+``core.handle`` is the only existence-check field. Existing Handles are
+loaded once from ``V_Product_Handle`` column ``Product Handle`` and compared
+locally. SKU, Barcode, Product Key, Variant Key, numeric IDs, Title, and
+every other field are ignored. An existing Handle is not uploaded and is
+recorded in Result with status ``SKIPPED_HANDLE_EXISTS``. Shopify Admin
+GraphQL is used only for actual create/publication operations.
 ``productSet``
 synchronously to create
 a Product with its options, variants, product/variant metafields, inventory
@@ -56,7 +60,7 @@ from zoneinfo import ZoneInfo
 from shopify_create import generic_prepare as gp
 
 
-MODULE_VERSION = "1.5.7"
+MODULE_VERSION = "1.5.8"
 MODULE_PATH = "shopify_create.generic_apply"
 DEFAULT_JOB_NAME = "generic_create_apply"
 EXPECTED_PREPARE_MODULE_VERSION = "1.6.5"
@@ -105,17 +109,6 @@ RESULT_HEADERS = LEGACY_RESULT_HEADERS + [
     "publications_published",
     "publication_ids",
 ]
-
-Q_PRODUCT_BY_HANDLE = """
-query ProductByHandle($identifier: ProductIdentifierInput!) {
-  product: productByIdentifier(identifier: $identifier) {
-    id
-    handle
-    title
-    status
-  }
-}
-"""
 
 Q_PUBLICATIONS_PAGE = """
 query PublicationsPage($first: Int!, $after: String) {
@@ -1283,17 +1276,77 @@ def _attach_location_gids(
             )
 
 
-def _preflight_shopify_handle_conflicts(
-    *,
-    client: ShopifyClient,
-    product_rows: Mapping[str, Sequence[Mapping[str, str]]],
-    progress_every: int,
-) -> Dict[str, Any]:
-    """Query Shopify by core.handle only.
+def _normalize_handle_lookup(value: Any) -> str:
+    """Normalize a Handle for local snapshot comparison only."""
+    return gp._safe_str(value).casefold()
 
-    Existing Handles are normal skip results, not errors or warnings.
-    No SKU, Barcode, Product Key, Variant Key, Title, or other field is queried.
-    """
+
+def _read_existing_product_handle_snapshot(
+    values: Sequence[Sequence[Any]],
+    *,
+    header_name: str,
+    tab_name: str,
+) -> Dict[str, Any]:
+    """Read only the Product Handle column from V_Product_Handle."""
+    if not values:
+        raise ValueError(
+            f"{tab_name} is empty."
+        )
+
+    normalized_target = gp._safe_str(header_name).casefold()
+    headers = [
+        gp._safe_str(value)
+        for value in values[0]
+    ]
+    matches = [
+        index
+        for index, header in enumerate(headers)
+        if header.casefold() == normalized_target
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"{tab_name} must contain exactly one "
+            f"{header_name!r} column; matches={len(matches)}; "
+            f"headers={headers}."
+        )
+
+    handle_index = matches[0]
+    handles_by_normalized: Dict[str, str] = {}
+    nonblank_rows = 0
+
+    for row in values[1:]:
+        raw_handle = gp._safe_str(
+            row[handle_index]
+            if handle_index < len(row)
+            else ""
+        )
+        if not raw_handle:
+            continue
+        nonblank_rows += 1
+        normalized = _normalize_handle_lookup(raw_handle)
+        # Duplicate snapshot rows are silently deduplicated.
+        handles_by_normalized.setdefault(
+            normalized,
+            raw_handle,
+        )
+
+    return {
+        "tab_name": tab_name,
+        "header_name": header_name,
+        "rows_loaded": max(0, len(values) - 1),
+        "nonblank_handle_rows": nonblank_rows,
+        "unique_handles": len(handles_by_normalized),
+        "handles_by_normalized": handles_by_normalized,
+    }
+
+
+def _check_handles_against_snapshot(
+    *,
+    product_rows: Mapping[str, Sequence[Mapping[str, str]]],
+    snapshot: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Compare selected core.handle values against the local snapshot only."""
+    existing_lookup = snapshot["handles_by_normalized"]
     duplicates: List[Dict[str, Any]] = []
     duplicates_by_handle: Dict[str, Dict[str, Any]] = {}
 
@@ -1303,49 +1356,57 @@ def _preflight_shopify_handle_conflicts(
         if rows and gp._safe_str(rows[0].get("core.handle"))
     })
 
-    total_checks = len(handles)
-    for completed, handle in enumerate(handles, start=1):
-        data = client.gql(
-            Q_PRODUCT_BY_HANDLE,
-            {"identifier": {"handle": handle}},
-            operation_name="handle_exists_check",
-        )
-        product = data.get("product")
-        if product:
-            normalized_product = {
-                "id": gp._safe_str(product.get("id")),
-                "handle": gp._safe_str(product.get("handle")) or handle,
-                "title": gp._safe_str(product.get("title")),
-                "status": gp._safe_str(product.get("status")),
-            }
-            duplicate = {
-                "code": "HANDLE_ALREADY_EXISTS",
-                "handle": handle,
-                "existing_product": normalized_product,
-            }
-            duplicates.append(duplicate)
-            duplicates_by_handle[handle] = normalized_product
+    for handle in handles:
+        normalized = _normalize_handle_lookup(handle)
+        snapshot_handle = existing_lookup.get(normalized)
+        if snapshot_handle is None:
+            continue
 
-        if progress_every and (
-            completed % progress_every == 0
-            or completed == total_checks
-        ):
-            print(
-                "[Handle check] "
-                f"{completed}/{total_checks} | "
-                f"existing={len(duplicates)}"
-            )
+        existing_product = {
+            "id": "",
+            "handle": snapshot_handle,
+            "title": "",
+            "status": "",
+            "source_tab": gp._safe_str(
+                snapshot.get("tab_name")
+            ),
+        }
+        duplicate = {
+            "code": "HANDLE_ALREADY_EXISTS",
+            "handle": handle,
+            "existing_product": existing_product,
+        }
+        duplicates.append(duplicate)
+        duplicates_by_handle[handle] = existing_product
 
     return {
         "duplicates": duplicates,
         "duplicates_by_handle": duplicates_by_handle,
-        "checks": total_checks,
+        "checks": len(handles),
         "identity_field": "core.handle",
+        "source_tab": gp._safe_str(
+            snapshot.get("tab_name")
+        ),
+        "source_header": gp._safe_str(
+            snapshot.get("header_name")
+        ),
+        "snapshot_rows_loaded": int(
+            snapshot.get("rows_loaded", 0)
+        ),
+        "snapshot_nonblank_handle_rows": int(
+            snapshot.get("nonblank_handle_rows", 0)
+        ),
+        "snapshot_unique_handles": int(
+            snapshot.get("unique_handles", 0)
+        ),
         "queried_fields": ["core.handle"],
+        "shopify_handle_api_requests": 0,
         "sku_checked": False,
         "barcode_checked": False,
         "product_key_checked": False,
         "variant_key_checked": False,
+        "product_id_checked": False,
+        "variant_id_checked": False,
         "errors": [],
         "warnings": [],
     }
@@ -2043,6 +2104,8 @@ def run(
     tab_input: str = "Input",
     tab_defaults: str = "Defaults",
     tab_preview: str = "Preview",
+    tab_product_handle: str = "V_Product_Handle",
+    product_handle_header: str = "Product Handle",
     tab_result: str = "Result",
     tab_runlog: str = "Ops__RunLog",
     only_product_keys: Optional[Iterable[str]] = None,
@@ -2160,8 +2223,8 @@ def run(
         progress(
             3,
             12,
-            "Re-read current Input, Defaults, Cfg__Fields, "
-            "and Cfg__Locations",
+            "Read current Input, Defaults, V_Product_Handle, "
+            "Cfg__Fields, and Cfg__Locations",
         )
         input_values = gp._require_worksheet(
             create_book,
@@ -2170,6 +2233,10 @@ def run(
         defaults_values = gp._require_worksheet(
             create_book,
             tab_defaults,
+        ).get_all_values()
+        product_handle_values = gp._require_worksheet(
+            create_book,
+            tab_product_handle,
         ).get_all_values()
         cfg_values = gp._require_worksheet(
             config_book,
@@ -2191,6 +2258,21 @@ def run(
         locations = gp._read_locations(
             location_values,
             site_code,
+        )
+        existing_handle_snapshot = (
+            _read_existing_product_handle_snapshot(
+                product_handle_values,
+                header_name=product_handle_header,
+                tab_name=tab_product_handle,
+            )
+        )
+        print(
+            "[Existing Handle snapshot] "
+            f"tab={tab_product_handle} | "
+            f"header={product_handle_header} | "
+            f"rows={existing_handle_snapshot['rows_loaded']} | "
+            f"nonblank={existing_handle_snapshot['nonblank_handle_rows']} | "
+            f"unique={existing_handle_snapshot['unique_handles']}"
         )
 
         progress(
@@ -2313,21 +2395,22 @@ def run(
         progress(
             8,
             12,
-            "Query Shopify by core.handle only",
+            "Compare core.handle with V_Product_Handle locally",
         )
-        conflict_result = _preflight_shopify_handle_conflicts(
-            client=client,
+        conflict_result = _check_handles_against_snapshot(
             product_rows=product_rows,
-            progress_every=preflight_progress_every,
+            snapshot=existing_handle_snapshot,
         )
         duplicate_handles = set(
             conflict_result["duplicates_by_handle"]
         )
         print(
             "[Handle check result] "
+            f"source={tab_product_handle}.{product_handle_header} | "
             f"checked={conflict_result['checks']} | "
             f"existing={len(duplicate_handles)} | "
-            f"new={len(selected_product_keys) - len(duplicate_handles)}"
+            f"new={len(selected_product_keys) - len(duplicate_handles)} | "
+            "shopify_handle_api_requests=0"
         )
 
         upload_product_rows = {
@@ -2464,15 +2547,11 @@ def run(
                         "user_errors": [],
                     }
                     message = (
-                        "Handle already exists in Shopify. "
+                        "Handle exists in V_Product_Handle. "
                         "Product was not uploaded. "
                         f"handle={product_key}; "
-                        f"existing_product_gid="
-                        f"{gp._safe_str(duplicate_match.get('id'))}; "
-                        f"existing_title="
-                        f"{gp._safe_str(duplicate_match.get('title'))}; "
-                        f"existing_status="
-                        f"{gp._safe_str(duplicate_match.get('status'))}."
+                        f"source_tab={tab_product_handle}; "
+                        f"source_header={product_handle_header}."
                     )
                 elif dry_run:
                     status = "PLANNED"
@@ -2922,15 +3001,30 @@ def run(
             "warnings": [],
             "handle_check": {
                 "identity_field": "core.handle",
+                "source_type": "GOOGLE_SHEETS_SNAPSHOT",
+                "source_tab": tab_product_handle,
+                "source_header": product_handle_header,
+                "snapshot_rows_loaded": conflict_result[
+                    "snapshot_rows_loaded"
+                ],
+                "snapshot_nonblank_handle_rows": conflict_result[
+                    "snapshot_nonblank_handle_rows"
+                ],
+                "snapshot_unique_handles": conflict_result[
+                    "snapshot_unique_handles"
+                ],
                 "checked": conflict_result["checks"],
                 "existing_count": len(
                     conflict_result["duplicates"]
                 ),
                 "duplicates": conflict_result["duplicates"],
+                "shopify_handle_api_requests": 0,
                 "sku_checked": False,
                 "barcode_checked": False,
                 "product_key_checked": False,
                 "variant_key_checked": False,
+                "product_id_checked": False,
+                "variant_id_checked": False,
             },
             "preview_verification": preview_verification,
             "preview_gate_disabled": True,
@@ -2954,6 +3048,8 @@ def run(
             },
             "targets": {
                 "create_sheet_url": create_url,
+                "product_handle_tab": tab_product_handle,
+                "product_handle_header": product_handle_header,
                 "result_tab": tab_result,
                 "runlog_sheet_url": runlog_url,
                 "runlog_tab": tab_runlog,
