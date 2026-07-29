@@ -53,7 +53,7 @@ from zoneinfo import ZoneInfo
 from shopify_create import generic_prepare as gp
 
 
-MODULE_VERSION = "1.5.3"
+MODULE_VERSION = "1.5.4"
 MODULE_PATH = "shopify_create.generic_apply"
 DEFAULT_JOB_NAME = "generic_create_apply"
 EXPECTED_PREPARE_MODULE_VERSION = "1.6.4"
@@ -579,37 +579,52 @@ def _verify_preview_snapshot(
     *,
     prepare_plan: Mapping[str, Any],
     preview_contract: Mapping[str, Any],
+    selected_handles: Sequence[str],
 ) -> Dict[str, Any]:
-    """Verify the Preview by physical source row.
+    """Verify only the selected Product rows by physical source row.
 
-    sys.variant_key is a trace value and may repeat across different Products.
+    Validation errors on unrelated Input rows must not block an explicitly
+    selected ready Product. sys.variant_key remains a trace value and may
+    repeat across different Handles.
     """
+    selected = {
+        gp._safe_str(value)
+        for value in selected_handles
+        if gp._safe_str(value)
+    }
+    if not selected:
+        raise ValueError(
+            "Preview verification requires at least one selected Handle."
+        )
+
     current_by_source_row: Dict[str, Dict[str, str]] = {}
     for record in prepare_plan["preview_records"]:
-        source_row = gp._safe_str(
-            record.get("sys.source_row")
-        )
+        handle = gp._safe_str(record.get("core.handle"))
+        if handle not in selected:
+            continue
+        source_row = gp._safe_str(record.get("sys.source_row"))
         if not source_row:
             continue
         if source_row in current_by_source_row:
             raise ValueError(
-                f"Current plan duplicate sys.source_row={source_row!r}."
+                f"Current selected plan has duplicate "
+                f"sys.source_row={source_row!r}."
             )
         current_by_source_row[source_row] = {
             str(key): gp._safe_str(value)
             for key, value in record.items()
         }
 
+    selected_source_rows = set(current_by_source_row)
     preview_by_source_row: Dict[str, Dict[str, str]] = {}
     for record in preview_contract["records"]:
-        source_row = gp._safe_str(
-            record.get("sys.source_row")
-        )
-        if not source_row:
+        source_row = gp._safe_str(record.get("sys.source_row"))
+        if source_row not in selected_source_rows:
             continue
         if source_row in preview_by_source_row:
             raise ValueError(
-                f"Preview duplicate sys.source_row={source_row!r}."
+                f"Preview selected scope has duplicate "
+                f"sys.source_row={source_row!r}."
             )
         preview_by_source_row[source_row] = record
 
@@ -617,7 +632,8 @@ def _verify_preview_snapshot(
     preview_keys = set(preview_by_source_row)
     if current_keys != preview_keys:
         raise ValueError(
-            "Preview no longer matches Input. Source-row sets differ. "
+            "Preview no longer matches the selected Input rows. "
+            "Source-row sets differ. "
             f"current_only={sorted(current_keys - preview_keys)}; "
             f"preview_only={sorted(preview_keys - current_keys)}. "
             "Rerun Prepare."
@@ -637,12 +653,8 @@ def _verify_preview_snapshot(
         current = current_by_source_row[source_row]
         preview = preview_by_source_row[source_row]
         for field_key in compare_fields:
-            current_value = gp._safe_str(
-                current.get(field_key)
-            )
-            preview_value = gp._safe_str(
-                preview.get(field_key)
-            )
+            current_value = gp._safe_str(current.get(field_key))
+            preview_value = gp._safe_str(preview.get(field_key))
             if current_value != preview_value:
                 mismatches.append(
                     f"source_row={source_row}:{field_key}:"
@@ -656,19 +668,20 @@ def _verify_preview_snapshot(
 
     if mismatches:
         raise ValueError(
-            "Preview is stale or was edited. Rerun Prepare. "
+            "Preview is stale or was edited for the selected Product rows. "
+            "Rerun Prepare. "
             f"First mismatches={mismatches}"
         )
 
     invalid_statuses = {
         gp._safe_str(record.get("sys.plan_status"))
-        for record in preview_by_source_row.values()
+        for record in current_by_source_row.values()
         if gp._safe_str(record.get("sys.plan_status"))
-        not in {"READY", "READY_WITH_WARNINGS", "SKIPPED"}
+        not in {"READY", "READY_WITH_WARNINGS"}
     }
     if invalid_statuses:
         raise ValueError(
-            "Preview contains non-ready rows: "
+            "Selected Preview rows are not ready: "
             f"{sorted(invalid_statuses)}"
         )
 
@@ -676,6 +689,8 @@ def _verify_preview_snapshot(
         "variant_count": len(current_keys),
         "row_count": len(current_keys),
         "row_identity": "sys.source_row",
+        "selection_identity": "core.handle",
+        "selected_handles": sorted(selected),
         "verified_fields": len(compare_fields),
     }
 
@@ -687,65 +702,116 @@ def _select_product_keys(
     max_products: int,
     live_mode: bool,
 ) -> List[str]:
-    """Return selected Product Handles.
+    """Resolve selected Product Handles without requiring the full Input ready.
 
-    For backward compatibility, ONLY_PRODUCT_KEYS accepts either a Handle or a
-    sys.product_key. A repeated product_key expands to every ready Handle that
-    carries that business key.
+    ONLY_PRODUCT_KEYS remains backward compatible:
+    - an exact core.handle selects that Product;
+    - a sys.product_key expands to every Handle carrying that business key.
+
+    An explicitly selected Product must itself be READY. Errors on unrelated
+    Handles are ignored for this Apply run.
     """
-    ready_records = [
+    all_records = [
         record
         for record in prepare_plan["preview_records"]
-        if gp._safe_str(record.get("sys.plan_status"))
-        in {"READY", "READY_WITH_WARNINGS"}
+        if gp._safe_str(record.get("sys.plan_status")) != "SKIPPED"
         and gp._safe_str(record.get("core.handle"))
     ]
-    ready_handles = sorted({
-        gp._safe_str(record.get("core.handle"))
-        for record in ready_records
-    })
 
+    records_by_handle: Dict[str, List[Mapping[str, Any]]] = {}
     handles_by_product_key: Dict[str, List[str]] = {}
-    for record in ready_records:
-        product_key = gp._safe_str(
-            record.get("sys.product_key")
-        )
+    for record in all_records:
         handle = gp._safe_str(record.get("core.handle"))
-        if not product_key or not handle:
-            continue
-        bucket = handles_by_product_key.setdefault(product_key, [])
-        if handle not in bucket:
-            bucket.append(handle)
+        records_by_handle.setdefault(handle, []).append(record)
+
+        product_key = gp._safe_str(record.get("sys.product_key"))
+        if product_key:
+            bucket = handles_by_product_key.setdefault(product_key, [])
+            if handle not in bucket:
+                bucket.append(handle)
+
+    ready_statuses = {"READY", "READY_WITH_WARNINGS"}
+    ready_handles = sorted(
+        handle
+        for handle, records in records_by_handle.items()
+        if records
+        and all(
+            gp._safe_str(record.get("sys.plan_status"))
+            in ready_statuses
+            for record in records
+        )
+    )
 
     requested = _safe_list(only_product_keys)
     if requested:
         selected: List[str] = []
         unknown: List[str] = []
-        ready_handle_set = set(ready_handles)
+
         for value in requested:
-            matches: List[str] = []
-            if value in ready_handle_set:
+            if value in records_by_handle:
                 matches = [value]
             elif value in handles_by_product_key:
                 matches = handles_by_product_key[value]
             else:
                 unknown.append(value)
                 continue
+
             for handle in matches:
                 if handle not in selected:
                     selected.append(handle)
 
         if unknown:
             raise ValueError(
-                "ONLY_PRODUCT_KEYS contains values that are neither READY "
-                "Handles nor READY sys.product_key values: "
+                "ONLY_PRODUCT_KEYS contains values that are neither "
+                "core.handle nor sys.product_key in the current Input: "
                 f"{sorted(unknown)}"
+            )
+
+        selected_not_ready: List[Dict[str, Any]] = []
+        for handle in selected:
+            records = records_by_handle.get(handle, [])
+            invalid_records = [
+                record
+                for record in records
+                if gp._safe_str(record.get("sys.plan_status"))
+                not in ready_statuses
+            ]
+            if not invalid_records:
+                continue
+
+            selected_not_ready.append(
+                {
+                    "handle": handle,
+                    "source_rows": [
+                        gp._safe_str(record.get("sys.source_row"))
+                        for record in invalid_records
+                    ],
+                    "statuses": sorted({
+                        gp._safe_str(record.get("sys.plan_status"))
+                        for record in invalid_records
+                    }),
+                    "validation_messages": [
+                        gp._safe_str(
+                            record.get("sys.validation_messages")
+                        )
+                        for record in invalid_records[:5]
+                    ],
+                }
+            )
+
+        if selected_not_ready:
+            raise ValueError(
+                "Selected Product Handles are not READY: "
+                + json.dumps(
+                    selected_not_ready[:20],
+                    ensure_ascii=False,
+                )
             )
     else:
         if live_mode and not apply_all_ready_products:
             raise ValueError(
                 "Live Apply requires explicit ONLY_PRODUCT_KEYS "
-                "(Handle or sys.product_key), or set "
+                "(core.handle or sys.product_key), or set "
                 "APPLY_ALL_READY_PRODUCTS=True."
             )
         selected = ready_handles
@@ -756,8 +822,10 @@ def _select_product_keys(
     if len(selected) > int(max_products):
         raise ValueError(
             f"Selected Product Handles={len(selected)} exceeds "
-            f"MAX_PRODUCTS_PER_RUN={max_products}."
+            f"MAX_PRODUCTS_PER_RUN={max_products}. "
+            f"Handles={selected[:20]}"
         )
+
     return selected
 
 def _product_rows(
@@ -2079,32 +2147,18 @@ def run(
             cfg_fields=cfg_fields,
             locations=locations,
         )
-        if not prepare_plan["ready_for_apply"]:
-            raise ValueError(
-                "Current Input is not READY for Apply. "
-                f"errors={prepare_plan['stats']['error_count']} | "
-                f"warnings={prepare_plan['stats']['warning_count']}"
-            )
+        print(
+            "[Prepare rebuild] "
+            f"rows={prepare_plan['stats']['rows_loaded']} | "
+            f"products={prepare_plan['stats']['product_groups']} | "
+            f"errors_total={prepare_plan['stats']['error_count']} | "
+            f"warnings_total={prepare_plan['stats']['warning_count']}"
+        )
 
         progress(
             5,
             12,
-            "Verify Preview snapshot against current Input",
-        )
-        preview_verification = _verify_preview_snapshot(
-            prepare_plan=prepare_plan,
-            preview_contract=preview_contract,
-        )
-        print(
-            "[Preview verified] "
-            f"variants={preview_verification['variant_count']} | "
-            f"fields={preview_verification['verified_fields']}"
-        )
-
-        progress(
-            6,
-            12,
-            "Select approved Product groups",
+            "Select ready Product Handles",
         )
         selected_product_keys = _select_product_keys(
             prepare_plan=prepare_plan,
@@ -2114,6 +2168,25 @@ def run(
             ),
             max_products=max_products_per_run,
             live_mode=live_mode,
+        )
+
+        progress(
+            6,
+            12,
+            "Verify Preview for selected Product rows",
+        )
+        preview_verification = _verify_preview_snapshot(
+            prepare_plan=prepare_plan,
+            preview_contract=preview_contract,
+            selected_handles=selected_product_keys,
+        )
+        print(
+            "[Preview verified] "
+            f"selected_handles={len(selected_product_keys)} | "
+            f"rows={preview_verification['row_count']} | "
+            f"fields={preview_verification['verified_fields']} | "
+            f"unselected_errors_ignored="
+            f"{prepare_plan['stats']['error_count']}"
         )
         product_rows = _product_rows(
             prepare_plan=prepare_plan,
@@ -2677,6 +2750,15 @@ def run(
                     conflict_result["warnings"]
                 ),
                 "error_count": products_failed,
+                "input_warning_count_total": prepare_plan["stats"][
+                    "warning_count"
+                ],
+                "input_error_count_total": prepare_plan["stats"][
+                    "error_count"
+                ],
+                "unselected_input_errors_ignored": prepare_plan["stats"][
+                    "error_count"
+                ],
                 "business_objects_planned": len(
                     selected_product_keys
                 ),
