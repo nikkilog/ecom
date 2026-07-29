@@ -6,9 +6,9 @@ Import path: ``shopify_create.generic_apply``
 
 Safety model
 ------------
-1. Re-read Input, Defaults, Cfg__Fields and Cfg__Locations.
-2. Rebuild the Prepare plan using ``shopify_create.generic_prepare``.
-3. Compare the rebuilt plan with the existing Preview snapshot.
+1. Re-read current Input, Defaults, Cfg__Fields and Cfg__Locations.
+2. Rebuild rows from current Input using ``generic_prepare``.
+3. Do not read, compare, or require the Preview tab.
 4. Query Shopify by ``core.handle`` only. Existing Handles are skipped,
    written to Result, and never treated as Apply errors.
 5. Resolve every accessible Shopify Publication when all-channel
@@ -56,7 +56,7 @@ from zoneinfo import ZoneInfo
 from shopify_create import generic_prepare as gp
 
 
-MODULE_VERSION = "1.5.6"
+MODULE_VERSION = "1.5.7"
 MODULE_PATH = "shopify_create.generic_apply"
 DEFAULT_JOB_NAME = "generic_create_apply"
 EXPECTED_PREPARE_MODULE_VERSION = "1.6.5"
@@ -2160,7 +2160,7 @@ def run(
         progress(
             3,
             12,
-            "Re-read Input, Defaults, Preview, Cfg__Fields, "
+            "Re-read current Input, Defaults, Cfg__Fields, "
             "and Cfg__Locations",
         )
         input_values = gp._require_worksheet(
@@ -2170,10 +2170,6 @@ def run(
         defaults_values = gp._require_worksheet(
             create_book,
             tab_defaults,
-        ).get_all_values()
-        preview_values = gp._require_worksheet(
-            create_book,
-            tab_preview,
         ).get_all_values()
         cfg_values = gp._require_worksheet(
             config_book,
@@ -2195,9 +2191,6 @@ def run(
         locations = gp._read_locations(
             location_values,
             site_code,
-        )
-        preview_contract = _read_preview_records(
-            preview_values
         )
 
         progress(
@@ -2237,20 +2230,20 @@ def run(
         progress(
             6,
             12,
-            "Verify Preview for selected Product rows",
+            "Use current Input directly; Preview gate disabled",
         )
-        preview_verification = _verify_preview_snapshot(
-            prepare_plan=prepare_plan,
-            preview_contract=preview_contract,
-            selected_handles=selected_product_keys,
-        )
+        preview_verification = {
+            "status": "NOT_USED",
+            "preview_read": False,
+            "preview_compared": False,
+            "reason": (
+                "Apply uses current Input and checks Shopify by "
+                "core.handle only."
+            ),
+        }
         print(
-            "[Preview verified] "
-            f"selected_handles={len(selected_product_keys)} | "
-            f"rows={preview_verification['row_count']} | "
-            f"fields={preview_verification['verified_fields']} | "
-            f"unselected_errors_ignored="
-            f"{prepare_plan['stats']['error_count']}"
+            "[Preview gate] DISABLED | "
+            f"selected_handles={len(selected_product_keys)}"
         )
         product_rows = _product_rows(
             prepare_plan=prepare_plan,
@@ -2940,6 +2933,7 @@ def run(
                 "variant_key_checked": False,
             },
             "preview_verification": preview_verification,
+            "preview_gate_disabled": True,
             "runtime": {
                 "runtime_mode": gp._runtime_mode(),
                 "auth_type": (
