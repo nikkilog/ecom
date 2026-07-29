@@ -65,7 +65,7 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "1.6.5"
+MODULE_VERSION = "1.6.6"
 MODULE_PATH = "shopify_create.generic_prepare"
 DEFAULT_JOB_NAME = "generic_create_prepare"
 
@@ -2156,21 +2156,39 @@ def _build_prepare_plan(
             except (ValueError, TypeError):
                 values[field_key] = raw
 
-    # The only row-level validation is duplicate non-empty Handle.
+    # Input is Variant-grain and sys.product_key defines the Product group.
+    # Multiple Variants in one Product group normally share one Handle.
+    # The only row-level validation is therefore a normalized non-empty
+    # Handle assigned to more than one distinct Product group.
     # A blank Handle is passed through; Shopify may derive it from Title.
-    rows_by_handle: Dict[str, List[Dict[str, Any]]] = {}
+    rows_by_normalized_handle: Dict[str, List[Dict[str, Any]]] = {}
     for row_state in active_rows:
         handle = _safe_str(
             row_state["values"].get("core.handle")
         )
         if handle:
-            rows_by_handle.setdefault(handle, []).append(row_state)
+            normalized_handle = handle.casefold()
+            rows_by_normalized_handle.setdefault(
+                normalized_handle,
+                [],
+            ).append(row_state)
 
-    for handle, rows in rows_by_handle.items():
-        if len(rows) <= 1:
+    for normalized_handle, rows in rows_by_normalized_handle.items():
+        product_keys = {
+            _safe_str(row["values"].get("sys.product_key"))
+            for row in rows
+        }
+        if len(product_keys) <= 1:
             continue
+        displayed_handles = sorted({
+            _safe_str(row["values"].get("core.handle"))
+            for row in rows
+        })
         message = (
-            f"Duplicate core.handle={handle!r}; "
+            "Duplicate normalized core.handle across Product groups; "
+            f"normalized_handle={normalized_handle!r}; "
+            f"handles={displayed_handles}; "
+            f"product_keys={sorted(product_keys)}; "
             f"source_rows={[row['source_row'] for row in rows]}."
         )
         for row_state in rows:
@@ -2182,8 +2200,9 @@ def _build_prepare_plan(
             )
 
     product_variant_counts = {
-        handle: len(rows)
-        for handle, rows in rows_by_handle.items()
+        normalized_handle: len(rows)
+        for normalized_handle, rows
+        in rows_by_normalized_handle.items()
     }
 
     for row_state in active_rows:
@@ -2237,6 +2256,7 @@ def _build_prepare_plan(
         handle = _safe_str(
             row_state["values"].get("core.handle")
         )
+        normalized_handle = handle.casefold()
         messages = row_state["errors"]
         system_values = [
             row_state["status"],
@@ -2252,7 +2272,7 @@ def _build_prepare_plan(
                 sorted(set(row_state["defaulted_fields"]))
             ),
             "",
-            str(product_variant_counts.get(handle, 0)),
+            str(product_variant_counts.get(normalized_handle, 0)),
         ]
         normalized_values = [
             _safe_str(row_state["values"].get(field_key))
@@ -2312,7 +2332,12 @@ def _build_prepare_plan(
             "rows_recognized": len(active_rows),
             "rows_planned": len(ready_rows),
             "rows_skipped": len(skipped_rows),
-            "product_groups": len(rows_by_handle),
+            "product_groups": len({
+                _safe_str(
+                    row_state["values"].get("sys.product_key")
+                )
+                for row_state in active_rows
+            }),
             "business_objects_planned": len(ready_handles),
             "variant_objects_planned": len(ready_rows),
             "warning_count": 0,

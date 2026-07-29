@@ -110,8 +110,8 @@ High-risk Apply Runners enforce the version contract twice:
 2. immediately before calling Apply.
 
 Both gates define expected versions in the current execution chain and compare
-them with the loaded modules. For Generic Create Current, Apply `1.5.3`
-requires Prepare `1.6.4`.
+them with the loaded modules. For Generic Create Current, Apply `1.5.10`
+requires Prepare `1.6.6`.
 
 A clean Kernel is required for acceptance after a module or expected-version
 change. Saved globals, imported modules, Notebook outputs, local `__pycache__`,
@@ -172,11 +172,20 @@ Planned `inserted`, `written`, or `created` counts must be labeled as planned. A
 
 `DRY_RUN` must disclose any remaining side effects, including Sheet creation, mapping writes, RunLog writes, cache changes, or other operational mutations. A dry run with undisclosed side effects violates this contract.
 
+Generic Apply does not read or compare Preview as an execution gate. It
+re-reads current Input, Defaults, `Cfg__Fields`, and `Cfg__Locations`, rebuilds
+the plan, and reads `V_Product_Handle.Product Handle` once for local
+target-existence comparison. Prepare's Input-internal `DUPLICATE_HANDLE`
+contract is distinct: Generic Create Input is Variant-grain,
+`sys.product_key` defines a Product group, and only different Product groups
+sharing one trimmed, case-insensitive Handle conflict.
+
 Generic Apply Dry Run may perform current-state Shopify reads for accessible
-Publications and Handle conflict preflight. It must not invoke Product,
-Publication, Inventory, or Metafield mutation operations. Result and RunLog
-rows created as dry-run evidence must report planned operations, zero Shopify
-business writes, and the exact remaining Sheet side effects.
+Publications. Handle existence is checked from the Sheet snapshot, with zero
+Shopify Handle lookup requests. Dry Run must not invoke Product, Publication,
+Inventory, or Metafield mutation operations. Result and RunLog rows created as
+dry-run evidence must report planned operations, zero Shopify business writes,
+and the exact remaining Sheet side effects.
 
 ## Write Gates
 
@@ -241,6 +250,27 @@ RunLog records actual phase and effect:
 - Append operations verify the target header/schema contract first.
 - Repeated runs use stable idempotency keys where the workflow requires append history or recovery.
 
+## Generic Create Concurrency and Sheets Writes
+
+Generic Apply may execute new Product groups with bounded Product-level
+concurrency. A Product worker performs Shopify Product and Publication
+operations and returns a structured outcome; it does not write Google Sheets.
+Result and RunLog writes are serialized on the main thread through one writer.
+With `STOP_ON_FIRST_ERROR=False`, one Product failure does not prevent later
+Product groups from being submitted.
+
+Quota-safe Result behavior includes:
+
+- pre-size the Result worksheet once using expected output rows;
+- buffer completed Product outcomes;
+- require both a completed-Product threshold and a minimum time interval for
+  intermediate flushes;
+- force the final remaining buffer to write;
+- retry Google Sheets HTTP 429, 500, 502, 503, and 504;
+- honor `Retry-After` and use bounded exponential backoff;
+- retain the buffer during failed attempts and clear it only after success;
+- apply the same retry protection to final and failure RunLog writes.
+
 ## Failure and Recovery
 
 - Validation failure occurs before writes whenever complete-plan validation is possible.
@@ -249,3 +279,7 @@ RunLog records actual phase and effect:
 - Fallback/degraded behavior is explicit and never silently changes data meaning.
 - Product-creation partial failure leaves the product DRAFT and records recovery information.
 - The final result identifies safe resume conditions and does not describe partial work as complete.
+- Shopify mutations and Google Sheets Result/RunLog evidence are not a single
+  transaction. If evidence writing fails after Shopify work, do not rerun from
+  a stale Handle snapshot. Refresh Shopify Product facts and
+  `V_Product_Handle`, then rerun so existing Handles are skipped.

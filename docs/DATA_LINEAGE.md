@@ -115,9 +115,14 @@ Purpose:
 
 Review output must preserve a stable key so Apply can identify approved business objects without relying on row order. Approval is not a substitute for Apply-time validation against current configuration and Shopify state.
 
-For Generic Create, `core.handle` is the Product identity. Physical
-`sys.source_row` anchors Preview snapshot verification; `sys.product_key`,
-`sys.variant_key`, SKU, and Barcode remain trace or business values.
+Generic Create Input is Variant-grain. `sys.product_key` defines the Product
+group, so multiple Variant rows in one Product group normally share one
+`core.handle`. Prepare normalizes Handle with trim plus case-insensitive
+comparison and reports `DUPLICATE_HANDLE` only when different Product groups
+reuse the same normalized Handle. This is an Input-internal grouping conflict;
+it is not evidence that the Handle already exists in Shopify. Variant Key,
+SKU, Barcode, Product-field differences, dimensions, and Draft publication
+intent are not duplicate-Handle checks.
 
 RichText transformation treats non-empty current Input HTML as authoritative.
 Previously generated RichText HTML is fallback input only when the
@@ -153,12 +158,45 @@ These counts are not interchangeable.
 
 State-dependent operations must re-read current facts. Reference `LINK`, `UNLINK`, and `REPLACE_ALL` calculate differences from current values. `CLEAR` behavior is defined by field type and module. Variant updates prefer immutable IDs over the SKU being modified. Metaobject updates prefer `entry_gid`.
 
-Generic Apply `1.5.3` requires Generic Prepare `1.6.4`. Apply re-reads Input,
-Defaults, `Cfg__Fields`, and `Cfg__Locations`, rebuilds the Prepare plan, and
-verifies it against Preview before selection and Shopify Handle preflight.
-Draft plus all-channel intent is a warning rather than an error. Publication
-association is an execution relationship; it does not make a Draft Product
-customer-visible.
+Generic Apply `1.5.10` requires Generic Prepare `1.6.6`. Apply does not read or
+compare Preview as an execution gate. It re-reads current Input, Defaults,
+`Cfg__Fields`, and `Cfg__Locations`, then rebuilds the execution plan from
+current facts.
+
+The current Handle-existence flow is:
+
+```text
+Shopify Product facts
+→ external Handle synchronization flow
+→ create_generic / V_Product_Handle
+→ Product Handle snapshot
+→ Generic Apply reads the snapshot once
+→ normalized in-memory Handle-set comparison
+→ existing: SKIPPED_HANDLE_EXISTS
+→ new: Shopify productSet / publication
+→ Result / RunLog
+```
+
+Apply locates `Product Handle` by header name rather than fixed column
+position, ignores blank snapshot values, and silently deduplicates repeated
+snapshot Handles after trim plus case-insensitive normalization. SKU, Barcode,
+Product Key, Variant Key, Title, Product ID, and Variant ID are not queried or
+compared. Shopify Handle lookup API requests are zero.
+
+New Product groups execute through bounded Product workers. Workers perform
+Shopify Product and Publication work only; Result and RunLog writes are
+serialized on the main thread. `STOP_ON_FIRST_ERROR=False` permits later
+Product groups to continue after an isolated failure.
+
+Prepare and Apply Handle checks must not be conflated:
+
+- Prepare detects one normalized Handle assigned to different Input Product
+  groups.
+- Apply detects a normalized Handle already present in the target-system
+  snapshot.
+
+Publication association is an execution relationship; it does not make a
+Draft Product customer-visible.
 
 ### 6. Shopify
 
@@ -183,6 +221,19 @@ Purpose:
 Results should use stable idempotency and trace keys, including `run_id` and business-object identity. Append history must verify the target header contract before writing.
 
 RunLog phases must correspond to real side effects. A Preview or dry run must not label planned work as written, and any allowed log or mapping side effect must be disclosed explicitly.
+
+Generic Apply pre-sizes Result for expected rows and flushes buffered outcomes
+in batches only after both the count threshold and minimum interval are met;
+the final remaining buffer is forced to write. Result and final/failure RunLog
+writes retry HTTP 429, 500, 502, 503, and 504 with bounded exponential backoff
+and `Retry-After` support. A Result buffer is cleared only after a successful
+write.
+
+Shopify effects and Google Sheets evidence are not one transaction. A Shopify
+Product may exist even if a later Result or RunLog write remains unsuccessful
+after retries. Before recovery or rerun, refresh Shopify Product facts and
+`V_Product_Handle`; the refreshed snapshot lets already-created Handles
+resolve to `SKIPPED_HANDLE_EXISTS`.
 
 ## Cross-Stage Invariants
 

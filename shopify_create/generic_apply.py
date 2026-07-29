@@ -56,7 +56,7 @@ from shopify_create import generic_prepare as gp
 MODULE_VERSION = "1.5.10"
 MODULE_PATH = "shopify_create.generic_apply"
 DEFAULT_JOB_NAME = "generic_create_apply"
-EXPECTED_PREPARE_MODULE_VERSION = "1.6.5"
+EXPECTED_PREPARE_MODULE_VERSION = "1.6.6"
 
 LEGACY_RESULT_HEADERS = [
     "run_id",
@@ -2716,8 +2716,8 @@ def run(
             "preview_read": False,
             "preview_compared": False,
             "reason": (
-                "Apply uses current Input and checks Shopify by "
-                "core.handle only."
+                "Apply uses current Input and compares core.handle "
+                "with V_Product_Handle locally."
             ),
         }
         print(

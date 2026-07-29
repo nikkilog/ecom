@@ -95,23 +95,37 @@ Overall status: `ACTIVE_BUT_UNVALIDATED`
 
 Overall status: `EXPERIMENTAL`
 
-- `generic_prepare.py`: Current module version `1.6.4`. It reads and validates
-  Generic Create inputs, applies configured defaults, treats explicit
-  `Cfg__Fields.entity_type` as authoritative, groups Product rows by
-  `core.handle`, and produces the reviewed Preview plan. Draft plus
-  `publish.all_channels=TRUE` is valid with a warning.
-- `generic_apply.py`: Current module version `1.5.3`; it requires
-  `generic_prepare` `1.6.4`. It re-reads configuration and Input, rebuilds the
-  Prepare plan, verifies Preview by physical `sys.source_row`, resolves
-  selections to Product Handles, performs current Shopify Handle preflight,
-  and separates dry-run planning from live Product and Publication mutations.
+- `generic_prepare.py`: Current module version `1.6.6`. Generic Create Input is
+  Variant-grain and `sys.product_key` defines the Product group. Multiple
+  Variants in one Product group may share one normalized `core.handle`.
+  Prepare reports only `DUPLICATE_HANDLE`, meaning the same trimmed,
+  case-insensitive Handle is used by more than one distinct Product group.
+  SKU, Barcode, Variant Key, Product-field differences, dimensions, and Draft
+  publication intent are not Preview warning or error checks.
+- `generic_apply.py`: Current module version `1.5.10`; it requires
+  `generic_prepare` `1.6.6`. It does not use Preview as an execution gate. It
+  re-reads current Input, Defaults, `Cfg__Fields`, and `Cfg__Locations`,
+  rebuilds the execution plan, and reads
+  `V_Product_Handle.Product Handle` once as the target-existence snapshot.
+  Apply compares only normalized Handle in memory. Existing Handles become
+  `SKIPPED_HANDLE_EXISTS`, produce Result evidence, and cause no Shopify
+  Handle lookup or Product mutation. New Handles are processed by bounded
+  Product workers. Result and RunLog Google Sheets writes remain on the main
+  thread through a single quota-safe writer with batching, minimum flush
+  interval, pre-sizing, and retry protection.
 
 The area is still under design and construction. Existing generic, legacy, wholesale, and SPU preparation paths do not yet establish one final common product-creation contract.
 
-Required safety direction includes Prepare → Review → Apply, `APPROVED` filtering, Apply-time configuration and handle checks, append-only result history with stable idempotency keys, DRAFT-first creation, partial-failure retention in DRAFT, and explicit recovery/reconciliation behavior.
+Current evidence level:
+`USER_CONFIRMED_RUNTIME_SUCCESS_WITH_STATIC_AND_MOCK_VALIDATION`. This does
+not establish an independently audited full live run, complete successful Run
+Summary, final Result-row reconciliation, or Shopify object readback.
+
+Required safety direction includes Prepare → Review → Apply, `APPROVED` filtering, Apply-time configuration and snapshot checks, append-only result history with stable idempotency keys, DRAFT-first creation, partial-failure retention in DRAFT, and explicit recovery/reconciliation behavior.
 
 `core.handle` is the Shopify Product identity for Generic Create.
-`sys.product_key`, `sys.variant_key`, SKU, and Barcode remain trace or business
+`sys.product_key` is the Input Product-group boundary, not the target-system
+existence key. `sys.variant_key`, SKU, and Barcode remain trace or business
 values and are not duplicate-blocking identities. A Draft Product may be
 associated with accessible Publications, but customer availability remains
 controlled by Product status.
