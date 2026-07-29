@@ -53,7 +53,7 @@ from zoneinfo import ZoneInfo
 from shopify_create import generic_prepare as gp
 
 
-MODULE_VERSION = "1.5.9"
+MODULE_VERSION = "1.5.10"
 MODULE_PATH = "shopify_create.generic_apply"
 DEFAULT_JOB_NAME = "generic_create_apply"
 EXPECTED_PREPARE_MODULE_VERSION = "1.6.5"
@@ -1682,15 +1682,122 @@ def _ensure_result_header(
     )
 
 
-class _ResultBatchWriter:
-    """Append Result batches from the main thread only."""
 
-    def __init__(self, worksheet: gspread.Worksheet) -> None:
+def _google_api_status(exc: BaseException) -> Optional[int]:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(response, "status", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _retry_after_seconds(exc: BaseException) -> Optional[float]:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    value = headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _google_write_with_retry(
+    operation,
+    *,
+    action: str,
+    max_retries: int = 8,
+    base_seconds: float = 10.0,
+    max_seconds: float = 90.0,
+    print_progress: bool = True,
+):
+    """Retry quota/transient Sheets writes without dropping buffered rows."""
+    retriable_statuses = {429, 500, 502, 503, 504}
+    last_error: Optional[BaseException] = None
+
+    for attempt in range(1, int(max_retries) + 1):
+        try:
+            return operation()
+        except BaseException as exc:
+            last_error = exc
+            status = _google_api_status(exc)
+            if (
+                status not in retriable_statuses
+                or attempt >= int(max_retries)
+            ):
+                raise
+
+            wait_seconds = min(
+                float(max_seconds),
+                float(base_seconds) * (2 ** (attempt - 1)),
+            )
+            retry_after = _retry_after_seconds(exc)
+            if retry_after is not None:
+                wait_seconds = max(wait_seconds, retry_after)
+
+            if print_progress:
+                print(
+                    "[Google Sheets write retry] "
+                    f"action={action} | status={status} | "
+                    f"attempt={attempt}/{max_retries} | "
+                    f"wait={wait_seconds:.1f}s"
+                )
+            time.sleep(wait_seconds)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"{action} failed without an exception.")
+
+
+class _ResultBatchWriter:
+    """Main-thread Result writer with quota-safe retries."""
+
+    def __init__(
+        self,
+        worksheet: gspread.Worksheet,
+        *,
+        expected_append_rows: int = 0,
+        print_progress: bool = True,
+    ) -> None:
         self.worksheet = worksheet
+        self.print_progress = bool(print_progress)
+
         values = worksheet.get_all_values()
         self.next_row = max(2, len(values) + 1)
         self.rows_written = 0
         self.flush_count = 0
+
+        expected_append_rows = max(0, int(expected_append_rows))
+        required_rows = max(
+            self.next_row,
+            self.next_row + expected_append_rows - 1,
+        )
+        required_cols = len(RESULT_HEADERS)
+
+        if (
+            worksheet.row_count < required_rows
+            or worksheet.col_count < required_cols
+        ):
+            _google_write_with_retry(
+                lambda: worksheet.resize(
+                    rows=max(
+                        worksheet.row_count,
+                        required_rows + 100,
+                    ),
+                    cols=max(
+                        worksheet.col_count,
+                        required_cols,
+                    ),
+                ),
+                action="pre-size Result worksheet",
+                print_progress=self.print_progress,
+            )
 
     def append(
         self,
@@ -1698,30 +1805,49 @@ class _ResultBatchWriter:
     ) -> int:
         if not rows:
             return 0
+
         start_row = self.next_row
         end_row = start_row + len(rows) - 1
         required_cols = len(RESULT_HEADERS)
+
         if (
             self.worksheet.row_count < end_row
             or self.worksheet.col_count < required_cols
         ):
-            self.worksheet.resize(
-                rows=max(self.worksheet.row_count, end_row + 100),
-                cols=max(self.worksheet.col_count, required_cols),
+            _google_write_with_retry(
+                lambda: self.worksheet.resize(
+                    rows=max(
+                        self.worksheet.row_count,
+                        end_row + 100,
+                    ),
+                    cols=max(
+                        self.worksheet.col_count,
+                        required_cols,
+                    ),
+                ),
+                action="expand Result worksheet",
+                print_progress=self.print_progress,
             )
-        self.worksheet.update(
-            range_name=(
-                f"A{start_row}:"
-                f"{gp._a1_col(required_cols)}{end_row}"
+
+        _google_write_with_retry(
+            lambda: self.worksheet.update(
+                range_name=(
+                    f"A{start_row}:"
+                    f"{gp._a1_col(required_cols)}{end_row}"
+                ),
+                values=[list(row) for row in rows],
+                value_input_option="RAW",
             ),
-            values=[list(row) for row in rows],
-            value_input_option="RAW",
+            action=f"write Result rows {start_row}-{end_row}",
+            print_progress=self.print_progress,
         )
+
         written = len(rows)
         self.next_row = end_row + 1
         self.rows_written += written
         self.flush_count += 1
         return written
+
 
 
 def _append_result_rows(
@@ -2373,7 +2499,8 @@ def run(
     preflight_progress_every: int = 10,
     product_progress_every: int = 1,
     product_concurrency: int = 4,
-    result_flush_every: int = 20,
+    result_flush_every: int = 100,
+    result_flush_min_interval_seconds: float = 15.0,
     api_timeout_seconds: int = 120,
     api_max_retries: int = 6,
     tz_name: str = "America/New_York",
@@ -2408,10 +2535,17 @@ def run(
 
     product_concurrency = int(product_concurrency)
     result_flush_every = int(result_flush_every)
+    result_flush_min_interval_seconds = float(
+        result_flush_min_interval_seconds
+    )
     if product_concurrency < 1:
         raise ValueError("PRODUCT_CONCURRENCY must be >= 1.")
     if result_flush_every < 1:
         raise ValueError("RESULT_FLUSH_EVERY must be >= 1.")
+    if result_flush_min_interval_seconds < 0:
+        raise ValueError(
+            "RESULT_FLUSH_MIN_INTERVAL_SECONDS must be >= 0."
+        )
 
     run_id = run_id or gp._make_run_id(
         job_name,
@@ -2770,12 +2904,20 @@ def run(
         result_writer: Optional[_ResultBatchWriter] = None
         if write_result:
             result_ws = _ensure_result_header(create_book, tab_result)
-            result_writer = _ResultBatchWriter(result_ws)
+            result_writer = _ResultBatchWriter(
+                result_ws,
+                expected_append_rows=sum(
+                    len(rows)
+                    for rows in product_rows.values()
+                ),
+                print_progress=print_progress,
+            )
 
         total_products = len(selected_product_keys)
         completed_products = 0
         stop_requested = False
         processing_started = time.monotonic()
+        last_result_flush_at = processing_started
 
         def submit_product(executor: ThreadPoolExecutor, product_key: str):
             rows = product_rows[product_key]
@@ -2934,11 +3076,22 @@ def run(
                         error_reason=outcome["error_reason"],
                     )
 
+                    flush_interval_elapsed = (
+                        time.monotonic()
+                        - last_result_flush_at
+                    ) >= result_flush_min_interval_seconds
+                    final_completion = (
+                        completed_products == total_products
+                    )
                     if (
                         result_writer is not None
                         and (
-                            products_since_result_flush >= result_flush_every
-                            or completed_products == total_products
+                            (
+                                products_since_result_flush
+                                >= result_flush_every
+                                and flush_interval_elapsed
+                            )
+                            or final_completion
                         )
                     ):
                         written = result_writer.append(result_rows_buffer)
@@ -2954,6 +3107,7 @@ def run(
                             )
                         result_rows_buffer.clear()
                         products_since_result_flush = 0
+                        last_result_flush_at = time.monotonic()
 
                     if status == "FAILED" and stop_on_first_error:
                         stop_requested = True
@@ -2979,6 +3133,8 @@ def run(
                             f"result_buffer_products="
                             f"{products_since_result_flush}/"
                             f"{result_flush_every} | "
+                            f"flush_min_interval="
+                            f"{result_flush_min_interval_seconds:.0f}s | "
                             f"rate={rate:.2f}/s | eta={eta_seconds:.0f}s"
                         )
 
@@ -3076,7 +3232,11 @@ def run(
                 else ""
             ),
         )
-        logger.flush()
+        _google_write_with_retry(
+            logger.flush,
+            action="write final RunLog",
+            print_progress=print_progress,
+        )
 
         progress(
             12,
@@ -3178,6 +3338,9 @@ def run(
                 "result_rows_written": result_rows_written,
                 "result_flush_count": result_flush_count,
                 "result_flush_every": result_flush_every,
+                "result_flush_min_interval_seconds": (
+                    result_flush_min_interval_seconds
+                ),
                 "product_concurrency": worker_count,
                 "products_completed": completed_products,
                 "products_not_processed": max(
@@ -3241,6 +3404,9 @@ def run(
                 "api_version": api_version,
                 "product_concurrency": worker_count,
                 "result_flush_every": result_flush_every,
+                "result_flush_min_interval_seconds": (
+                    result_flush_min_interval_seconds
+                ),
             },
             "targets": {
                 "create_sheet_url": create_url,
@@ -3271,7 +3437,11 @@ def run(
                 message=str(exc),
                 error_reason=type(exc).__name__,
             )
-            logger.flush()
+            _google_write_with_retry(
+                logger.flush,
+                action="write failure RunLog",
+                print_progress=print_progress,
+            )
         except Exception as log_exc:
             if print_progress:
                 print(
@@ -3308,7 +3478,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-products", type=int, default=5)
     parser.add_argument("--product-concurrency", type=int, default=4)
-    parser.add_argument("--result-flush-every", type=int, default=20)
+    parser.add_argument("--result-flush-every", type=int, default=100)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--confirmed", action="store_true")
     parser.add_argument("--secret-home", default="")
