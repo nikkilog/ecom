@@ -21,9 +21,9 @@ Safety model
 9. Result and RunLog retain execution evidence.
 10. Images/media are intentionally out of scope.
 
-``core.handle`` is the Product identity. ``sys.product_key``,
-``sys.variant_key``, SKU, and Barcode are trace/business values and do not
-participate in duplicate blocking. The module uses Shopify Admin GraphQL
+``core.handle`` is the sole Preview identity. The paired Prepare module
+reports only missing or duplicated Handles. Other Input differences are
+not Preview blockers. The module uses Shopify Admin GraphQL
 ``productSet``
 synchronously to create
 a Product with its options, variants, product/variant metafields, inventory
@@ -53,10 +53,10 @@ from zoneinfo import ZoneInfo
 from shopify_create import generic_prepare as gp
 
 
-MODULE_VERSION = "1.5.4"
+MODULE_VERSION = "1.5.5"
 MODULE_PATH = "shopify_create.generic_apply"
 DEFAULT_JOB_NAME = "generic_create_apply"
-EXPECTED_PREPARE_MODULE_VERSION = "1.6.4"
+EXPECTED_PREPARE_MODULE_VERSION = "1.6.5"
 
 LEGACY_RESULT_HEADERS = [
     "run_id",

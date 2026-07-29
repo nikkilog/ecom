@@ -15,11 +15,12 @@ Scope
 - Resolve ``Cfg__Fields`` from the routed ``config`` workbook.
 - Resolve the current site's default warehouse from Console Core /
   ``Cfg__Locations``.
-- Normalize, validate, group variants by ``core.handle`` and overwrite
-  ``Preview`` with a machine-readable two-row-header plan.
-- ``core.handle`` is the Product identity. ``sys.product_key``,
-  ``sys.variant_key``, SKU, and Barcode are trace/business values and do
-  not participate in duplicate blocking.
+- Apply Defaults and overwrite ``Preview`` with a machine-readable
+  two-row-header plan.
+- APOLLO simple policy: every non-empty unique ``core.handle`` is one
+  independent Product. Preview reports only missing or duplicated Handles.
+  Other field differences, repeated business keys, and Draft publication
+  intent do not create Preview errors or warnings.
 - Product Category, default theme template, and all-channel publishing are
   driven by Defaults with Input nonblank values taking precedence.
 - Write RunLog evidence.
@@ -64,7 +65,7 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "1.6.4"
+MODULE_VERSION = "1.6.5"
 MODULE_PATH = "shopify_create.generic_prepare"
 DEFAULT_JOB_NAME = "generic_create_prepare"
 
@@ -2063,12 +2064,23 @@ def _build_prepare_plan(
     cfg_fields: Mapping[str, Any],
     locations: Mapping[str, Any],
 ) -> Dict[str, Any]:
+    """Build the APOLLO simple Preview.
+
+    Blocking policy:
+    - DUPLICATE_HANDLE only
+
+    Everything else is passed through without Preview errors or warnings.
+    Shopify/API validation can still return an execution error during Apply.
+    """
     input_field_keys = list(input_contract["field_keys"])
     all_field_keys: List[str] = list(input_field_keys)
     for field_key in defaults:
         if field_key not in all_field_keys:
             all_field_keys.append(field_key)
 
+    # Keep the field contract check because unresolved columns cannot be
+    # serialized into a usable Apply payload. It is an infrastructure/schema
+    # exception, not a row-level Preview validation message.
     _validate_known_fields(all_field_keys, cfg_fields)
 
     row_states: List[Dict[str, Any]] = []
@@ -2080,8 +2092,15 @@ def _build_prepare_plan(
             key: _safe_str(value)
             for key, value in row["values"].items()
         }
-        action = _safe_str(values.get("sys.action")).upper() or "CREATE"
-        values["sys.action"] = action
+
+        action = _safe_str(values.get("sys.action")).upper()
+        if action == "SKIP":
+            normalized_action = "SKIP"
+        else:
+            # Blank, CREATE, and any unfamiliar action are treated as CREATE.
+            normalized_action = "CREATE"
+        values["sys.action"] = normalized_action
+
         row_state = {
             "source_row": int(row["source_row"]),
             "values": values,
@@ -2093,71 +2112,37 @@ def _build_prepare_plan(
         }
         row_states.append(row_state)
 
-        if action == "SKIP":
+        if normalized_action == "SKIP":
             row_state["status"] = "SKIPPED"
             skipped_rows.append(row_state)
             continue
-        if action != "CREATE":
-            _add_issue(
-                row_state,
-                "ERROR",
-                "INVALID_ACTION",
-                f"sys.action must be CREATE, SKIP, or blank; got={action!r}.",
-            )
+
         active_rows.append(row_state)
 
-    # Handle is the Product identity. Generate it independently per row
-    # before any Product grouping so repeated business keys cannot merge
-    # otherwise distinct Shopify Products.
+    # Apply Defaults independently per row. There is deliberately no
+    # Product-field inheritance or cross-row field comparison.
     for row_state in active_rows:
         values = row_state["values"]
+
         if not _safe_str(values.get("core.handle")):
             generated = _slugify(values.get("core.title"))
             if generated:
                 values["core.handle"] = generated
-                if "core.handle" not in row_state["defaulted_fields"]:
-                    row_state["defaulted_fields"].append("core.handle")
+                row_state["defaulted_fields"].append("core.handle")
                 if "core.handle" not in all_field_keys:
                     all_field_keys.append("core.handle")
 
-    product_fields = _product_level_fields(
-        all_field_keys,
-        cfg_fields,
-    )
-    _apply_product_inheritance(active_rows, product_fields)
-
-    groups = _group_active_rows_by_handle(active_rows)
-
-    for row_state in active_rows:
         for field_key, spec in defaults.items():
-            if not _safe_str(row_state["values"].get(field_key)):
-                resolved = _evaluate_default(
+            if not _safe_str(values.get(field_key)):
+                values[field_key] = _evaluate_default(
                     spec,
-                    row_state["values"],
+                    values,
                     locations,
                 )
-                row_state["values"][field_key] = resolved
                 row_state["defaulted_fields"].append(field_key)
 
-    # Product values can now include derived Defaults, so run consistency again.
-    product_fields = _product_level_fields(
-        all_field_keys,
-        cfg_fields,
-    )
-    _apply_product_inheritance(active_rows, product_fields)
-
-    for row_state in active_rows:
-        values = row_state["values"]
-
-        for required_field in REQUIRED_ACTIVE_FIELDS:
-            if not _safe_str(values.get(required_field)):
-                _add_issue(
-                    row_state,
-                    "ERROR",
-                    "MISSING_REQUIRED_FIELD",
-                    f"Required field is empty: {required_field}",
-                )
-
+        # Best-effort normalization only. Invalid optional values are left as
+        # entered and are not turned into Preview messages.
         for field_key in all_field_keys:
             raw = _safe_str(values.get(field_key))
             if not raw:
@@ -2168,166 +2153,43 @@ def _build_prepare_plan(
                     raw,
                     cfg_fields,
                 )
-            except ValueError as exc:
-                _add_issue(
-                    row_state,
-                    "ERROR",
-                    "INVALID_FIELD_VALUE",
-                    f"{field_key}: {exc}",
-                )
+            except (ValueError, TypeError):
+                values[field_key] = raw
 
-        publish_all_channels = _normalize_bool(
-            values.get("publish.all_channels")
+    # The only row-level validation is duplicate non-empty Handle.
+    # A blank Handle is passed through; Shopify may derive it from Title.
+    rows_by_handle: Dict[str, List[Dict[str, Any]]] = {}
+    for row_state in active_rows:
+        handle = _safe_str(
+            row_state["values"].get("core.handle")
         )
-        product_status = _safe_str(
-            values.get("core.status")
-        ).lower()
+        if handle:
+            rows_by_handle.setdefault(handle, []).append(row_state)
 
-        if publish_all_channels is True and product_status == "draft":
-            _add_issue(
-                row_state,
-                "WARNING",
-                "DRAFT_WITH_ALL_CHANNEL_PUBLICATION_INTENT",
-                "publish.all_channels=TRUE is allowed with "
-                "core.status=draft. The Product can be associated "
-                "with Publications, but it remains unavailable to "
-                "customers until its status becomes active.",
-            )
-        elif (
-            publish_all_channels is True
-            and product_status not in {"active", "draft"}
-        ):
+    for handle, rows in rows_by_handle.items():
+        if len(rows) <= 1:
+            continue
+        message = (
+            f"Duplicate core.handle={handle!r}; "
+            f"source_rows={[row['source_row'] for row in rows]}."
+        )
+        for row_state in rows:
             _add_issue(
                 row_state,
                 "ERROR",
-                "ALL_CHANNEL_PUBLICATION_UNSUPPORTED_STATUS",
-                "publish.all_channels=TRUE currently supports "
-                "core.status=active or draft; "
-                f"received={product_status!r}.",
+                "DUPLICATE_HANDLE",
+                message,
             )
-
-        location_code = _safe_str(
-            values.get("inventory.location_code")
-        )
-        if location_code and location_code not in locations["active_by_code"]:
-            _add_issue(
-                row_state,
-                "ERROR",
-                "UNKNOWN_LOCATION_CODE",
-                f"inventory.location_code={location_code!r} is not an "
-                "active Cfg__Locations code for this site.",
-            )
-
-        price = _safe_str(values.get("core.price"))
-        compare_at = _safe_str(values.get("core.compare_at_price"))
-        if price and compare_at:
-            try:
-                if Decimal(compare_at) < Decimal(price):
-                    _add_issue(
-                        row_state,
-                        "WARNING",
-                        "COMPARE_AT_BELOW_PRICE",
-                        "Compare-at Price is lower than Price.",
-                    )
-            except InvalidOperation:
-                pass
-
-        for option_number in (1, 2, 3):
-            name_key = f"core.option{option_number}_name"
-            value_key = f"core.option{option_number}_value"
-            name = _safe_str(values.get(name_key))
-            option_value = _safe_str(values.get(value_key))
-            if name and not option_value:
-                _add_issue(
-                    row_state,
-                    "ERROR",
-                    "OPTION_VALUE_MISSING",
-                    f"{name_key} has a value but {value_key} is empty.",
-                )
-            if option_value and not name:
-                _add_issue(
-                    row_state,
-                    "ERROR",
-                    "OPTION_NAME_MISSING",
-                    f"{value_key} has a value but {name_key} is empty.",
-                )
-
-    # sys.product_key, sys.variant_key, SKU, and Barcode are intentionally
-    # excluded from duplicate blocking. The only Product grouping identity is
-    # core.handle.
-
-    # Check option names and option-value combinations within each Product.
-    for handle, group in groups.items():
-        for option_number in (1, 2, 3):
-            name_key = f"core.option{option_number}_name"
-            names = {
-                _safe_str(row["values"].get(name_key))
-                for row in group
-                if _safe_str(row["values"].get(name_key))
-            }
-            if len(names) > 1:
-                message = (
-                    f"{name_key} is inconsistent within "
-                    f"core.handle={handle!r}: {sorted(names)}"
-                )
-                for row_state in group:
-                    _add_issue(
-                        row_state,
-                        "ERROR",
-                        "OPTION_NAME_CONFLICT",
-                        message,
-                    )
-
-        combinations: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
-        for row_state in group:
-            combination = tuple(
-                _safe_str(
-                    row_state["values"].get(
-                        f"core.option{number}_value"
-                    )
-                )
-                for number in (1, 2, 3)
-            )
-            if any(combination):
-                combinations.setdefault(combination, []).append(row_state)
-        for combination, rows in combinations.items():
-            if len(rows) > 1:
-                for row_state in rows:
-                    _add_issue(
-                        row_state,
-                        "ERROR",
-                        "DUPLICATE_OPTION_COMBINATION",
-                        "Duplicate option-value combination within "
-                        f"core.handle={handle!r}: {combination}",
-                    )
-
-    for handle, group in groups.items():
-        if any(row_state["errors"] for row_state in group):
-            message = (
-                "The Product group is blocked because at least one "
-                f"Variant row has an error: core.handle={handle!r}."
-            )
-            for row_state in group:
-                if not row_state["errors"]:
-                    _add_issue(
-                        row_state,
-                        "ERROR",
-                        "PRODUCT_GROUP_BLOCKED",
-                        message,
-                    )
 
     product_variant_counts = {
-        handle: len(group)
-        for handle, group in groups.items()
+        handle: len(rows)
+        for handle, rows in rows_by_handle.items()
     }
 
     for row_state in active_rows:
-        if row_state["errors"]:
-            row_state["status"] = "ERROR"
-        elif row_state["warnings"]:
-            row_state["status"] = "READY_WITH_WARNINGS"
-        else:
-            row_state["status"] = "READY"
+        row_state["status"] = (
+            "ERROR" if row_state["errors"] else "READY"
+        )
 
     display_by_key: Dict[str, str] = {
         column["field_key"]: column["display_name"]
@@ -2370,30 +2232,26 @@ def _build_prepare_plan(
 
     preview_rows: List[List[str]] = []
     preview_records: List[Dict[str, str]] = []
+
     for row_state in row_states:
         handle = _safe_str(
             row_state["values"].get("core.handle")
         )
-        messages = row_state["errors"] + row_state["warnings"]
-        message_text = json.dumps(
-            messages,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        defaulted_text = ";".join(
-            sorted(set(row_state["defaulted_fields"]))
-        )
-        inherited_text = ";".join(
-            sorted(set(row_state["inherited_fields"]))
-        )
+        messages = row_state["errors"]
         system_values = [
             row_state["status"],
             str(row_state["source_row"]),
             str(len(row_state["errors"])),
-            str(len(row_state["warnings"])),
-            message_text,
-            defaulted_text,
-            inherited_text,
+            "0",
+            json.dumps(
+                messages,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            ";".join(
+                sorted(set(row_state["defaulted_fields"]))
+            ),
+            "",
             str(product_variant_counts.get(handle, 0)),
         ]
         normalized_values = [
@@ -2415,53 +2273,29 @@ def _build_prepare_plan(
         for row_state in row_states
         for issue in row_state["errors"]
     ]
-    warnings = [
-        issue
-        for row_state in row_states
-        for issue in row_state["warnings"]
-    ]
+    warnings: List[Dict[str, str]] = []
     ready_rows = [
         row_state
         for row_state in active_rows
         if not row_state["errors"]
     ]
-    ready_product_handles = {
+    ready_handles = {
         _safe_str(row_state["values"].get("core.handle"))
         for row_state in ready_rows
         if _safe_str(row_state["values"].get("core.handle"))
-        and all(
-            not member["errors"]
-            for member in groups.get(
-                _safe_str(
-                    row_state["values"].get("core.handle")
-                ),
-                [],
-            )
-        )
     }
 
     if not active_rows:
+        # No row-level warning/error is added; the run is simply not ready.
         status = "FAILED_VALIDATION"
-        errors.append(
-            {
-                "level": "ERROR",
-                "code": "NO_ACTIVE_ROWS",
-                "message": "Input has no CREATE rows.",
-            }
-        )
     elif errors:
         status = "FAILED_VALIDATION"
-    elif warnings:
-        status = "READY_WITH_WARNINGS"
     else:
         status = "READY"
 
     return {
         "status": status,
-        "ready_for_apply": status in {
-            "READY",
-            "READY_WITH_WARNINGS",
-        },
+        "ready_for_apply": status == "READY",
         "preview_matrix": [
             preview_display_headers,
             preview_field_keys,
@@ -2478,14 +2312,13 @@ def _build_prepare_plan(
             "rows_recognized": len(active_rows),
             "rows_planned": len(ready_rows),
             "rows_skipped": len(skipped_rows),
-            "product_groups": len(groups),
-            "business_objects_planned": len(ready_product_handles),
+            "product_groups": len(rows_by_handle),
+            "business_objects_planned": len(ready_handles),
             "variant_objects_planned": len(ready_rows),
-            "warning_count": len(warnings),
+            "warning_count": 0,
             "error_count": len(errors),
         },
     }
-
 
 def update_existing_notebook_registry_row(
     *,
