@@ -95,20 +95,41 @@ Overall status: `ACTIVE_BUT_UNVALIDATED`
 
 Overall status: `EXPERIMENTAL`
 
-- `generic_prepare.py`
-- `generic_apply.py`
+- `generic_prepare.py`: Current module version `1.6.4`. It reads and validates
+  Generic Create inputs, applies configured defaults, treats explicit
+  `Cfg__Fields.entity_type` as authoritative, groups Product rows by
+  `core.handle`, and produces the reviewed Preview plan. Draft plus
+  `publish.all_channels=TRUE` is valid with a warning.
+- `generic_apply.py`: Current module version `1.5.3`; it requires
+  `generic_prepare` `1.6.4`. It re-reads configuration and Input, rebuilds the
+  Prepare plan, verifies Preview by physical `sys.source_row`, resolves
+  selections to Product Handles, performs current Shopify Handle preflight,
+  and separates dry-run planning from live Product and Publication mutations.
 
 The area is still under design and construction. Existing generic, legacy, wholesale, and SPU preparation paths do not yet establish one final common product-creation contract.
 
 Required safety direction includes Prepare → Review → Apply, `APPROVED` filtering, Apply-time configuration and handle checks, append-only result history with stable idempotency keys, DRAFT-first creation, partial-failure retention in DRAFT, and explicit recovery/reconciliation behavior.
 
+`core.handle` is the Shopify Product identity for Generic Create.
+`sys.product_key`, `sys.variant_key`, SKU, and Barcode remain trace or business
+values and are not duplicate-blocking identities. A Draft Product may be
+associated with accessible Publications, but customer availability remains
+controlled by Product status.
+
 ### `shopify_setup`
 
 Overall status: `ACTIVE_BUT_UNVALIDATED`
 
-- `sync_locations.py`
+- `sync_locations.py`: Current module version `2.3.1`. It resolves the active
+  project through the Workspace Project Registry, then uses the selected
+  project Console Core route and project-specific Secret name to synchronize
+  Shopify Locations into `Cfg__Locations`.
 
-The module appears to support site/setup configuration. Its precise ownership, input/output contract, side effects, and relationship to Console routing require end-to-end validation.
+`Cfg__Locations` system-managed fields are `site_code`, `location_name`,
+`location_gid`, `province_code`, `active`, and `synced_at`. Human-managed
+fields are `location_code`, `is_default`, and `notes`; synchronization
+preserves those human values. End-to-end validation and confirmed real-write
+evidence remain outstanding.
 
 ### `business_overview`
 
@@ -148,6 +169,12 @@ The sibling `Console_Core_Colab/PBS` workspace currently groups Runners for:
 - product creation, including legacy, wholesale, generic, and SPU-preparation paths.
 
 Notebook presence or absence does not prove Python capability. Notebook filenames, saved output, job names, module versions, and Cell parameters require contract validation against actual imported functions.
+
+The APOLLO Generic Create Runners are operational assets in
+`Console_Core_Colab`, not formal Python Current. RichText generation uses
+non-empty current Input HTML first and may use existing generated RichText
+only when Input is blank. Runtime copies under `.runtime/ecom` are disposable
+execution caches and may lag Git Current.
 
 ## Known Identity and Boundary Issues
 

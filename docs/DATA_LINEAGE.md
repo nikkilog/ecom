@@ -26,6 +26,20 @@ Purpose:
 
 Key resources include the central Console, `Cfg__Sites`, `Cfg__colab&sheets`, `Cfg__account_id`, `Cfg__Fields`, and `Cfg__MetaobjectDefs`.
 
+Workspace-aware operations use two-stage project routing:
+
+```text
+WORKSPACE_GSHEET
+→ Workspace Project Registry / Cfg__Projects
+→ active PROJECT_CODE row
+→ project Console Core URL + project Google Secret name
+→ project Cfg__account_id
+→ project operation
+```
+
+The Workspace credential is limited to resolving the registry route. The
+project-selected credential authenticates the project operation.
+
 `Cfg__Fields` canonical logical key:
 
 ```text
@@ -33,6 +47,13 @@ entity_type + field_key
 ```
 
 Automated synchronization may restore Shopify facts and system-derived columns, but it must preserve human governance such as purpose, sequence, lookup/join semantics, concepts, applicability, notes, and review status.
+
+`Cfg__Locations` grain is one registered Shopify Location per `site_code` and
+`location_gid`. System synchronization owns `site_code`, `location_name`,
+`location_gid`, `province_code`, `active`, and `synced_at`. Operators own
+`location_code`, `is_default`, and `notes`. Generic Create consumes an active
+`location_code` as its stable human-facing routing key and resolves the
+immutable Location GID before execution.
 
 Known non-core or site-specific content, such as analytics/Overview routes and PBS size ordering, must not be promoted into universal Console Core facts merely because it is present in the Console.
 
@@ -94,6 +115,15 @@ Purpose:
 
 Review output must preserve a stable key so Apply can identify approved business objects without relying on row order. Approval is not a substitute for Apply-time validation against current configuration and Shopify state.
 
+For Generic Create, `core.handle` is the Product identity. Physical
+`sys.source_row` anchors Preview snapshot verification; `sys.product_key`,
+`sys.variant_key`, SKU, and Barcode remain trace or business values.
+
+RichText transformation treats non-empty current Input HTML as authoritative.
+Previously generated RichText HTML is fallback input only when the
+corresponding current Input is blank; valid historical output must not
+silently outrank corrected Input.
+
 ### 5. Edit / Apply
 
 Canonical execution:
@@ -122,6 +152,13 @@ Important distinctions:
 These counts are not interchangeable.
 
 State-dependent operations must re-read current facts. Reference `LINK`, `UNLINK`, and `REPLACE_ALL` calculate differences from current values. `CLEAR` behavior is defined by field type and module. Variant updates prefer immutable IDs over the SKU being modified. Metaobject updates prefer `entry_gid`.
+
+Generic Apply `1.5.3` requires Generic Prepare `1.6.4`. Apply re-reads Input,
+Defaults, `Cfg__Fields`, and `Cfg__Locations`, rebuilds the Prepare plan, and
+verifies it against Preview before selection and Shopify Handle preflight.
+Draft plus all-channel intent is a warning rather than an error. Publication
+association is an execution relationship; it does not make a Draft Product
+customer-visible.
 
 ### 6. Shopify
 

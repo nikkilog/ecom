@@ -19,6 +19,13 @@ Console_Core_Colab
 
 Notebook code should progressively shrink to configuration, loading, invocation, and presentation. Core business logic belongs in Git-hosted Python modules.
 
+Configured Secret names are runtime inputs, not credentials stored in source.
+Colab preserves the exact configured logical name. Local execution derives the
+canonical `PROJECT_CODE` alias once at the authentication boundary for
+supported suffixes such as `_GSHEET`, `_SHOPIFY_ACCESS_TOKEN`, and
+`_SHOPIFY_TOKEN`; business and API call sites must not maintain per-project
+Secret mappings.
+
 ## Logical Notebook Structure
 
 Historical Runners may physically use more cells, but they should map to three logical sections.
@@ -97,6 +104,21 @@ Use one or more reliable mechanisms:
 
 The Runtime must fail closed when the expected module version or revision gate does not match.
 
+High-risk Apply Runners enforce the version contract twice:
+
+1. immediately after loading the modules; and
+2. immediately before calling Apply.
+
+Both gates define expected versions in the current execution chain and compare
+them with the loaded modules. For Generic Create Current, Apply `1.5.3`
+requires Prepare `1.6.4`.
+
+A clean Kernel is required for acceptance after a module or expected-version
+change. Saved globals, imported modules, Notebook outputs, local `__pycache__`,
+and `.runtime/ecom` copies are not evidence of Current. Acceptance starts from
+the first cell and prints the repository, branch, commit SHA, module
+`__file__`, module versions, and loaded function source before execution.
+
 ## Progress and Heartbeat
 
 Long tasks must not remain silent.
@@ -149,6 +171,12 @@ error_count
 Planned `inserted`, `written`, or `created` counts must be labeled as planned. Actual counts are emitted only after confirmed side effects.
 
 `DRY_RUN` must disclose any remaining side effects, including Sheet creation, mapping writes, RunLog writes, cache changes, or other operational mutations. A dry run with undisclosed side effects violates this contract.
+
+Generic Apply Dry Run may perform current-state Shopify reads for accessible
+Publications and Handle conflict preflight. It must not invoke Product,
+Publication, Inventory, or Metafield mutation operations. Result and RunLog
+rows created as dry-run evidence must report planned operations, zero Shopify
+business writes, and the exact remaining Sheet side effects.
 
 ## Write Gates
 

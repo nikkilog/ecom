@@ -27,9 +27,9 @@ class _PreflightClient:
 
 class GenericApplyTests(unittest.TestCase):
     def test_apply_prepare_version_contract(self):
-        self.assertEqual(apply.MODULE_VERSION, "1.5.2")
-        self.assertEqual(prepare.MODULE_VERSION, "1.6.3")
-        self.assertEqual(apply.EXPECTED_PREPARE_MODULE_VERSION, "1.6.3")
+        self.assertEqual(apply.MODULE_VERSION, "1.5.3")
+        self.assertEqual(prepare.MODULE_VERSION, "1.6.4")
+        self.assertEqual(apply.EXPECTED_PREPARE_MODULE_VERSION, "1.6.4")
         self.assertEqual(
             prepare.MODULE_VERSION,
             apply.EXPECTED_PREPARE_MODULE_VERSION,
