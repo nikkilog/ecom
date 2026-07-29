@@ -117,9 +117,18 @@ Overall status: `EXPERIMENTAL`
 The area is still under design and construction. Existing generic, legacy, wholesale, and SPU preparation paths do not yet establish one final common product-creation contract.
 
 Current evidence level:
-`USER_CONFIRMED_RUNTIME_SUCCESS_WITH_STATIC_AND_MOCK_VALIDATION`. This does
-not establish an independently audited full live run, complete successful Run
-Summary, final Result-row reconciliation, or Shopify object readback.
+`LIVE_MULTI_VARIANT_PRODUCT_CREATION_VALIDATED`. Generic Prepare `1.6.6` has
+completed a live two-row, one-Product, two-Variant validation with `READY`,
+zero warnings, and zero errors. Generic Apply `1.5.10` has completed a live
+creation of one DRAFT Product with two Variants, associated the Product with
+accessible Publications, and wrote two Result rows successfully. The
+`V_Product_Handle.Product Handle` snapshot was read and compared locally, with
+zero Shopify Handle lookup requests. The quota-safe Google Sheets writer
+succeeded for this single-Product run.
+
+This evidence does not establish large-batch concurrency or quota stress
+validation. It also does not certify every edge Schema, Publication,
+partial-failure, retry-exhaustion, or recovery path through live execution.
 
 Required safety direction includes Prepare → Review → Apply, `APPROVED` filtering, Apply-time configuration and snapshot checks, append-only result history with stable idempotency keys, DRAFT-first creation, partial-failure retention in DRAFT, and explicit recovery/reconciliation behavior.
 
