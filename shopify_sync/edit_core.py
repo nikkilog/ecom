@@ -1,11 +1,12 @@
-# delivery_name: edit_core_inventory_cost_clear_v9_20260626.py
+# delivery_name: edit_core_product_status_v10_20260730.py
 # deployment_path: shopify_sync/edit_core.py
-# Full Edit__Core apply engine: core fields, metafields, SKU/cost/prices, and media.
+# Full Edit__Core apply engine: core fields, product status, metafields, SKU/cost/prices, and media.
 # core.cost uses the shop default currency and supports SET/CLEAR; core.cost_currency is intentionally not read or written.
+# core.status supports SET with ACTIVE, DRAFT, or ARCHIVED.
 
 from __future__ import annotations
 
-MODULE_VERSION = "edit_core_inventory_cost_clear_v9_20260626"
+MODULE_VERSION = "edit_core_product_status_v10_20260730"
 
 import base64
 import datetime as dt
@@ -62,6 +63,8 @@ SUPPORTED_ENTITY_TYPES = {"PRODUCT", "VARIANT", "COLLECTION", "PAGE"}
 SUPPORTED_METAFIELD_ACTIONS = {"SET", "CLEAR"}
 SUPPORTED_CORE_TAG_ACTIONS = {"SET", "CLEAR", "ADD", "REMOVE"}
 SUPPORTED_CORE_SCALAR_ACTIONS = {"SET", "CLEAR"}
+SUPPORTED_PRODUCT_STATUS_ACTIONS = {"SET"}
+SUPPORTED_PRODUCT_STATUS_VALUES = {"ACTIVE", "DRAFT", "ARCHIVED"}
 SUPPORTED_CORE_PRICE_ACTIONS = {"SET"}
 SUPPORTED_CORE_SKU_ACTIONS = {"SET"}
 SUPPORTED_CORE_COST_ACTIONS = {"SET", "CLEAR"}
@@ -79,6 +82,7 @@ FORBIDDEN_SHOPIFY_PREFIXES = ("mf.shopify.", "v_mf.shopify.", "v.mf.shopify.")
 PRODUCT_CORE_KEYS = {
     "core.title",
     "core.product_type",
+    "core.status",
     "core.tags",
     "core.description_html",
     "core.description",
@@ -135,6 +139,7 @@ mutation productUpdate($input: ProductInput!) {
       id
       title
       productType
+      status
       vendor
       tags
       descriptionHtml
@@ -908,6 +913,12 @@ def validate_row(entity_type: str, field_key: str, action: str) -> tuple[bool, s
         if act not in SUPPORTED_CORE_TAG_ACTIONS:
             return False, "action_not_supported"
 
+    elif fk == "core.status":
+        if et != "PRODUCT":
+            return False, "core_entity_mismatch"
+        if act not in SUPPORTED_PRODUCT_STATUS_ACTIONS:
+            return False, "action_not_supported"
+
     elif fk in {
         "core.title",
         "core.product_type",
@@ -1604,6 +1615,8 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                 "id": owner_id,
                 "title": None,
                 "productType": None,
+                "status_present": False,
+                "status": None,
                 "vendor": None,
                 "descriptionHtml": None,
                 "seo_title_present": False,
@@ -1676,6 +1689,27 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                     "action": action,
                     "plan_type": "product_core",
                     "value_preview": bucket["productType"],
+                })
+
+            elif fk == "core.status":
+                status = _upper_strip(desired)
+                if status not in SUPPORTED_PRODUCT_STATUS_VALUES:
+                    allowed = ", ".join(sorted(SUPPORTED_PRODUCT_STATUS_VALUES))
+                    raise ValueError(f"core.status must be one of: {allowed}")
+
+                bucket = get_product_bucket(owner_id)
+                bucket["status_present"] = True
+                bucket["status"] = status
+                bucket["source_rows"].append(sheet_row)
+                bucket["field_keys"].append(fk)
+                preview_rows.append({
+                    "sheet_row": sheet_row,
+                    "entity_type": entity_type,
+                    "owner_id": owner_id,
+                    "field_key": fk,
+                    "action": action,
+                    "plan_type": "product_core",
+                    "value_preview": status,
                 })
 
             elif fk == "core.vendor":
@@ -1906,6 +1940,9 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
 
         if bucket["productType"] is not None:
             input_obj["productType"] = bucket["productType"]
+
+        if bucket["status_present"]:
+            input_obj["status"] = bucket["status"]
 
         if bucket["vendor"] is not None:
             input_obj["vendor"] = bucket["vendor"]
