@@ -30,7 +30,14 @@ Overall status: `ACTIVE_BUT_UNVALIDATED`
 
 Known intended responsibilities:
 
-- `export_idx_tables.py`: build product and variant index snapshots.
+- `3_1_1_export_product_idx_tables.py`
+  (`shopify_export.3_1_1_export_product_idx_tables`): build Product and Variant
+  index snapshots in `IDX__Products` and `IDX__Variants`. The 3.1.1 pilot was
+  live-validated in Local and Colab at Git commit
+  `eb5a987ee2363b4e28ef594aff84bf38a7de21df`, with both Runtimes loading module
+  version `2026-05-24-calc-fields-in-fetch-v2` and reporting reconciled business
+  results. This is bounded validation of the 3.1.1 pilot, not validation of the
+  whole `shopify_export` package or a production-readiness claim.
 - `dl_values_long.py`: fetch configured dependencies not covered by index tables.
 - `build_product_views.py`: build operational views from index, long values, and configuration without Shopify access.
 - `export_collection_views.py`: serve multiple collection views from a shared Shopify pull.

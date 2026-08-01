@@ -18,13 +18,21 @@ Console_Core_Colab
 != independent project
 ```
 
+For the validated Product IDX Runner, Local execution uses only the canonical
+checkout at `/Users/nikki/Documents/AI_Workspace/Projects/Console_Core`. Local
+must fail closed when that checkout or the target module is unavailable; it
+must not create, search for, or fall back to `.runtime/ecom` or another local
+checkout. Colab may create a clean, temporary Git clone at `/content/ecom`.
+That clone is ephemeral Runtime material and never a second source of truth or
+an independent Current.
+
 Notebook code should progressively shrink to configuration, loading, invocation, and presentation. Core business logic belongs in Git-hosted Python modules.
 
 The Console Core Git repository is Current for Python, tests, and formal
 documentation. `Console_Core_Colab` carries Notebook entry points and Runtime
 copies only. Notebook expected-version gates must align with Console Core
 Current. Notebook Current must have saved outputs cleared; saved output is
-runtime history, not Current acceptance evidence.
+runtime history, not Current acceptance evidence or Current authority.
 
 Configured Secret names are runtime inputs, not credentials stored in source.
 Colab preserves the exact configured logical name. Local execution derives the
@@ -105,6 +113,14 @@ The Run section:
 ## Preventing Stale Colab Modules
 
 Updating GitHub does not prove that a running Kernel loaded new code.
+
+Modules whose filenames begin with digits, such as
+`shopify_export.3_1_1_export_product_idx_tables`, must be loaded from their full
+module string with `importlib`; normal Python import statement syntax cannot
+name them directly. Before loading renamed or numeric-leading modules, the
+Runner must invalidate import caches and clear relevant current and legacy
+entries from `sys.modules` so a stale Kernel module cannot masquerade as
+Current.
 
 Use one or more reliable mechanisms:
 
