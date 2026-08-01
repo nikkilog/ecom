@@ -1,0 +1,4 @@
+interface:
+  display_name: "Console Core Closeout"
+  short_description: "Close out Console Core Current, runtime evidence, and Git safely"
+  default_prompt: "Use $console-core-closeout to audit and close out this Console Core task with exact Current, Runner/runtime evidence, safe Git handling, and complete downstream routing."
