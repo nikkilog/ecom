@@ -158,6 +158,13 @@ These counts are not interchangeable.
 
 State-dependent operations must re-read current facts. Reference `LINK`, `UNLINK`, and `REPLACE_ALL` calculate differences from current values. `CLEAR` behavior is defined by field type and module. Variant updates prefer immutable IDs over the SKU being modified. Metaobject updates prefer `entry_gid`.
 
+Generic Edit__Core maps Product Status through the canonical `Cfg__Fields`
+identity `PRODUCT + core.status` (`product.status`, string, CORE). The write
+contract accepts only `SET` with normalized `ACTIVE`, `DRAFT`, or `ARCHIVED`;
+blank or unsupported values fail during plan validation. Metafield `CLEAR`
+uses delete/unset semantics by owner ID, namespace, and key rather than an
+empty-string SET.
+
 APOLLO Shipping Profile Assignment Current has one instruction row per
 Shopify Product Variant. Its stable object key is the normalized immutable
 Product Variant GID derived from the required positive numeric Variant ID;

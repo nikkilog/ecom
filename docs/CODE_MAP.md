@@ -68,7 +68,11 @@ Substantive modules:
 
 - `edit_metafields.py`
 - `edit_metafieldblocks.py`
-- `edit_core.py`
+- `edit_core.py`: Current module version
+  `edit_core_product_status_v10_20260730`. Its generic Product core contract
+  includes `core.status` with `SET` for `ACTIVE`, `DRAFT`, or `ARCHIVED`.
+  This records the authoritative implementation and focused local contract
+  tests; it does not establish live end-to-end validation.
 - `edit_entries_create.py`
 - `edit_entries_update.py`
 - `edit_refs.py`
@@ -80,6 +84,10 @@ Placeholders:
 - `init.py`: `EMPTY_PLACEHOLDER` — zero bytes and not a package `__init__.py`.
 
 The edit modules require evidence for complete-plan validation, current-state reads, Preview fidelity, dual write gates, ID-based owner resolution, type-specific CLEAR behavior, reference difference calculation, ordered values, batch-failure isolation, result accuracy, and RunLog phase fidelity.
+
+`edit_metafields.py` defines metafield `CLEAR` as deleting/unsetting the
+metafield by immutable owner ID, namespace, and key. It does not model CLEAR
+as an empty-string SET.
 
 ### `shopify_ops`
 

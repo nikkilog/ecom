@@ -37,6 +37,14 @@ Secret mappings.
 
 Historical Runners may physically use more cells, but they should map to three logical sections.
 
+For the GitHub-backed Edit__Core Runner, Config declares
+`EXPECTED_MODULE_VERSION`; Load refreshes `main` and locates the canonical
+`shopify_sync/edit_core.py`; Run imports or reloads that module, prints its
+path and `MODULE_VERSION`, and fails closed unless the actual version exactly
+matches Config. A versioned delivery name never replaces the canonical import
+path. Current Edit__Core expects
+`edit_core_product_status_v10_20260730`.
+
 ### Config
 
 Contains explicit runtime parameters:
