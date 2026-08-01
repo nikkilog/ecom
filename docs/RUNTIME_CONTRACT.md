@@ -218,6 +218,26 @@ EXPECTED_MODULE_VERSION = <approved version>
 
 Failure of any required gate returns a Preview, `SKIPPED`, or validation failure without real business-object writes.
 
+## APOLLO Shipping Profile Assignment Current
+
+The stable Runner defaults to `DRY_RUN=True` and `CONFIRMED=False`. It requests
+Shopify Admin GraphQL `2026-07`, requires at least `2026-07`, and fails closed
+if `X-Shopify-API-Version` reports a different effective version. It also
+fails closed when `shop.features.marketDrivenShipping` cannot be verified or
+is enabled.
+
+The required `Edit__ShippingProfileAssignments` Tab and its exact five-column
+header must already exist. The Runner must not call `add_worksheet` or mutate
+Sheet structure when the Tab is absent. READY Variants are automatically
+processed in bounded API batches; a confirmed mutation is successful only
+when per-Variant readback equals the requested target Delivery Profile GID.
+
+`NO_CHANGE` and `rows_skipped` are distinct: `no_change_count` records
+Variants already in the requested target state, while `rows_skipped` counts
+only explicit skip outcomes. Validation errors are reported through
+`error_count`; neither validation errors nor `NO_CHANGE` inflate
+`rows_skipped`. The existing 18-column RunLog header remains unchanged.
+
 ## Unified Result Contract
 
 Recommended top-level result:

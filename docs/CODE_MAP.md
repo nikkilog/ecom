@@ -199,6 +199,15 @@ non-empty current Input HTML first and may use existing generated RichText
 only when Input is blank. Runtime copies under `.runtime/ecom` are disposable
 execution caches and may lag Git Current.
 
+The stable APOLLO Shipping Profile Assignment Runner is
+`APOLLO/05_5. export_shipping/edit_shipping_profile_assignments.ipynb` in the
+sibling Notebook workspace. Status: `ACTIVE_BUT_UNVALIDATED`. It is a
+Colab-only Controller/runtime implementation, not a Python module and not a
+Shipping Suite refactor. The prior v1 remains historical evidence and has not
+been deleted or promoted. The Current Runner is bounded to exact Variant ID →
+Delivery Profile GID instructions and preserves the existing 18-column
+RunLog schema.
+
 ## Known Identity and Boundary Issues
 
 - The Git remote remains `nikkilog/ecom.git`, which does not match the Console Core project identity. It is recorded, not changed.

@@ -42,6 +42,12 @@ Detailed package status is owned by `docs/CODE_MAP.md`. Data stages and ownershi
 
 ## Current Status
 
+- The stable APOLLO Shipping Profile Assignment Runner is
+  `Console_Core_Colab/APOLLO/05_5. export_shipping/edit_shipping_profile_assignments.ipynb`.
+  Its bounded closeout source was the user-designated local v4 with SHA-256
+  `f79664d3cb9ebd9fe614b660a10bf491000ca005c8f921aa17662f939a982da5`;
+  the cleaned stable Current has SHA-256
+  `1441ad66f8f5f0945ca20a205bfe2cbee2e24e209d5a3f43614d360c72dd97f0`.
 - The existing repository is connected to `https://github.com/nikkilog/ecom.git`; the remote name does not match the Console Core project identity. This onboarding records the mismatch but does not change the remote.
 - Existing Python and Notebook assets have been preserved in place.
 - Existing modules have not received end-to-end production validation as part of onboarding.
@@ -53,7 +59,9 @@ Detailed package status is owned by `docs/CODE_MAP.md`. Data stages and ownershi
 - Commerce Analytics Hub collection, analytics, validation, reporting, Overview, and Google Ads responsibilities.
 - Moving analytics or Overview routes currently mixed into the Console.
 - Treating PBS-specific configuration, including size ordering, as universal Console Core facts.
-- Modifying Python, Notebook, requirements, Runtime Cache, Git remote, Google Drive, Google Sheets, Shopify, or Secret material during governance onboarding.
+- Modifying Python, requirements, Runtime Cache, Git remote, Google Drive,
+  Google Sheets, Shopify, Secret material, or Notebook assets outside an
+  explicitly authorized bounded implementation package during governance onboarding.
 - Claiming a module is production-ready without end-to-end evidence.
 
 ## Open Questions and Known Overlap
@@ -79,4 +87,6 @@ Detailed package status is owned by `docs/CODE_MAP.md`. Data stages and ownershi
 
 ## Next Action
 
-Perform a read-only call-site and contract validation of the existing Python modules and Notebook Runners, then produce a bounded plan that identifies authoritative implementations, incomplete wiring, test priorities, and safe retirement candidates without modifying operational code.
+Run the stable APOLLO Shipping Profile Assignment Runner from a clean Colab
+kernel in safe Preview mode (`DRY_RUN=True`, `CONFIRMED=False`), including a
+missing-input-Tab fail-closed check, without repeating the completed full live Apply.

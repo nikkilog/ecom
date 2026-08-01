@@ -158,6 +158,27 @@ These counts are not interchangeable.
 
 State-dependent operations must re-read current facts. Reference `LINK`, `UNLINK`, and `REPLACE_ALL` calculate differences from current values. `CLEAR` behavior is defined by field type and module. Variant updates prefer immutable IDs over the SKU being modified. Metaobject updates prefer `entry_gid`.
 
+APOLLO Shipping Profile Assignment Current has one instruction row per
+Shopify Product Variant. Its stable object key is the normalized immutable
+Product Variant GID derived from the required positive numeric Variant ID;
+the target is a complete immutable Delivery Profile GID. `EXACT_ONE` forbids
+duplicate Variant instructions in a run. The complete flow is:
+
+```text
+exact five-column Input row
+→ local validation
+→ current Variant + target Delivery Profile read
+→ READY or NO_CHANGE Preview
+→ dual write gate
+→ bounded deliveryProfileUpdate batches
+→ per-Variant Delivery Profile readback
+→ SUCCESS_VERIFIED / failure Result and RunLog
+```
+
+`NO_CHANGE` is a validated current-state outcome and is counted separately;
+it is not a skipped row and not a Shopify write. A missing input Tab fails
+closed without creating or modifying a worksheet.
+
 Generic Apply `1.5.10` requires Generic Prepare `1.6.6`. Apply does not read or
 compare Preview as an execution gate. It re-reads current Input, Defaults,
 `Cfg__Fields`, and `Cfg__Locations`, then rebuilds the execution plan from
