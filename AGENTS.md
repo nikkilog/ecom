@@ -109,6 +109,6 @@ The project is in `ONBOARDING`.
 
 ## Closeout Method
 
-Use `$project-closeout` for project closeout until repeated, stable, project-specific closeout logic demonstrates that a dedicated Console Core Skill is necessary.
+Use `$console-core-closeout` for Console Core project closeout.
 
 Closeout must report validation, warnings, unresolved evidence, Git status, commit/push/cloud-sync state, and the safe resume point. Identity or lifecycle changes require a separate Workspace Control synchronization task.

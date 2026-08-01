@@ -7,7 +7,7 @@ REPOSITORY_PATH: /Users/nikki/Documents/AI_Workspace/Projects/Console_Core
 LIFECYCLE: ONBOARDING
 MAINTENANCE_PROFILE: COMPLEX
 CURRENT_AUTHORITY: This PROJECT.md for project state and routing; the Console_Core Git main branch for Python, requirements, tests, and formal project documentation
-CLOSEOUT_METHOD: $project-closeout
+CLOSEOUT_METHOD: $console-core-closeout
 ```
 
 ## Project Purpose
