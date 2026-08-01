@@ -4,3 +4,4 @@ pandas
 requests
 google-auth
 google-ads
+urllib3
