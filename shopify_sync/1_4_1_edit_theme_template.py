@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-shopify_sync.edit_theme_template
+shopify_sync.1_4_1_edit_theme_template
 
 Batch update Shopify theme template suffix for PRODUCT / COLLECTION / PAGE from Google Sheets.
 
@@ -27,7 +27,9 @@ from __future__ import annotations
 import base64
 import json
 import os
+import random
 import re
+import sys
 import time
 import traceback
 from dataclasses import dataclass
@@ -44,6 +46,16 @@ except Exception as exc:  # pragma: no cover
     raise ImportError(
         "Missing Google Sheets dependencies. Install with: pip install gspread google-auth pandas requests"
     ) from exc
+
+
+MODULE_PATH = "shopify_sync.1_4_1_edit_theme_template"
+MODULE_VERSION = "2026-08-02-runtime-boundary-v1"
+DEFAULT_JOB_NAME = "edit_theme_template"
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
 
 REQUIRED_COLUMNS = [
@@ -105,53 +117,596 @@ def _is_truthy(v: Any) -> bool:
     return s in {"true", "yes", "y", "1", "ok", "ready", "set"}
 
 
-def _get_secret(secret_name: str) -> str:
-    """
-    Read secret from:
-      1. Google Colab userdata
-      2. environment variable
-    """
-    secret_name = _as_str(secret_name)
-    if not secret_name:
-        raise ValueError("Secret name is blank.")
+@dataclass(frozen=True)
+class SecretValue:
+    value: str
+    source_type: str
+    source_detail: str
 
+
+def _runtime_mode() -> str:
     try:
-        from google.colab import userdata  # type: ignore
-        val = userdata.get(secret_name)
-        if val:
-            return val
+        import google.colab  # type: ignore  # noqa: F401
+        return "COLAB"
     except Exception:
-        pass
-
-    val = os.environ.get(secret_name)
-    if val:
-        return val
-
-    raise KeyError(f"Secret not found: {secret_name}")
+        return "LOCAL"
 
 
-def _load_sa_info_from_b64_secret(secret_name: str) -> Dict[str, Any]:
-    raw = _get_secret(secret_name).strip()
-    # Supports either base64 JSON or raw JSON.
-    if raw.startswith("{"):
-        return json.loads(raw)
+def _workspace_secret_result_to_value(result: Any) -> SecretValue:
+    source_detail = getattr(result, "resolved_name", "") or ""
+    path = getattr(result, "path", None)
+    key = getattr(result, "key", None)
+
+    if path is not None:
+        source_detail = str(path)
+        if key:
+            source_detail += f"::{key}"
+    elif key:
+        source_detail = str(key)
+
+    return SecretValue(
+        value=str(result.value).strip(),
+        source_type=str(result.source_type).strip(),
+        source_detail=str(source_detail).strip(),
+    )
+
+
+def read_secret(
+    secret_name: str,
+    *,
+    project_code: str,
+    explicit_value: Optional[str] = None,
+    secret_home: Optional[str] = None,
+) -> SecretValue:
+    """Resolve one secret without logging its value."""
+    name = _as_str(secret_name)
+    resolved_project_code = _as_str(project_code).upper()
+
+    if not name:
+        raise ValueError("Secret name is blank.")
+    if not resolved_project_code:
+        raise ValueError("PROJECT_CODE is required for Secret resolution.")
+
+    if explicit_value is not None and _as_str(explicit_value):
+        return SecretValue(
+            value=_as_str(explicit_value),
+            source_type="EXPLICIT_VALUE",
+            source_detail="caller",
+        )
+
+    if _runtime_mode() == "COLAB":
+        try:
+            from google.colab import userdata  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("Colab Secret adapter is unavailable.") from exc
+
+        value = userdata.get(name)
+        if value is None or not str(value).strip():
+            raise KeyError(
+                f"Colab Secret {name!r} is missing or not enabled for this notebook."
+            )
+        return SecretValue(
+            value=str(value).strip(),
+            source_type="COLAB_SECRETS",
+            source_detail=name,
+        )
+
     try:
-        decoded = base64.b64decode(raw).decode("utf-8")
-        return json.loads(decoded)
+        from workspace_secret_resolver import WorkspaceSecretResolver
     except Exception as exc:
-        raise ValueError(
-            f"Secret {secret_name} is neither raw service-account JSON nor base64-encoded JSON."
+        raise RuntimeError(
+            "Workspace Secret Resolver is required for Local execution. "
+            "Install it once into the active Python environment with:\n"
+            f"{sys.executable} -m pip install -e "
+            "/Users/nikki/Documents/AI_Workspace/Projects/Workspace_Secret_Resolver"
         ) from exc
 
+    resolver = WorkspaceSecretResolver(
+        resolved_project_code,
+        secret_home=secret_home,
+    )
 
-def _gspread_client_from_sa_secret(secret_name: str) -> gspread.Client:
-    info = _load_sa_info_from_b64_secret(secret_name)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    aliases: Tuple[str, ...] = ()
+    normalized_name = name.upper()
+    for suffix in (
+        "_GSHEET",
+        "_SHOPIFY_ACCESS_TOKEN",
+        "_SHOPIFY_TOKEN",
+    ):
+        if normalized_name.endswith(suffix):
+            canonical_name = f"{resolved_project_code}{suffix}"
+            if canonical_name != name:
+                aliases = (canonical_name,)
+            break
+
+    result = resolver.read(name, aliases=aliases)
+    return _workspace_secret_result_to_value(result)
+
+
+def _get_secret(
+    secret_name: str,
+    *,
+    project_code: str,
+    secret_home: Optional[str] = None,
+) -> str:
+    """Backward-compatible value-only adapter over the formal Secret boundary."""
+    return read_secret(
+        secret_name,
+        project_code=project_code,
+        secret_home=secret_home,
+    ).value
+
+
+def _parse_service_account_text(raw_value: str) -> Tuple[Dict[str, Any], str]:
+    raw = _as_str(raw_value)
+    if not raw:
+        raise ValueError("Google service-account Secret is empty.")
+
+    try:
+        info = json.loads(raw)
+        secret_format = "RAW_JSON"
+    except Exception:
+        try:
+            padded = raw + "=" * ((4 - len(raw) % 4) % 4)
+            info = json.loads(base64.b64decode(padded).decode("utf-8"))
+            secret_format = "BASE64_JSON"
+        except Exception as exc:
+            raise ValueError(
+                "Google service-account Secret is neither valid raw JSON nor Base64 JSON."
+            ) from exc
+
+    required = {"type", "project_id", "private_key", "client_email", "token_uri"}
+    missing = sorted(key for key in required if not info.get(key))
+    if missing or info.get("type") != "service_account":
+        raise ValueError(
+            "Google Secret is not a complete service-account credential; "
+            f"missing={missing}."
+        )
+    return info, secret_format
+
+
+def _load_sa_info_from_b64_secret(
+    secret_name: str,
+    *,
+    project_code: str,
+    secret_home: Optional[str] = None,
+) -> Dict[str, Any]:
+    raw = _get_secret(
+        secret_name,
+        project_code=project_code,
+        secret_home=secret_home,
+    )
+    info, _secret_format = _parse_service_account_text(raw)
+    return info
+
+
+def _gspread_client_from_sa_secret(
+    secret_name: str,
+    *,
+    project_code: str,
+    secret_home: Optional[str] = None,
+) -> gspread.Client:
+    info = _load_sa_info_from_b64_secret(
+        secret_name,
+        project_code=project_code,
+        secret_home=secret_home,
+    )
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
+
+
+def _gspread_client_from_sa_value(raw_value: str) -> gspread.Client:
+    info, _secret_format = _parse_service_account_text(raw_value)
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    return gspread.authorize(creds)
+
+
+def _sheets_error_status(exc: BaseException) -> Optional[int]:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(response, "status", None)
+
+    try:
+        return int(status) if status is not None else None
+    except Exception:
+        return None
+
+
+def _is_retryable_sheets_error(
+    exc: BaseException,
+    *,
+    retry_5xx: bool = True,
+) -> bool:
+    status = _sheets_error_status(exc)
+    if status == 429:
+        return True
+    if retry_5xx and status in {500, 502, 503, 504}:
+        return True
+
+    err_text = str(exc).lower()
+    quota_tokens = (
+        "resource_exhausted",
+        "ratelimitexceeded",
+        "userratelimitexceeded",
+        "rate limit exceeded",
+        "quota exceeded",
+        "read requests per minute",
+        "write requests per minute",
+        "too many requests",
+    )
+    return any(token in err_text for token in quota_tokens)
+
+
+def _with_sheets_retry(
+    operation,
+    *,
+    action: str,
+    max_attempts: int = 8,
+    base_sleep: float = 1.5,
+    max_delay: float = 20.0,
+    retry_5xx: bool = True,
+):
+    attempts = max(1, int(max_attempts))
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            retryable = _is_retryable_sheets_error(
+                exc,
+                retry_5xx=retry_5xx,
+            )
+            if (not retryable) or attempt >= attempts:
+                raise
+
+            delay = min(
+                float(max_delay),
+                float(base_sleep) * (2 ** (attempt - 1)),
+            ) + random.random()
+
+            status = _sheets_error_status(exc)
+            reason = f"HTTP {status}" if status is not None else type(exc).__name__
+            print(
+                "[Sheets retry] "
+                f"action={action} | attempt={attempt}/{attempts} | "
+                f"reason={reason} | sleep={delay:.1f}s",
+                flush=True,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(f"Sheets operation exhausted retries: {action}")
+
+
+def _normalize_registry_header(value: Any) -> str:
+    return re.sub(r"[\s_]+", " ", _as_str(value).lower()).strip()
+
+
+def _extract_spreadsheet_id(value: Any) -> str:
+    raw = _as_str(value)
+    if not raw:
+        raise ValueError("Workspace Project Registry ID/URL is empty.")
+
+    match = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", raw)
+    if match:
+        return match.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_-]+", raw):
+        return raw
+
+    raise ValueError(
+        "Workspace Project Registry must be a Google Sheets ID or URL."
+    )
+
+
+def resolve_workspace_project(
+    *,
+    project_code: str,
+    workspace_registry_id: str,
+    workspace_gsheet_secret_name: str = "WORKSPACE_GSHEET",
+    workspace_registry_tab: str = "Cfg__Projects",
+    secret_home: Optional[str] = None,
+    print_progress: bool = True,
+) -> Dict[str, str]:
+    resolved_project_code = _as_str(project_code).upper()
+    if not resolved_project_code:
+        raise ValueError("project_code is required.")
+
+    workspace_secret = read_secret(
+        workspace_gsheet_secret_name,
+        project_code="WORKSPACE",
+        secret_home=secret_home,
+    )
+    workspace_gc = _gspread_client_from_sa_value(workspace_secret.value)
+
+    registry_file_id = _extract_spreadsheet_id(workspace_registry_id)
+    registry_book = _with_sheets_retry(
+        lambda: workspace_gc.open_by_key(registry_file_id),
+        action="workspace.open_registry",
+    )
+    worksheet = _with_sheets_retry(
+        lambda: registry_book.worksheet(workspace_registry_tab),
+        action="workspace.open_registry_tab",
+    )
+    values = _with_sheets_retry(
+        lambda: worksheet.get_all_values(),
+        action="workspace.read_registry",
+    )
+    if not values:
+        raise ValueError(
+            f"Workspace Project Registry tab {workspace_registry_tab!r} is empty."
+        )
+
+    header_map: Dict[str, int] = {}
+    duplicate_headers: List[str] = []
+    for index, raw_header in enumerate(values[0]):
+        normalized = _normalize_registry_header(raw_header)
+        if not normalized:
+            continue
+        if normalized in header_map:
+            duplicate_headers.append(normalized)
+        header_map[normalized] = index
+
+    if duplicate_headers:
+        raise ValueError(
+            "Workspace Project Registry has duplicate normalized headers: "
+            + ", ".join(sorted(set(duplicate_headers)))
+        )
+
+    def require_column(*aliases: str) -> int:
+        for alias in aliases:
+            normalized = _normalize_registry_header(alias)
+            if normalized in header_map:
+                return header_map[normalized]
+        raise ValueError(
+            "Workspace Project Registry is missing a required column; "
+            f"accepted_aliases={aliases}."
+        )
+
+    project_col = require_column("project_code", "project code")
+    active_col = require_column("active")
+    console_url_col = require_column("console_core_url", "console core url")
+    gsheet_secret_col = require_column("gsheet_secret_name", "gsheet secret name")
+    account_tab_col = require_column("account_config_tab", "account config tab")
+    timezone_col = require_column("timezone", "time zone")
+    project_name_col = header_map.get(_normalize_registry_header("project_name"))
+
+    width = len(values[0])
+    matches: List[Tuple[int, List[Any]]] = []
+
+    for row_number, raw_row in enumerate(values[1:], start=2):
+        row = list(raw_row) + [""] * max(0, width - len(raw_row))
+        if _as_str(row[project_col]).upper() == resolved_project_code:
+            matches.append((row_number, row))
+
+    if not matches:
+        raise ValueError(
+            f"Workspace Project Registry has no row for project_code={resolved_project_code}."
+        )
+    if len(matches) > 1:
+        raise ValueError(
+            "Workspace Project Registry has duplicate project rows: "
+            f"project_code={resolved_project_code}; "
+            f"rows={[row_number for row_number, _ in matches]}."
+        )
+
+    source_row, row = matches[0]
+    active_text = _as_str(row[active_col]).lower()
+    if active_text not in {"true", "1", "yes", "y", "是"}:
+        raise ValueError(
+            "Workspace Project Registry project is inactive: "
+            f"project_code={resolved_project_code}; row={source_row}."
+        )
+
+    route = {
+        "project_code": resolved_project_code,
+        "project_name": (
+            _as_str(row[project_name_col])
+            if project_name_col is not None
+            else ""
+        ),
+        "console_core_url": _as_str(row[console_url_col]),
+        "gsheet_secret_name": _as_str(row[gsheet_secret_col]),
+        "account_config_tab": _as_str(row[account_tab_col]),
+        "timezone": _as_str(row[timezone_col]),
+        "registry_source_row": str(source_row),
+        "workspace_auth_source_type": workspace_secret.source_type,
+    }
+
+    missing = [
+        key
+        for key in (
+            "console_core_url",
+            "gsheet_secret_name",
+            "account_config_tab",
+            "timezone",
+        )
+        if not route[key]
+    ]
+    if missing:
+        raise ValueError(
+            "Workspace Project Registry route has empty required values: "
+            f"project_code={resolved_project_code}; fields={missing}; row={source_row}."
+        )
+
+    if print_progress:
+        print(
+            "[Workspace Registry] resolved | "
+            f"project={route['project_code']} | row={source_row} | "
+            f"secret={route['gsheet_secret_name']} | "
+            f"account_tab={route['account_config_tab']} | "
+            f"timezone={route['timezone']}"
+        )
+
+    return route
+
+
+def update_existing_notebook_registry_row(
+    *,
+    project_code: str,
+    registry_mode: str,
+    console_core_url: str,
+    bootstrap_gsheet_secret_name: str,
+    registry_tab: str,
+    job_name: str,
+    sheet_label: str,
+    tab_name: str,
+    current_colab_url: str = "",
+    current_colab_name: str = "",
+    secret_home: Optional[str] = None,
+    print_progress: bool = True,
+) -> Dict[str, Any]:
+    """Check/update exactly one existing Registry row; never append."""
+    mode = _as_str(registry_mode).upper() or "OFF"
+    allowed = {"OFF", "CHECK", "UPDATE_URL", "UPDATE_URL_AND_NAME"}
+
+    if mode not in allowed:
+        raise ValueError(f"registry_mode must be one of {sorted(allowed)}.")
+
+    if mode == "OFF":
+        if print_progress:
+            print(
+                "[Registry] mode=OFF | "
+                f"job_name={job_name} | sheet_label={sheet_label} | tab_name={tab_name}"
+            )
+        return {
+            "status": "OFF",
+            "target_row": None,
+            "changed_fields": [],
+        }
+
+    if mode in {"UPDATE_URL", "UPDATE_URL_AND_NAME"} and not _as_str(
+        current_colab_url
+    ):
+        raise ValueError(f"registry_mode={mode} requires current_colab_url.")
+
+    if mode == "UPDATE_URL_AND_NAME" and not _as_str(current_colab_name):
+        raise ValueError("UPDATE_URL_AND_NAME requires current_colab_name.")
+
+    gc = _gspread_client_from_sa_secret(
+        bootstrap_gsheet_secret_name,
+        project_code=project_code,
+        secret_home=secret_home,
+    )
+    sh = _open_spreadsheet(gc, console_core_url)
+    ws = _with_sheets_retry(
+        lambda: sh.worksheet(registry_tab),
+        action="registry.open_tab",
+    )
+    values = _with_sheets_retry(
+        lambda: ws.get_all_values(),
+        action="registry.read",
+    )
+
+    if not values:
+        raise ValueError(f"Registry tab {registry_tab!r} is empty.")
+
+    header_map: Dict[str, int] = {}
+    for index, raw_header in enumerate(values[0]):
+        normalized = _normalize_registry_header(raw_header)
+        if not normalized:
+            continue
+        if normalized in header_map:
+            raise ValueError(
+                f"Registry tab has duplicate normalized header: {normalized}."
+            )
+        header_map[normalized] = index
+
+    def require_column(*aliases: str) -> int:
+        for alias in aliases:
+            key = _normalize_registry_header(alias)
+            if key in header_map:
+                return header_map[key]
+        raise ValueError(
+            f"Registry tab is missing required column; accepted aliases={aliases}."
+        )
+
+    job_col = require_column("job_name", "job name")
+    label_col = require_column("sheet_label", "sheet label")
+    tab_col = require_column("Tab name", "sheet name", "sheet_name")
+    url_col = require_column("colab_url", "colab url")
+    name_col = require_column("colab_name", "colab name")
+
+    wanted = (
+        _as_str(job_name).lower(),
+        _as_str(sheet_label).lower(),
+        _as_str(tab_name).lower(),
+    )
+
+    matches: List[int] = []
+    for row_index, row in enumerate(values[1:], start=2):
+        padded = list(row) + [""] * max(0, len(values[0]) - len(row))
+        logical_key = (
+            _as_str(padded[job_col]).lower(),
+            _as_str(padded[label_col]).lower(),
+            _as_str(padded[tab_col]).lower(),
+        )
+        if logical_key == wanted:
+            matches.append(row_index)
+
+    if not matches:
+        raise ValueError(
+            "Registry target row was not found. This function never appends. "
+            f"logical_key={wanted}"
+        )
+    if len(matches) > 1:
+        raise ValueError(
+            f"Registry logical key is duplicated at rows={matches}; no row was changed."
+        )
+
+    row_number = matches[0]
+    current_row = values[row_number - 1] + [""] * max(
+        0,
+        len(values[0]) - len(values[row_number - 1]),
+    )
+
+    changes: List[Tuple[str, int, str, str]] = []
+    provided_url = _as_str(current_colab_url)
+    provided_name = _as_str(current_colab_name)
+
+    if provided_url and _as_str(current_row[url_col]) != provided_url:
+        changes.append(
+            ("colab_url", url_col + 1, _as_str(current_row[url_col]), provided_url)
+        )
+
+    if provided_name and _as_str(current_row[name_col]) != provided_name:
+        changes.append(
+            ("colab_name", name_col + 1, _as_str(current_row[name_col]), provided_name)
+        )
+
+    if mode == "CHECK":
+        status = "CHANGE_DETECTED" if changes else "NO_CHANGE"
+    else:
+        permitted = (
+            {"colab_url"}
+            if mode == "UPDATE_URL"
+            else {"colab_url", "colab_name"}
+        )
+        applied = [change for change in changes if change[0] in permitted]
+
+        for field_name, column_number, _old_value, new_value in applied:
+            _with_sheets_retry(
+                lambda rn=row_number, cn=column_number, nv=new_value: (
+                    ws.update_cell(rn, cn, nv)
+                ),
+                action=f"registry.update_cell:{field_name}",
+                retry_5xx=True,
+            )
+
+        changes = applied
+        status = "UPDATED" if changes else "NO_CHANGE"
+
+    if print_progress:
+        print(
+            "[Registry] "
+            f"row={row_number} | status={status} | "
+            f"changed_fields={[item[0] for item in changes]}"
+        )
+
+    return {
+        "status": status,
+        "target_row": row_number,
+        "changed_fields": [item[0] for item in changes],
+    }
 
 
 def _sheet_id_from_url_or_id(value: str) -> str:
@@ -164,11 +719,17 @@ def _sheet_id_from_url_or_id(value: str) -> str:
 
 def _open_spreadsheet(gc: gspread.Client, url_or_id: str) -> gspread.Spreadsheet:
     sid = _sheet_id_from_url_or_id(url_or_id)
-    return gc.open_by_key(sid)
+    return _with_sheets_retry(
+        lambda: gc.open_by_key(sid),
+        action="spreadsheet.open_by_key",
+    )
 
 
 def _worksheet_to_df(ws: gspread.Worksheet) -> pd.DataFrame:
-    values = ws.get_all_values()
+    values = _with_sheets_retry(
+        lambda: ws.get_all_values(),
+        action=f"worksheet.read:{ws.title}",
+    )
     if not values:
         return pd.DataFrame()
     headers = [h.strip() for h in values[0]]
@@ -302,7 +863,10 @@ def _load_account_config_from_worksheet(ws: gspread.Worksheet, site_code: str) -
       - headered site_code + key + value
       - headered one-row-per-site wide config
     """
-    values = ws.get_all_values()
+    values = _with_sheets_retry(
+        lambda: ws.get_all_values(),
+        action=f"account_config.read:{ws.title}",
+    )
     values = [row for row in values if any(_as_str(x) for x in row)]
     if not values:
         return {}
@@ -675,14 +1239,34 @@ class RunLogger:
             self._ensure_header()
 
     def _ensure_header(self) -> None:
-        values = self.ws.get_all_values()
+        values = _with_sheets_retry(
+            lambda: self.ws.get_all_values(),
+            action="runlog.read_header",
+        )
         if not values:
-            self.ws.update("A1:R1", [self.headers])
+            _with_sheets_retry(
+                lambda: self.ws.update(
+                    range_name="A1:R1",
+                    values=[self.headers],
+                    value_input_option="RAW",
+                ),
+                action="runlog.write_header",
+                retry_5xx=True,
+            )
             return
+
         current = [h.strip() for h in values[0][: len(self.headers)]]
         if current != self.headers:
             # Do not clear existing log. Just update header row.
-            self.ws.update("A1:R1", [self.headers])
+            _with_sheets_retry(
+                lambda: self.ws.update(
+                    range_name="A1:R1",
+                    values=[self.headers],
+                    value_input_option="RAW",
+                ),
+                action="runlog.update_header",
+                retry_5xx=True,
+            )
 
     def log(
         self,
@@ -731,17 +1315,18 @@ class RunLogger:
     def flush(self) -> None:
         if not self.enabled or not self._buf:
             return
-        rows = self._buf
-        last_exc = None
-        for i in range(6):
-            try:
-                self.ws.append_rows(rows, value_input_option="USER_ENTERED", table_range="A:R")
-                self._buf = []
-                return
-            except Exception as exc:
-                last_exc = exc
-                time.sleep(min(2 ** i, 20))
-        raise RuntimeError(f"Failed to write RunLog after retries: {last_exc}")
+        rows = list(self._buf)
+        _with_sheets_retry(
+            lambda: self.ws.append_rows(
+                rows,
+                value_input_option="USER_ENTERED",
+                table_range="A:R",
+            ),
+            action="runlog.append_rows",
+            # Append is not safely repeatable after an ambiguous server 5xx.
+            retry_5xx=False,
+        )
+        self._buf = []
 
 
 # -----------------------------
@@ -853,6 +1438,7 @@ def run(
     runlog_flush_every: int = 200,
     runlog_print_rows: bool = False,
     progress_every: int = 25,
+    secret_home: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Execute edit_theme_template job.
@@ -880,13 +1466,23 @@ def run(
     if not dry_run and not confirmed:
         raise ValueError("Blocked: CONFIRMED=True is required when DRY_RUN=False.")
 
-    console_gc = _gspread_client_from_sa_secret(console_gsheet_sa_b64_secret)
+    console_gc = _gspread_client_from_sa_secret(
+        console_gsheet_sa_b64_secret,
+        project_code=site_code,
+        secret_home=secret_home,
+    )
     console_sh = _open_spreadsheet(console_gc, console_core_url)
 
-    cfg_sites_ws = console_sh.worksheet(cfg_sites_tab)
+    cfg_sites_ws = _with_sheets_retry(
+        lambda: console_sh.worksheet(cfg_sites_tab),
+        action="console.open_cfg_sites",
+    )
     cfg_sites_df = _worksheet_to_df(cfg_sites_ws)
 
-    account_ws = console_sh.worksheet(cfg_account_tab)
+    account_ws = _with_sheets_retry(
+        lambda: console_sh.worksheet(cfg_account_tab),
+        action="console.open_account_config",
+    )
     account_cfg = _load_account_config_from_worksheet(account_ws, site_code)
     account_cfg = _normalize_account_config(account_cfg)
 
@@ -900,20 +1496,46 @@ def run(
     input_route = _find_site_route(cfg_sites_df, site_code, input_sheet_label)
     runlog_route = _find_site_route(cfg_sites_df, site_code, runlog_sheet_label)
 
-    site_gsheet_secret = _pick_config(account_cfg, "GSHEET_SA_B64_SECRET", required=False, default=console_gsheet_sa_b64_secret)
-    site_gc = _gspread_client_from_sa_secret(site_gsheet_secret)
+    site_gsheet_secret = _pick_config(
+        account_cfg,
+        "GSHEET_SA_B64_SECRET",
+        required=False,
+        default=console_gsheet_sa_b64_secret,
+    )
+    site_gc = _gspread_client_from_sa_secret(
+        site_gsheet_secret,
+        project_code=site_code,
+        secret_home=secret_home,
+    )
 
-    input_sh = _open_spreadsheet(site_gc, input_route.get("sheet_url") or input_route.get("sheet_id"))
-    input_ws = input_sh.worksheet(input_worksheet_title)
+    input_sh = _open_spreadsheet(
+        site_gc,
+        input_route.get("sheet_url") or input_route.get("sheet_id"),
+    )
+    input_ws = _with_sheets_retry(
+        lambda: input_sh.worksheet(input_worksheet_title),
+        action="input.open_worksheet",
+    )
     input_df = _worksheet_to_df(input_ws)
 
     runlog_ws = None
     try:
         runlog_sh = _open_spreadsheet(site_gc, runlog_route.get("sheet_url") or runlog_route.get("sheet_id"))
         try:
-            runlog_ws = runlog_sh.worksheet(runlog_tab_name)
+            runlog_ws = _with_sheets_retry(
+                lambda: runlog_sh.worksheet(runlog_tab_name),
+                action="runlog.open_worksheet",
+            )
         except gspread.WorksheetNotFound:
-            runlog_ws = runlog_sh.add_worksheet(title=runlog_tab_name, rows=1000, cols=30)
+            runlog_ws = _with_sheets_retry(
+                lambda: runlog_sh.add_worksheet(
+                    title=runlog_tab_name,
+                    rows=1000,
+                    cols=30,
+                ),
+                action="runlog.add_worksheet",
+                retry_5xx=False,
+            )
     except Exception as exc:
         print(f"[WARN] Runlog sheet unavailable: {exc}")
 
@@ -992,7 +1614,11 @@ def run(
     shop_domain = _pick_config(account_cfg, "SHOP_DOMAIN", required=True)
     api_version = _pick_config(account_cfg, "SHOPIFY_API_VERSION", required=True)
     token_secret = _pick_config(account_cfg, "SHOPIFY_TOKEN_SECRET", required=True)
-    access_token = _get_secret(token_secret)
+    access_token = _get_secret(
+        token_secret,
+        project_code=site_code,
+        secret_home=secret_home,
+    )
 
     client = ShopifyClient(
         shop_domain=shop_domain,
