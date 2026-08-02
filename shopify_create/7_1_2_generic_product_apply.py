@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Apply Generic Shopify Product Creation rows.
 
-GitHub target: ``ecom/shopify_create/generic_apply.py``
-Import path: ``shopify_create.generic_apply``
+GitHub target: ``ecom/shopify_create/7_1_2_generic_product_apply.py``
+Import path: ``shopify_create.7_1_2_generic_product_apply``
 
 Execution contract
 ------------------
@@ -33,6 +33,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     wait,
 )
+import importlib
 import json
 import os
 import platform
@@ -50,13 +51,14 @@ import pandas as pd
 import requests
 from zoneinfo import ZoneInfo
 
-from shopify_create import generic_prepare as gp
+gp = importlib.import_module("shopify_create.7_1_1_generic_product_prepare")
 
 
-MODULE_VERSION = "1.5.10"
-MODULE_PATH = "shopify_create.generic_apply"
-DEFAULT_JOB_NAME = "generic_create_apply"
+MODULE_VERSION = "2026-08-02-runtime-boundary-v1"
+MODULE_PATH = "shopify_create.7_1_2_generic_product_apply"
+DEFAULT_JOB_NAME = "generic_product_apply"
 EXPECTED_PREPARE_MODULE_VERSION = "1.6.6"
+PREPARE_MODULE_PATH = "shopify_create.7_1_1_generic_product_prepare"
 
 LEGACY_RESULT_HEADERS = [
     "run_id",

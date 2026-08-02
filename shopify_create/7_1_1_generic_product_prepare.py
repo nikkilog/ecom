@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Prepare a generic Shopify product-creation plan from Google Sheets.
 
-GitHub target: ``ecom/shopify_create/generic_prepare.py``
-Import path: ``shopify_create.generic_prepare``
+GitHub target: ``ecom/shopify_create/7_1_1_generic_product_prepare.py``
+Import path: ``shopify_create.7_1_1_generic_product_prepare``
 
 Scope
 -----
@@ -65,9 +65,9 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "1.6.6"
-MODULE_PATH = "shopify_create.generic_prepare"
-DEFAULT_JOB_NAME = "generic_create_prepare"
+MODULE_VERSION = "2026-08-02-runtime-boundary-v1"
+MODULE_PATH = "shopify_create.7_1_1_generic_product_prepare"
+DEFAULT_JOB_NAME = "generic_product_prepare"
 
 
 RUNLOG_HEADER_18 = [
@@ -494,7 +494,10 @@ class RunLogger18:
     def flush(self) -> None:
         if not self.buffer:
             return
-        values = self.worksheet.get_all_values()
+        values = _sheets_retry(
+            f"read {self.worksheet.title}",
+            self.worksheet.get_all_values,
+        )
         start_row = max(2, len(values) + 1)
         required_rows = start_row + len(self.buffer) - 1
         required_cols = len(RUNLOG_HEADER_18)
@@ -502,15 +505,21 @@ class RunLogger18:
             self.worksheet.row_count < required_rows
             or self.worksheet.col_count < required_cols
         ):
-            self.worksheet.resize(
-                rows=max(self.worksheet.row_count, required_rows + 100),
-                cols=max(self.worksheet.col_count, required_cols),
+            _sheets_retry(
+                f"resize {self.worksheet.title}",
+                lambda: self.worksheet.resize(
+                    rows=max(self.worksheet.row_count, required_rows + 100),
+                    cols=max(self.worksheet.col_count, required_cols),
+                ),
             )
         end_row = start_row + len(self.buffer) - 1
-        self.worksheet.update(
-            range_name=f"A{start_row}:R{end_row}",
-            values=self.buffer,
-            value_input_option="RAW",
+        _sheets_retry(
+            f"append runlog {self.worksheet.title}",
+            lambda: self.worksheet.update(
+                range_name=f"A{start_row}:R{end_row}",
+                values=self.buffer,
+                value_input_option="RAW",
+            ),
         )
         self.buffer.clear()
 
@@ -521,6 +530,44 @@ def _runtime_mode() -> str:
         return "COLAB"
     except Exception:
         return "LOCAL"
+
+
+_SHEETS_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+_SHEETS_RETRYABLE_TEXT = (
+    "quota",
+    "rate limit",
+    "too many requests",
+    "resource exhausted",
+    "backend error",
+    "internal error",
+    "service unavailable",
+)
+
+
+def _sheets_retry(label: str, func, attempts: int = 6):
+    """Run one Google Sheets operation with bounded transient retry."""
+    attempts = max(int(attempts), 1)
+    last_error: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return func()
+        except Exception as exc:
+            last_error = exc
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            text = str(exc).lower()
+            retryable = (
+                status in _SHEETS_RETRYABLE_STATUS
+                or any(token in text for token in _SHEETS_RETRYABLE_TEXT)
+            )
+            if not retryable or attempt >= attempts:
+                raise
+            delay = min(20.0, (2 ** (attempt - 1)) + (0.25 * attempt))
+            print(
+                f"[Sheets retry] {label} | attempt={attempt}/{attempts} "
+                f"| sleep={delay:.2f}s | reason={type(exc).__name__}"
+            )
+            time.sleep(delay)
+    raise RuntimeError(f"Sheets operation failed: {label}: {last_error}")
 
 
 def _safe_str(value: Any) -> str:
@@ -839,7 +886,10 @@ def _load_account_values(
     spreadsheet: gspread.Spreadsheet,
     tab_name: str,
 ) -> Dict[str, str]:
-    values = spreadsheet.worksheet(tab_name).get_all_values()
+    values = _sheets_retry(
+        f"read {tab_name}",
+        lambda: spreadsheet.worksheet(tab_name).get_all_values(),
+    )
     if not values:
         raise ValueError(f"{tab_name} is empty.")
     result: Dict[str, str] = {}
@@ -863,7 +913,10 @@ def _resolve_sheet_url_by_label(
     site_code: str,
     label: str,
 ) -> str:
-    records = console.worksheet(tab_cfg_sites).get_all_records()
+    records = _sheets_retry(
+        f"read {tab_cfg_sites}",
+        lambda: console.worksheet(tab_cfg_sites).get_all_records(),
+    )
     matches = [
         row
         for row in records
@@ -891,17 +944,26 @@ def _resolve_sheet_url_by_label(
 
 
 def _ensure_runlog_header(worksheet: gspread.Worksheet) -> None:
-    values = worksheet.get_all_values()
+    values = _sheets_retry(
+        f"read {worksheet.title}",
+        worksheet.get_all_values,
+    )
     if not values:
         if worksheet.row_count < 2 or worksheet.col_count < 18:
-            worksheet.resize(
-                rows=max(worksheet.row_count, 100),
-                cols=max(worksheet.col_count, 18),
+            _sheets_retry(
+                f"resize {worksheet.title}",
+                lambda: worksheet.resize(
+                    rows=max(worksheet.row_count, 100),
+                    cols=max(worksheet.col_count, 18),
+                ),
             )
-        worksheet.update(
-            range_name="A1:R1",
-            values=[RUNLOG_HEADER_18],
-            value_input_option="RAW",
+        _sheets_retry(
+            f"write header {worksheet.title}",
+            lambda: worksheet.update(
+                range_name="A1:R1",
+                values=[RUNLOG_HEADER_18],
+                value_input_option="RAW",
+            ),
         )
         return
     current = [
@@ -920,7 +982,10 @@ def _require_worksheet(
     title: str,
 ) -> gspread.Worksheet:
     try:
-        return spreadsheet.worksheet(title)
+        return _sheets_retry(
+            f"open worksheet {title}",
+            lambda: spreadsheet.worksheet(title),
+        )
     except gspread.WorksheetNotFound as exc:
         raise ValueError(
             f"Required worksheet {title!r} does not exist in "
@@ -935,12 +1000,18 @@ def _get_or_create_preview_worksheet(
     cols: int,
 ) -> gspread.Worksheet:
     try:
-        worksheet = spreadsheet.worksheet(title)
+        worksheet = _sheets_retry(
+            f"open worksheet {title}",
+            lambda: spreadsheet.worksheet(title),
+        )
     except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(
-            title=title,
-            rows=max(100, int(rows)),
-            cols=max(20, int(cols)),
+        worksheet = _sheets_retry(
+            f"create worksheet {title}",
+            lambda: spreadsheet.add_worksheet(
+                title=title,
+                rows=max(100, int(rows)),
+                cols=max(20, int(cols)),
+            ),
         )
     return worksheet
 
@@ -961,19 +1032,31 @@ def _write_matrix_overwrite(
         cols + 5,
     )
     if worksheet.row_count < rows or worksheet.col_count < cols:
-        worksheet.resize(
-            rows=max(worksheet.row_count, rows + 50),
-            cols=max(worksheet.col_count, cols + 5),
+        _sheets_retry(
+            f"resize {tab_name}",
+            lambda: worksheet.resize(
+                rows=max(worksheet.row_count, rows + 50),
+                cols=max(worksheet.col_count, cols + 5),
+            ),
         )
-    worksheet.clear()
+    _sheets_retry(
+        f"clear {tab_name}",
+        worksheet.clear,
+    )
     end_col = _a1_col(cols)
-    worksheet.update(
-        range_name=f"A1:{end_col}{rows}",
-        values=[list(row) for row in matrix],
-        value_input_option="RAW",
+    _sheets_retry(
+        f"write {tab_name}",
+        lambda: worksheet.update(
+            range_name=f"A1:{end_col}{rows}",
+            values=[list(row) for row in matrix],
+            value_input_option="RAW",
+        ),
     )
     try:
-        worksheet.freeze(rows=2)
+        _sheets_retry(
+            f"freeze {tab_name}",
+            lambda: worksheet.freeze(rows=2),
+        )
     except Exception:
         pass
     return max(0, rows - 2)
@@ -1409,14 +1492,20 @@ def _write_input_field_key_row_if_changed(
             "changed_columns": [],
         }
     if worksheet.col_count < len(after):
-        worksheet.resize(
-            rows=max(worksheet.row_count, 3),
-            cols=len(after),
+        _sheets_retry(
+            f"resize {worksheet.title}",
+            lambda: worksheet.resize(
+                rows=max(worksheet.row_count, 3),
+                cols=len(after),
+            ),
         )
-    worksheet.update(
-        range_name=f"A2:{_a1_col(len(after))}2",
-        values=[after],
-        value_input_option="RAW",
+    _sheets_retry(
+        f"write mapping row {worksheet.title}",
+        lambda: worksheet.update(
+            range_name=f"A2:{_a1_col(len(after))}2",
+            values=[after],
+            value_input_option="RAW",
+        ),
     )
     return {
         "field_key_row_written": True,
@@ -2406,10 +2495,18 @@ def update_existing_notebook_registry_row(
         local_secret_aliases=local_secret_aliases,
     )
     gc, auth_meta = _build_gspread_client(secret)
-    worksheet = gc.open_by_url(
-        console_core_url
-    ).worksheet(registry_tab)
-    values = worksheet.get_all_values()
+    registry_book = _sheets_retry(
+        "open registry workbook",
+        lambda: gc.open_by_url(console_core_url),
+    )
+    worksheet = _sheets_retry(
+        f"open registry tab {registry_tab}",
+        lambda: registry_book.worksheet(registry_tab),
+    )
+    values = _sheets_retry(
+        f"read {worksheet.title}",
+        worksheet.get_all_values,
+    )
     if not values:
         raise ValueError(f"Registry tab {registry_tab!r} is empty.")
 
@@ -2515,10 +2612,13 @@ def update_existing_notebook_registry_row(
             change for change in changes if change[0] in permitted
         ]
         for _, column_number, _, new_value in applied:
-            worksheet.update_cell(
-                row_number,
-                column_number,
-                new_value,
+            _sheets_retry(
+                f"registry update row={row_number} col={column_number}",
+                lambda row_number=row_number, column_number=column_number, new_value=new_value: worksheet.update_cell(
+                    row_number,
+                    column_number,
+                    new_value,
+                ),
             )
         changes = applied
         status = "UPDATED" if changes else "NO_CHANGE"
@@ -2598,7 +2698,10 @@ def run(
         local_secret_aliases=local_secret_aliases,
     )
     gc, auth_meta = _build_gspread_client(secret)
-    console = gc.open_by_url(console_core_url)
+    console = _sheets_retry(
+        "open Console Core",
+        lambda: gc.open_by_url(console_core_url),
+    )
 
     progress(
         2,
@@ -2652,9 +2755,18 @@ def run(
         runlog_sheet_label,
     )
 
-    create_book = gc.open_by_url(create_url)
-    config_book = gc.open_by_url(config_url)
-    runlog_ws = gc.open_by_url(runlog_url).worksheet(tab_runlog)
+    create_book = _sheets_retry(
+        "open create workbook",
+        lambda: gc.open_by_url(create_url),
+    )
+    config_book = _sheets_retry(
+        "open config workbook",
+        lambda: gc.open_by_url(config_url),
+    )
+    runlog_ws = _sheets_retry(
+        f"open runlog {tab_runlog}",
+        lambda: gc.open_by_url(runlog_url).worksheet(tab_runlog),
+    )
     logger = RunLogger18(
         worksheet=runlog_ws,
         run_id=run_id,
@@ -2673,11 +2785,18 @@ def run(
             create_book,
             tab_input,
         )
-        input_values = input_ws.get_all_values()
-        defaults_values = _require_worksheet(
+        input_values = _sheets_retry(
+            f"read {tab_input}",
+            input_ws.get_all_values,
+        )
+        defaults_ws = _require_worksheet(
             create_book,
             tab_defaults,
-        ).get_all_values()
+        )
+        defaults_values = _sheets_retry(
+            f"read {tab_defaults}",
+            defaults_ws.get_all_values,
+        )
         defaults = _read_defaults_matrix(defaults_values)
 
         progress(
@@ -2685,11 +2804,15 @@ def run(
             10,
             f"Read field dictionary | tab={tab_cfg_fields}",
         )
+        cfg_fields_ws = _require_worksheet(
+            config_book,
+            tab_cfg_fields,
+        )
         cfg_fields = _read_cfg_fields(
-            _require_worksheet(
-                config_book,
-                tab_cfg_fields,
-            ).get_all_values()
+            _sheets_retry(
+                f"read {tab_cfg_fields}",
+                cfg_fields_ws.get_all_values,
+            )
         )
         print(
             "[Cfg__Fields] "
@@ -2752,11 +2875,15 @@ def run(
             10,
             f"Resolve default Location | tab={tab_cfg_locations}",
         )
+        locations_ws = _require_worksheet(
+            console,
+            tab_cfg_locations,
+        )
         locations = _read_locations(
-            _require_worksheet(
-                console,
-                tab_cfg_locations,
-            ).get_all_values(),
+            _sheets_retry(
+                f"read {tab_cfg_locations}",
+                locations_ws.get_all_values,
+            ),
             site_code,
         )
         default_location = locations["default"]
