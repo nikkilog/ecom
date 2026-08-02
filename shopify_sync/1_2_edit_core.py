@@ -35,6 +35,11 @@ from google.oauth2 import service_account
 # Constants
 # =========================================================
 
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
 CFG_SITES_TAB_DEFAULT = "Cfg__Sites"
 CFG_FIELDS_TAB_DEFAULT = "Cfg__Fields"
 
