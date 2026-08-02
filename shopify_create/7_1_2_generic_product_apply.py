@@ -57,7 +57,7 @@ gp = importlib.import_module("shopify_create.7_1_1_generic_product_prepare")
 MODULE_VERSION = "2026-08-02-runtime-boundary-v1"
 MODULE_PATH = "shopify_create.7_1_2_generic_product_apply"
 DEFAULT_JOB_NAME = "generic_product_apply"
-EXPECTED_PREPARE_MODULE_VERSION = "1.6.6"
+EXPECTED_PREPARE_MODULE_VERSION = "2026-08-02-runtime-boundary-v1"
 PREPARE_MODULE_PATH = "shopify_create.7_1_1_generic_product_prepare"
 
 LEGACY_RESULT_HEADERS = [
