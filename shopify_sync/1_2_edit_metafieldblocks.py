@@ -231,12 +231,14 @@ def _is_blank_row(row: dict[str, Any]) -> bool:
 # Runtime / Secret / Workspace Registry / clients
 # =========================================================
 
+@dataclass(frozen=True)
 class AccountConfig:
     shop_domain: str
     api_version: str
     gsheet_sa_b64_secret: str
     shopify_token_secret: str
 
+@dataclass(frozen=True)
 class SecretValue:
     value: str
     source_type: str
