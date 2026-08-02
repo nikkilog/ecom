@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Central Shopify Location registry synchronization.
 
-GitHub target: ``ecom/shopify_setup/sync_locations.py``
-Import path: ``shopify_setup.sync_locations``
+GitHub target: ``ecom/shopify_setup/cfg__locations.py``
+Import path: ``shopify_setup.cfg__locations``
 
 The module synchronizes Shopify Admin GraphQL locations into
 Console Core / ``Cfg__Locations`` while preserving human-governed fields.
@@ -41,8 +41,8 @@ from google.oauth2.service_account import Credentials
 from zoneinfo import ZoneInfo
 
 
-MODULE_VERSION = "2.3.1"
-MODULE_PATH = "shopify_setup.sync_locations"
+MODULE_VERSION = "2026-08-02-runtime-boundary-v1"
+MODULE_PATH = "shopify_setup.cfg__locations"
 DEFAULT_JOB_NAME = "config_locations"
 LOCATION_HEADERS = [
     "site_code",
@@ -284,7 +284,16 @@ class RunLogger18:
     def flush(self) -> None:
         if not self.buffer:
             return
-        self.worksheet.append_rows(self.buffer, value_input_option="RAW")
+        rows = list(self.buffer)
+        _with_sheets_retry(
+            lambda: self.worksheet.append_rows(
+                rows,
+                value_input_option="RAW",
+            ),
+            action="runlog.append_rows",
+            # Avoid blind retry after ambiguous server-side 5xx on append.
+            retry_5xx=False,
+        )
         self.buffer.clear()
 
 
@@ -339,6 +348,84 @@ def _normalize_bool(value: Any, *, default: bool = False) -> bool:
 
 def _bool_cell(value: Any, *, default: bool = False) -> str:
     return "TRUE" if _normalize_bool(value, default=default) else "FALSE"
+
+
+
+def _sheets_error_status(exc: BaseException) -> Optional[int]:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(response, "status", None)
+    try:
+        return int(status) if status is not None else None
+    except Exception:
+        return None
+
+
+def _is_retryable_sheets_error(
+    exc: BaseException,
+    *,
+    retry_5xx: bool = True,
+) -> bool:
+    status = _sheets_error_status(exc)
+    if status == 429:
+        return True
+    if retry_5xx and status in {500, 502, 503, 504}:
+        return True
+
+    err_text = str(exc).lower()
+    return any(
+        token in err_text
+        for token in (
+            "resource_exhausted",
+            "ratelimitexceeded",
+            "userratelimitexceeded",
+            "rate limit exceeded",
+            "quota exceeded",
+            "read requests per minute",
+            "write requests per minute",
+            "too many requests",
+        )
+    )
+
+
+def _with_sheets_retry(
+    operation: Callable[[], Any],
+    *,
+    action: str,
+    max_attempts: int = 8,
+    base_sleep: float = 1.5,
+    max_delay: float = 20.0,
+    retry_5xx: bool = True,
+):
+    attempts = max(1, int(max_attempts))
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            retryable = _is_retryable_sheets_error(
+                exc,
+                retry_5xx=retry_5xx,
+            )
+            if (not retryable) or attempt >= attempts:
+                raise
+
+            delay = min(
+                float(max_delay),
+                float(base_sleep) * (2 ** (attempt - 1)),
+            ) + random.random()
+
+            status = _sheets_error_status(exc)
+            reason = f"HTTP {status}" if status is not None else type(exc).__name__
+            print(
+                "[Sheets retry] "
+                f"action={action} | attempt={attempt}/{attempts} | "
+                f"reason={reason} | sleep={delay:.1f}s",
+                flush=True,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(f"Sheets operation exhausted retries: {action}")
 
 
 def _workspace_secret_result_to_value(result: Any) -> SecretValue:
@@ -479,7 +566,18 @@ def _load_account_config(
     console_core_url: str,
     tab_cfg_account_id: str,
 ) -> AccountConfig:
-    values = gc.open_by_url(console_core_url).worksheet(tab_cfg_account_id).get_all_values()
+    console = _with_sheets_retry(
+        lambda: gc.open_by_url(console_core_url),
+        action="account_config.open_console",
+    )
+    worksheet = _with_sheets_retry(
+        lambda: console.worksheet(tab_cfg_account_id),
+        action="account_config.open_tab",
+    )
+    values = _with_sheets_retry(
+        lambda: worksheet.get_all_values(),
+        action="account_config.read",
+    )
     if not values:
         raise ValueError(f"{tab_cfg_account_id} is empty.")
 
@@ -522,7 +620,18 @@ def _resolve_sheet_url_by_label(
     site_code: str,
     label: str,
 ) -> str:
-    records = gc.open_by_url(console_core_url).worksheet(tab_cfg_sites).get_all_records()
+    console = _with_sheets_retry(
+        lambda: gc.open_by_url(console_core_url),
+        action="cfg_sites.open_console",
+    )
+    worksheet = _with_sheets_retry(
+        lambda: console.worksheet(tab_cfg_sites),
+        action="cfg_sites.open_tab",
+    )
+    records = _with_sheets_retry(
+        lambda: worksheet.get_all_records(),
+        action="cfg_sites.read",
+    )
     matches = [
         row
         for row in records
@@ -546,9 +655,20 @@ def _resolve_sheet_url_by_label(
 
 
 def _ensure_runlog_header(worksheet: gspread.Worksheet) -> None:
-    values = worksheet.get_all_values()
+    values = _with_sheets_retry(
+        lambda: worksheet.get_all_values(),
+        action="runlog.read_header",
+    )
     if not values:
-        worksheet.update(range_name="A1", values=[RUNLOG_HEADER_18])
+        _with_sheets_retry(
+            lambda: worksheet.update(
+                range_name="A1",
+                values=[RUNLOG_HEADER_18],
+                value_input_option="RAW",
+            ),
+            action="runlog.write_header",
+            retry_5xx=True,
+        )
         return
     current = [_safe_str(x) for x in values[0][: len(RUNLOG_HEADER_18)]]
     if current != RUNLOG_HEADER_18:
@@ -563,7 +683,10 @@ def _get_optional_worksheet(
     title: str,
 ) -> Optional[gspread.Worksheet]:
     try:
-        return spreadsheet.worksheet(title)
+        return _with_sheets_retry(
+            lambda: spreadsheet.worksheet(title),
+            action=f"worksheet.open_optional:{title}",
+        )
     except gspread.WorksheetNotFound:
         return None
 
@@ -596,7 +719,11 @@ def _load_existing_locations(
 ) -> Tuple[List[str], List[Dict[str, str]]]:
     if worksheet is None:
         return LOCATION_HEADERS.copy(), []
-    return _records_from_matrix(worksheet.get_all_values())
+    values = _with_sheets_retry(
+        lambda: worksheet.get_all_values(),
+        action=f"locations.read_existing:{worksheet.title}",
+    )
+    return _records_from_matrix(values)
 
 
 def _fetch_all_locations(
@@ -909,21 +1036,41 @@ def _write_matrix(
     rows_needed = max(2, len(matrix) + 20)
     cols_needed = max(2, len(matrix[0]) if matrix else len(LOCATION_HEADERS))
     if worksheet is None:
-        worksheet = spreadsheet.add_worksheet(
-            title=title,
-            rows=rows_needed,
-            cols=cols_needed,
+        worksheet = _with_sheets_retry(
+            lambda: spreadsheet.add_worksheet(
+                title=title,
+                rows=rows_needed,
+                cols=cols_needed,
+            ),
+            action=f"locations.add_worksheet:{title}",
+            retry_5xx=False,
         )
     elif worksheet.row_count < rows_needed or worksheet.col_count < cols_needed:
-        worksheet.resize(
-            rows=max(worksheet.row_count, rows_needed),
-            cols=max(worksheet.col_count, cols_needed),
+        _with_sheets_retry(
+            lambda: worksheet.resize(
+                rows=max(worksheet.row_count, rows_needed),
+                cols=max(worksheet.col_count, cols_needed),
+            ),
+            action=f"locations.resize:{title}",
+            retry_5xx=True,
         )
 
-    worksheet.batch_clear(
-        [f"A1:{_a1_col(max(worksheet.col_count, cols_needed))}{worksheet.row_count}"]
+    _with_sheets_retry(
+        lambda: worksheet.batch_clear(
+            [f"A1:{_a1_col(max(worksheet.col_count, cols_needed))}{worksheet.row_count}"]
+        ),
+        action=f"locations.clear:{title}",
+        retry_5xx=True,
     )
-    worksheet.update(range_name="A1", values=list(matrix), value_input_option="RAW")
+    _with_sheets_retry(
+        lambda: worksheet.update(
+            range_name="A1",
+            values=list(matrix),
+            value_input_option="RAW",
+        ),
+        action=f"locations.write:{title}",
+        retry_5xx=True,
+    )
     return worksheet
 
 
@@ -994,16 +1141,25 @@ def resolve_workspace_project(
     workspace_gc, auth_meta = _build_gspread_client(workspace_secret)
 
     registry_file_id = _extract_spreadsheet_id(workspace_registry_id)
-    registry_book = workspace_gc.open_by_key(registry_file_id)
+    registry_book = _with_sheets_retry(
+        lambda: workspace_gc.open_by_key(registry_file_id),
+        action="workspace.open_registry",
+    )
     try:
-        worksheet = registry_book.worksheet(registry_tab)
+        worksheet = _with_sheets_retry(
+            lambda: registry_book.worksheet(registry_tab),
+            action="workspace.open_registry_tab",
+        )
     except gspread.WorksheetNotFound as exc:
         raise ValueError(
             f"Workspace Project Registry tab {registry_tab!r} does not exist "
             f"in {registry_book.title!r}."
         ) from exc
 
-    values = worksheet.get_all_values()
+    values = _with_sheets_retry(
+        lambda: worksheet.get_all_values(),
+        action="workspace.read_registry",
+    )
     if not values:
         raise ValueError(
             f"Workspace Project Registry tab {registry_tab!r} is empty."
@@ -1197,8 +1353,18 @@ def update_existing_notebook_registry_row(
         local_secret_aliases=local_secret_aliases,
     )
     gc, auth_meta = _build_gspread_client(sa_secret)
-    worksheet = gc.open_by_url(console_core_url).worksheet(registry_tab)
-    values = worksheet.get_all_values()
+    console = _with_sheets_retry(
+        lambda: gc.open_by_url(console_core_url),
+        action="registry.open_console",
+    )
+    worksheet = _with_sheets_retry(
+        lambda: console.worksheet(registry_tab),
+        action="registry.open_tab",
+    )
+    values = _with_sheets_retry(
+        lambda: worksheet.get_all_values(),
+        action="registry.read",
+    )
     if not values:
         raise ValueError(f"Registry tab {registry_tab!r} is empty.")
 
@@ -1267,8 +1433,16 @@ def update_existing_notebook_registry_row(
     else:
         permitted = {"colab_url"} if mode == "UPDATE_URL" else {"colab_url", "colab_name"}
         applied = [change for change in changes if change[0] in permitted]
-        for _, column_number, _, new_value in applied:
-            worksheet.update_cell(row_number, column_number, new_value)
+        for field_name, column_number, _, new_value in applied:
+            _with_sheets_retry(
+                lambda cn=column_number, nv=new_value: worksheet.update_cell(
+                    row_number,
+                    cn,
+                    nv,
+                ),
+                action=f"registry.update_cell:{field_name}",
+                retry_5xx=True,
+            )
         changes = applied
         status = "UPDATED" if changes else "NO_CHANGE"
 
@@ -1340,7 +1514,10 @@ def run(
         local_secret_aliases=local_secret_aliases,
     )
     gc, google_auth_meta = _build_gspread_client(bootstrap_secret)
-    console = gc.open_by_url(console_core_url)
+    console = _with_sheets_retry(
+        lambda: gc.open_by_url(console_core_url),
+        action="run.open_console",
+    )
     progress(
         2,
         8,
@@ -1384,7 +1561,14 @@ def run(
         site_code,
         runlog_sheet_label,
     )
-    runlog_ws = gc.open_by_url(runlog_url).worksheet(tab_runlog)
+    runlog_book = _with_sheets_retry(
+        lambda: gc.open_by_url(runlog_url),
+        action="runlog.open_book",
+    )
+    runlog_ws = _with_sheets_retry(
+        lambda: runlog_book.worksheet(tab_runlog),
+        action="runlog.open_tab",
+    )
     logger = RunLogger18(
         worksheet=runlog_ws,
         run_id=run_id,
