@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 MODULE_PATH = "shopify_sync.1_2_edit_core"
-MODULE_VERSION = "2026-08-02-collection-core-edit-v1"
+MODULE_VERSION = "2026-08-02-collection-page-core-edit-v2"
 DEFAULT_JOB_NAME = "edit_core"
 
 import base64
@@ -97,7 +97,12 @@ PRODUCT_CORE_KEYS = {
     PRODUCT_IMAGES_FIELD_KEY,
 }
 VARIANT_CORE_KEYS = {"core.sku", "core.cost", "core.weight", "core.weight_unit", "core.price", "core.compare_at_price", VARIANT_IMAGE_FIELD_KEY}
-COLLECTION_CORE_KEYS = {"core.description", "core.seo_title"}
+COLLECTION_CORE_KEYS = {"core.description", "core.seo_title", "core.seo_description"}
+PAGE_CORE_KEYS = {"core.seo_title", "core.seo_description"}
+PAGE_SEO_METAFIELD_MAP = {
+    "core.seo_title": "title_tag",
+    "core.seo_description": "description_tag",
+}
 
 Q_PRODUCT_BY_HANDLE = """
 query($handle: String!) {
@@ -170,6 +175,7 @@ mutation collectionUpdate($collection: CollectionUpdateInput!) {
       descriptionHtml
       seo {
         title
+        description
       }
     }
     userErrors {
@@ -1592,9 +1598,20 @@ def validate_row(entity_type: str, field_key: str, action: str) -> tuple[bool, s
         if act not in SUPPORTED_PRODUCT_STATUS_ACTIONS:
             return False, "action_not_supported"
 
-    elif fk in COLLECTION_CORE_KEYS:
+    elif fk == "core.description":
         if et not in {"PRODUCT", "COLLECTION"}:
             return False, "core_entity_mismatch"
+        if act not in SUPPORTED_CORE_SCALAR_ACTIONS:
+            return False, "action_not_supported"
+
+    elif fk in PAGE_CORE_KEYS:
+        if et not in {"PRODUCT", "COLLECTION", "PAGE"}:
+            return False, "core_entity_mismatch"
+        if et == "PAGE" and act == "CLEAR":
+            # Shopify Admin API currently has no supported way to clear Page SEO
+            # title/description back to blank/default. Fail closed instead of
+            # pretending that deleting or blanking the backing metafield is safe.
+            return False, "page_seo_clear_not_supported_by_shopify_api"
         if act not in SUPPORTED_CORE_SCALAR_ACTIONS:
             return False, "action_not_supported"
 
@@ -1602,7 +1619,6 @@ def validate_row(entity_type: str, field_key: str, action: str) -> tuple[bool, s
         "core.title",
         "core.product_type",
         "core.description_html",
-        "core.seo_description",
         "core.vendor",
     }:
         if et != "PRODUCT":
@@ -2283,6 +2299,8 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
 
     product_updates = {}
     collection_updates = {}
+    page_seo_inputs = []
+    page_seo_meta_rows = []
     variant_updates = {}
     preview_rows = []
     invalid_rows = []
@@ -2315,6 +2333,8 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                 "descriptionHtml": None,
                 "seo_title_present": False,
                 "seo_title": None,
+                "seo_description_present": False,
+                "seo_description": None,
                 "source_rows": [],
                 "field_keys": [],
             }
@@ -2452,40 +2472,98 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                 })
 
             elif fk == "core.seo_title":
-                bucket = (
-                    get_collection_bucket(owner_id)
-                    if entity_type == "COLLECTION"
-                    else get_product_bucket(owner_id)
-                )
-                bucket["seo_title_present"] = True
-                bucket["seo_title"] = "" if action == "CLEAR" else desired
-                bucket["source_rows"].append(sheet_row)
-                bucket["field_keys"].append(fk)
-                preview_rows.append({
-                    "sheet_row": sheet_row,
-                    "entity_type": entity_type,
-                    "owner_id": owner_id,
-                    "field_key": fk,
-                    "action": action,
-                    "plan_type": "collection_core" if entity_type == "COLLECTION" else "product_core",
-                    "value_preview": bucket["seo_title"],
-                })
+                if entity_type == "PAGE":
+                    # PageUpdateInput does not expose an SEO input. Shopify stores
+                    # Page search-listing SEO in global.title_tag / description_tag.
+                    page_seo_inputs.append({
+                        "ownerId": owner_id,
+                        "namespace": "global",
+                        "key": PAGE_SEO_METAFIELD_MAP[fk],
+                        "type": "single_line_text_field",
+                        "value": desired,
+                    })
+                    page_seo_meta_rows.append({
+                        "sheet_row": sheet_row,
+                        "entity_type": "PAGE",
+                        "owner_id": owner_id,
+                        "field_key": fk,
+                    })
+                    preview_rows.append({
+                        "sheet_row": sheet_row,
+                        "entity_type": "PAGE",
+                        "owner_id": owner_id,
+                        "field_key": fk,
+                        "action": action,
+                        "plan_type": "page_seo_metafield",
+                        "write_type": "single_line_text_field",
+                        "backing_metafield": "global.title_tag",
+                        "value_preview": desired,
+                    })
+                else:
+                    bucket = (
+                        get_collection_bucket(owner_id)
+                        if entity_type == "COLLECTION"
+                        else get_product_bucket(owner_id)
+                    )
+                    bucket["seo_title_present"] = True
+                    bucket["seo_title"] = "" if action == "CLEAR" else desired
+                    bucket["source_rows"].append(sheet_row)
+                    bucket["field_keys"].append(fk)
+                    preview_rows.append({
+                        "sheet_row": sheet_row,
+                        "entity_type": entity_type,
+                        "owner_id": owner_id,
+                        "field_key": fk,
+                        "action": action,
+                        "plan_type": "collection_core" if entity_type == "COLLECTION" else "product_core",
+                        "value_preview": bucket["seo_title"],
+                    })
 
             elif fk == "core.seo_description":
-                bucket = get_product_bucket(owner_id)
-                bucket["seo_description_present"] = True
-                bucket["seo_description"] = "" if action == "CLEAR" else desired
-                bucket["source_rows"].append(sheet_row)
-                bucket["field_keys"].append(fk)
-                preview_rows.append({
-                    "sheet_row": sheet_row,
-                    "entity_type": entity_type,
-                    "owner_id": owner_id,
-                    "field_key": fk,
-                    "action": action,
-                    "plan_type": "product_core",
-                    "value_preview": bucket["seo_description"],
-                })
+                if entity_type == "PAGE":
+                    page_seo_inputs.append({
+                        "ownerId": owner_id,
+                        "namespace": "global",
+                        "key": PAGE_SEO_METAFIELD_MAP[fk],
+                        "type": "single_line_text_field",
+                        "value": desired,
+                    })
+                    page_seo_meta_rows.append({
+                        "sheet_row": sheet_row,
+                        "entity_type": "PAGE",
+                        "owner_id": owner_id,
+                        "field_key": fk,
+                    })
+                    preview_rows.append({
+                        "sheet_row": sheet_row,
+                        "entity_type": "PAGE",
+                        "owner_id": owner_id,
+                        "field_key": fk,
+                        "action": action,
+                        "plan_type": "page_seo_metafield",
+                        "write_type": "single_line_text_field",
+                        "backing_metafield": "global.description_tag",
+                        "value_preview": desired,
+                    })
+                else:
+                    bucket = (
+                        get_collection_bucket(owner_id)
+                        if entity_type == "COLLECTION"
+                        else get_product_bucket(owner_id)
+                    )
+                    bucket["seo_description_present"] = True
+                    bucket["seo_description"] = "" if action == "CLEAR" else desired
+                    bucket["source_rows"].append(sheet_row)
+                    bucket["field_keys"].append(fk)
+                    preview_rows.append({
+                        "sheet_row": sheet_row,
+                        "entity_type": entity_type,
+                        "owner_id": owner_id,
+                        "field_key": fk,
+                        "action": action,
+                        "plan_type": "collection_core" if entity_type == "COLLECTION" else "product_core",
+                        "value_preview": bucket["seo_description"],
+                    })
 
             elif fk == "core.tags":
                 bucket = get_product_bucket(owner_id)
@@ -2678,8 +2756,13 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
         if bucket["descriptionHtml"] is not None:
             input_obj["descriptionHtml"] = bucket["descriptionHtml"]
 
+        seo_obj = {}
         if bucket["seo_title_present"]:
-            input_obj["seo"] = {"title": bucket["seo_title"]}
+            seo_obj["title"] = bucket["seo_title"]
+        if bucket["seo_description_present"]:
+            seo_obj["description"] = bucket["seo_description"]
+        if seo_obj:
+            input_obj["seo"] = seo_obj
 
         collection_inputs.append(input_obj)
         collection_meta_rows.append({
@@ -2808,6 +2891,8 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
         "product_meta_rows": product_meta_rows,
         "collection_inputs": collection_inputs,
         "collection_meta_rows": collection_meta_rows,
+        "page_seo_inputs": page_seo_inputs,
+        "page_seo_meta_rows": page_seo_meta_rows,
         "variant_inputs": variant_inputs,
         "variant_meta_rows": variant_meta_rows,
         "inventory_item_inputs": inventory_item_inputs,
@@ -4879,6 +4964,7 @@ def run(
         f"[prepare 5/5] plans built | metafield={len(meta_plan['set_inputs'])} | "
         f"product_core={len(core_plan['product_inputs'])} | "
         f"collection_core={len(core_plan['collection_inputs'])} | "
+        f"page_seo={len(core_plan['page_seo_inputs'])} | "
         f"variant_core={len(core_plan['variant_inputs'])} | "
         f"media={len(media_plan['product_rows']) + len(media_plan['variant_rows'])} | "
         f"elapsed={time.perf_counter() - phase_started_at:.1f}s",
@@ -4898,6 +4984,7 @@ def run(
         len(meta_plan["set_inputs"])
         + len(core_plan["product_inputs"])
         + len(core_plan["collection_inputs"])
+        + len(core_plan["page_seo_inputs"])
         + len(core_plan["tag_delta_rows"])
         + len(core_plan["variant_inputs"])
         + len(core_plan["inventory_item_inputs"])
@@ -5106,6 +5193,13 @@ def run(
         set_batch_size=set_batch_size,
     )
 
+    page_seo_apply = apply_metafield_plan(
+        client=shopify,
+        set_inputs=core_plan["page_seo_inputs"],
+        meta_rows=core_plan["page_seo_meta_rows"],
+        set_batch_size=set_batch_size,
+    )
+
     inventory_item_apply = apply_inventory_item_plan(
         client=shopify,
         item_inputs=core_plan["inventory_item_inputs"],
@@ -5145,6 +5239,7 @@ def run(
         metafield_apply["ok_count"]
         + product_apply["ok_count"]
         + collection_apply["ok_count"]
+        + page_seo_apply["ok_count"]
         + inventory_item_apply["ok_count"]
         + variant_apply["ok_count"]
         + media_apply["ok_count"]
@@ -5153,6 +5248,7 @@ def run(
         metafield_apply["fail_count"]
         + product_apply["fail_count"]
         + collection_apply["fail_count"]
+        + page_seo_apply["fail_count"]
         + inventory_item_apply["fail_count"]
         + variant_apply["fail_count"]
         + media_apply["fail_count"]
@@ -5195,6 +5291,7 @@ def run(
             metafield_apply["detail_fail_rows"]
             + product_apply["detail_fail_rows"]
             + collection_apply["detail_fail_rows"]
+            + page_seo_apply["detail_fail_rows"]
             + inventory_item_apply["detail_fail_rows"]
             + variant_apply["detail_fail_rows"]
             + media_apply["detail_fail_rows"]
