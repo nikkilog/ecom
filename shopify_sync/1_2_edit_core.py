@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 MODULE_PATH = "shopify_sync.1_2_edit_core"
-MODULE_VERSION = "2026-08-02-collection-page-core-edit-v2"
+MODULE_VERSION = "2026-08-02-collection-api-2026-01-fix-v1"
 DEFAULT_JOB_NAME = "edit_core"
 
 import base64
@@ -168,8 +168,8 @@ mutation productUpdate($input: ProductInput!) {
 """
 
 M_COLLECTION_UPDATE = """
-mutation collectionUpdate($collection: CollectionUpdateInput!) {
-  collectionUpdate(collection: $collection) {
+mutation collectionUpdate($input: CollectionInput!) {
+  collectionUpdate(input: $input) {
     collection {
       id
       descriptionHtml
@@ -4414,7 +4414,7 @@ def apply_collection_core_plan(
 
         for inp, meta in zip(batch_inputs, batch_meta):
             try:
-                data = gql(client, M_COLLECTION_UPDATE, {"collection": inp})
+                data = gql(client, M_COLLECTION_UPDATE, {"input": inp})
                 resp = data.get("collectionUpdate") or {}
                 errs = resp.get("userErrors") or []
                 collection = resp.get("collection") or {}
