@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 MODULE_PATH = "shopify_sync.1_2_edit_core"
-MODULE_VERSION = "2026-08-02-runtime-boundary-v1"
+MODULE_VERSION = "2026-08-02-collection-core-edit-v1"
 DEFAULT_JOB_NAME = "edit_core"
 
 import base64
@@ -97,6 +97,7 @@ PRODUCT_CORE_KEYS = {
     PRODUCT_IMAGES_FIELD_KEY,
 }
 VARIANT_CORE_KEYS = {"core.sku", "core.cost", "core.weight", "core.weight_unit", "core.price", "core.compare_at_price", VARIANT_IMAGE_FIELD_KEY}
+COLLECTION_CORE_KEYS = {"core.description", "core.seo_title"}
 
 Q_PRODUCT_BY_HANDLE = """
 query($handle: String!) {
@@ -151,6 +152,24 @@ mutation productUpdate($input: ProductInput!) {
       seo {
         title
         description
+      }
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}
+"""
+
+M_COLLECTION_UPDATE = """
+mutation collectionUpdate($collection: CollectionUpdateInput!) {
+  collectionUpdate(collection: $collection) {
+    collection {
+      id
+      descriptionHtml
+      seo {
+        title
       }
     }
     userErrors {
@@ -1573,12 +1592,16 @@ def validate_row(entity_type: str, field_key: str, action: str) -> tuple[bool, s
         if act not in SUPPORTED_PRODUCT_STATUS_ACTIONS:
             return False, "action_not_supported"
 
+    elif fk in COLLECTION_CORE_KEYS:
+        if et not in {"PRODUCT", "COLLECTION"}:
+            return False, "core_entity_mismatch"
+        if act not in SUPPORTED_CORE_SCALAR_ACTIONS:
+            return False, "action_not_supported"
+
     elif fk in {
         "core.title",
         "core.product_type",
         "core.description_html",
-        "core.description",
-        "core.seo_title",
         "core.seo_description",
         "core.vendor",
     }:
@@ -2259,6 +2282,7 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
     df_core = df_ready[(df_ready["_skip_reason"].eq("")) & (df_ready["row_type"] == "core")].copy()
 
     product_updates = {}
+    collection_updates = {}
     variant_updates = {}
     preview_rows = []
     invalid_rows = []
@@ -2283,6 +2307,18 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                 "field_keys": [],
             }
         return product_updates[owner_id]
+
+    def get_collection_bucket(owner_id: str):
+        if owner_id not in collection_updates:
+            collection_updates[owner_id] = {
+                "id": owner_id,
+                "descriptionHtml": None,
+                "seo_title_present": False,
+                "seo_title": None,
+                "source_rows": [],
+                "field_keys": [],
+            }
+        return collection_updates[owner_id]
 
     def get_variant_bucket(owner_id: str):
         if owner_id not in variant_updates:
@@ -2397,7 +2433,11 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                 })
 
             elif fk == "core.description":
-                bucket = get_product_bucket(owner_id)
+                bucket = (
+                    get_collection_bucket(owner_id)
+                    if entity_type == "COLLECTION"
+                    else get_product_bucket(owner_id)
+                )
                 bucket["descriptionHtml"] = "" if action == "CLEAR" else plain_text_to_description_html(desired)
                 bucket["source_rows"].append(sheet_row)
                 bucket["field_keys"].append(fk)
@@ -2407,12 +2447,16 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                     "owner_id": owner_id,
                     "field_key": fk,
                     "action": action,
-                    "plan_type": "product_core",
+                    "plan_type": "collection_core" if entity_type == "COLLECTION" else "product_core",
                     "value_preview": bucket["descriptionHtml"][:200],
                 })
 
             elif fk == "core.seo_title":
-                bucket = get_product_bucket(owner_id)
+                bucket = (
+                    get_collection_bucket(owner_id)
+                    if entity_type == "COLLECTION"
+                    else get_product_bucket(owner_id)
+                )
                 bucket["seo_title_present"] = True
                 bucket["seo_title"] = "" if action == "CLEAR" else desired
                 bucket["source_rows"].append(sheet_row)
@@ -2423,7 +2467,7 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
                     "owner_id": owner_id,
                     "field_key": fk,
                     "action": action,
-                    "plan_type": "product_core",
+                    "plan_type": "collection_core" if entity_type == "COLLECTION" else "product_core",
                     "value_preview": bucket["seo_title"],
                 })
 
@@ -2625,6 +2669,26 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
             "tags_value": bucket["tags_value"],
         })
 
+    collection_inputs = []
+    collection_meta_rows = []
+
+    for owner_id, bucket in collection_updates.items():
+        input_obj = {"id": owner_id}
+
+        if bucket["descriptionHtml"] is not None:
+            input_obj["descriptionHtml"] = bucket["descriptionHtml"]
+
+        if bucket["seo_title_present"]:
+            input_obj["seo"] = {"title": bucket["seo_title"]}
+
+        collection_inputs.append(input_obj)
+        collection_meta_rows.append({
+            "entity_type": "COLLECTION",
+            "owner_id": owner_id,
+            "field_key": ",".join(sorted(set(bucket["field_keys"]))) if bucket["field_keys"] else "core.collection",
+            "sheet_rows": bucket["source_rows"],
+        })
+
     variant_inputs = []
     variant_meta_rows = []
     inventory_item_inputs = []
@@ -2742,6 +2806,8 @@ def build_core_plan(df_ready: pd.DataFrame, client: ShopifyClient) -> dict[str, 
     return {
         "product_inputs": product_inputs,
         "product_meta_rows": product_meta_rows,
+        "collection_inputs": collection_inputs,
+        "collection_meta_rows": collection_meta_rows,
         "variant_inputs": variant_inputs,
         "variant_meta_rows": variant_meta_rows,
         "inventory_item_inputs": inventory_item_inputs,
@@ -4229,6 +4295,98 @@ def apply_product_core_plan(
     
 
 
+def apply_collection_core_plan(
+    client: ShopifyClient,
+    collection_inputs: list[dict[str, Any]],
+    collection_meta_rows: list[dict[str, Any]],
+    set_batch_size: int,
+) -> dict[str, Any]:
+    """Apply Collection core fields supported by Edit__Core."""
+    total = len(collection_inputs)
+    batch_size = max(1, int(set_batch_size or 1))
+    total_batches = (total + batch_size - 1) // batch_size if total else 0
+
+    print(
+        f"=== Applying collectionUpdate === total={total}, "
+        f"batches={total_batches}, batch_size={batch_size}"
+    )
+
+    if total == 0:
+        print("=== collectionUpdate done === total=0, ok=0, fail=0")
+        return {"ok_count": 0, "fail_count": 0, "detail_fail_rows": []}
+
+    ok_count = 0
+    fail_count = 0
+    detail_fail_rows = []
+
+    for batch_no, (start_idx, batch_inputs) in enumerate(
+        _chunk_list(collection_inputs, batch_size),
+        start=1,
+    ):
+        batch_meta = collection_meta_rows[start_idx:start_idx + len(batch_inputs)]
+        batch_ok = 0
+        batch_fail = 0
+
+        for inp, meta in zip(batch_inputs, batch_meta):
+            try:
+                data = gql(client, M_COLLECTION_UPDATE, {"collection": inp})
+                resp = data.get("collectionUpdate") or {}
+                errs = resp.get("userErrors") or []
+                collection = resp.get("collection") or {}
+
+                if errs or not collection.get("id"):
+                    batch_fail += 1
+                    first_err = errs[0] if errs else {}
+                    detail_fail_rows.append({
+                        "entity_type": "COLLECTION",
+                        "owner_id": meta.get("owner_id", ""),
+                        "field_key": meta.get("field_key", "core.collection"),
+                        "error_reason": "collection_update_error",
+                        "message": (
+                            f"sheet_rows={meta.get('sheet_rows')} | "
+                            f"msg={first_err.get('message', 'No collection returned')} | "
+                            f"field={first_err.get('field')}"
+                        ),
+                    })
+                else:
+                    batch_ok += 1
+
+            except Exception as e:
+                batch_fail += 1
+                detail_fail_rows.append({
+                    "entity_type": "COLLECTION",
+                    "owner_id": meta.get("owner_id", ""),
+                    "field_key": meta.get("field_key", "core.collection"),
+                    "error_reason": "collection_update_exception",
+                    "message": f"sheet_rows={meta.get('sheet_rows')} | exception={e}",
+                })
+
+        ok_count += batch_ok
+        fail_count += batch_fail
+
+        print(
+            f"Batch {batch_no}/{total_batches}: {len(batch_inputs)} items ... ",
+            end="",
+            flush=True,
+        )
+        if batch_fail == 0:
+            print("OK", flush=True)
+        elif batch_ok == 0:
+            print(f"FAILED (fail={batch_fail})", flush=True)
+        else:
+            print(f"PARTIAL_FAIL (ok={batch_ok}, fail={batch_fail})", flush=True)
+
+    print(
+        f"=== collectionUpdate done === total={total}, "
+        f"ok={ok_count}, fail={fail_count}"
+    )
+    return {
+        "ok_count": ok_count,
+        "fail_count": fail_count,
+        "detail_fail_rows": detail_fail_rows,
+    }
+
+
 def _build_inventory_item_batch_mutation(batch_size: int) -> str:
     variable_defs = []
     fields = []
@@ -4720,6 +4878,7 @@ def run(
     print(
         f"[prepare 5/5] plans built | metafield={len(meta_plan['set_inputs'])} | "
         f"product_core={len(core_plan['product_inputs'])} | "
+        f"collection_core={len(core_plan['collection_inputs'])} | "
         f"variant_core={len(core_plan['variant_inputs'])} | "
         f"media={len(media_plan['product_rows']) + len(media_plan['variant_rows'])} | "
         f"elapsed={time.perf_counter() - phase_started_at:.1f}s",
@@ -4738,6 +4897,7 @@ def run(
     rows_planned_ops = (
         len(meta_plan["set_inputs"])
         + len(core_plan["product_inputs"])
+        + len(core_plan["collection_inputs"])
         + len(core_plan["tag_delta_rows"])
         + len(core_plan["variant_inputs"])
         + len(core_plan["inventory_item_inputs"])
@@ -4939,6 +5099,13 @@ def run(
         set_batch_size=set_batch_size,
     )
 
+    collection_apply = apply_collection_core_plan(
+        client=shopify,
+        collection_inputs=core_plan["collection_inputs"],
+        collection_meta_rows=core_plan["collection_meta_rows"],
+        set_batch_size=set_batch_size,
+    )
+
     inventory_item_apply = apply_inventory_item_plan(
         client=shopify,
         item_inputs=core_plan["inventory_item_inputs"],
@@ -4977,6 +5144,7 @@ def run(
     rows_written = (
         metafield_apply["ok_count"]
         + product_apply["ok_count"]
+        + collection_apply["ok_count"]
         + inventory_item_apply["ok_count"]
         + variant_apply["ok_count"]
         + media_apply["ok_count"]
@@ -4984,6 +5152,7 @@ def run(
     apply_fail_count = (
         metafield_apply["fail_count"]
         + product_apply["fail_count"]
+        + collection_apply["fail_count"]
         + inventory_item_apply["fail_count"]
         + variant_apply["fail_count"]
         + media_apply["fail_count"]
@@ -5025,6 +5194,7 @@ def run(
         detail_rows=(
             metafield_apply["detail_fail_rows"]
             + product_apply["detail_fail_rows"]
+            + collection_apply["detail_fail_rows"]
             + inventory_item_apply["detail_fail_rows"]
             + variant_apply["detail_fail_rows"]
             + media_apply["detail_fail_rows"]

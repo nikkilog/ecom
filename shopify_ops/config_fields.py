@@ -52,7 +52,7 @@ DEFAULT_MF_OWNER_TYPES = ["PRODUCT", "PRODUCTVARIANT", "COLLECTION", "PAGE", "OR
 DEFAULT_PAGE_SIZE = 250
 
 MODULE_PATH = "shopify_ops.config_fields"
-MODULE_VERSION = "2026-08-01-runtime-boundary-v1"
+MODULE_VERSION = "2026-08-02-collection-core-fields-v1"
 DEFAULT_JOB_NAME = "config_fields"
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -117,6 +117,15 @@ CORE_FIXED = [{'display_name': 'Collection GID',
   'entity_type': 'COLLECTION',
   'field_key': 'core.description',
   'expr': 'collection.description',
+  'field_type': 'RAW',
+  'data_type': 'string',
+  'source_type': 'CORE',
+  'namespace': '',
+  'key': ''},
+ {'display_name': 'Collection SEO Title',
+  'entity_type': 'COLLECTION',
+  'field_key': 'core.seo_title',
+  'expr': 'collection.seo.title',
   'field_type': 'RAW',
   'data_type': 'string',
   'source_type': 'CORE',
