@@ -8,7 +8,7 @@ Import path:
 
 Scope
 -----
-- Read the first 23 formal columns of ``SPU_Source`` only.
+- Read the formal columns of ``SPU_Source`` through ``Primary category`` only.
 - Treat ``SPU_Source`` as the authoritative business source; existing ``Input``
   values/formulas are never read as source data.
 - Validate SPU-V / Status / Variant Base identity contracts.
@@ -49,14 +49,14 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 
-MODULE_VERSION = "2026-08-04-dynamic-input-range-v4"
+MODULE_VERSION = "2026-08-04-handle-formula-v7"
 MODULE_PATH = "shopify_create.7_4_1_spu_product_input"
 DEFAULT_JOB_NAME = "spu_product_input"
 
 INFRA_MODULE_PATH = "shopify_create.7_1_1_generic_product_prepare"
 EXPECTED_INFRA_MODULE_VERSION = "2026-08-02-runtime-boundary-v1"
 
-SOURCE_HEADERS_23 = [
+SOURCE_HEADERS = [
     "SPU-V",
     "Status",
     "Variant Base",
@@ -79,8 +79,8 @@ SOURCE_HEADERS_23 = [
     "Product Description",
     "Price",
     "Primary category",
-    "Multiplier-V",
 ]
+SOURCE_COLUMN_COUNT = len(SOURCE_HEADERS)
 
 # Positional Source columns. Duplicate human headers are intentional.
 SRC_SPU_V = 0
@@ -621,18 +621,24 @@ def _read_source(values: Sequence[Sequence[Any]]) -> List[SourceRow]:
     if not values:
         raise ValueError("SPU_Source is empty.")
 
-    actual = [_normalize_header(v) for v in list(values[0])[:23]]
-    expected = [_normalize_header(v) for v in SOURCE_HEADERS_23]
+    actual = [
+        _normalize_header(v)
+        for v in list(values[0])[:SOURCE_COLUMN_COUNT]
+    ]
+    expected = [_normalize_header(v) for v in SOURCE_HEADERS]
     if actual != expected:
         raise ValueError(
-            "SPU_Source first 23 columns do not match the formal schema. "
+            f"SPU_Source first {SOURCE_COLUMN_COUNT} columns do not match "
+            "the formal schema. "
             f"expected={expected}; actual={actual}"
         )
 
     rows: List[SourceRow] = []
     for source_row, raw in enumerate(values[1:], start=2):
-        padded = list(raw) + [""] * max(0, 23 - len(raw))
-        formal = tuple(_safe_str(v) for v in padded[:23])
+        padded = list(raw) + [""] * max(0, SOURCE_COLUMN_COUNT - len(raw))
+        formal = tuple(
+            _safe_str(v) for v in padded[:SOURCE_COLUMN_COUNT]
+        )
         if not any(formal):
             continue
 
@@ -873,12 +879,16 @@ def _group_content(
 
     input_error = ""
     if status == "CREATE":
-        title = remove_size_expressions(first.get(SRC_PRODUCT_TITLE), size_value)
-        if not title:
+        base_title = remove_size_expressions(first.get(SRC_PRODUCT_TITLE), size_value)
+        if not base_title:
             raise ValueError(
                 f"SPU-V {first.spu_v!r}: generated CREATE Title is blank."
             )
-        handle = _slugify_title(title)
+        title = f"{base_title} - Pick Size to Add"
+        # CREATE Handle is intentionally left blank in the raw matrix.
+        # _write_input_sheet writes the Google Sheets formula into core.handle
+        # after Title has been written, so Handle remains dynamically linked to Title.
+        handle = ""
     else:
         target_product_id = _safe_str(meta["target_product_id"])
         existing = product_handle_map.get(target_product_id)
@@ -1051,6 +1061,42 @@ def _write_input_sheet(input_ws, matrix: Sequence[Sequence[Any]]) -> None:
         ),
     )
 
+    # CREATE Handle contract: keep an actual Google Sheets formula in core.handle,
+    # equivalent to the operator-owned formula:
+    # =LOWER(REGEXREPLACE(REGEXREPLACE(TRIM(<TitleCell>),"[^A-Za-z0-9]+","-"),"(^-+|-+$)",""))
+    # Do not hard-code Title/Handle column letters; derive them from the Input schema.
+    # ADD rows keep the existing Shopify Product Handle already resolved from
+    # V_Product_Handle.
+    if len(matrix) > 2:
+        action_idx = INPUT_HEADERS.index("Action")
+        title_idx = INPUT_HEADERS.index("Title")
+        handle_idx = INPUT_HEADERS.index("Handle")
+        title_col = _a1_column_name(title_idx + 1)
+        handle_col = _a1_column_name(handle_idx + 1)
+
+        handle_values: List[List[str]] = []
+        for sheet_row, row in enumerate(matrix[2:], start=3):
+            action = _safe_str(row[action_idx]).upper()
+            if action == "CREATE":
+                title_cell = f"{title_col}{sheet_row}"
+                formula = (
+                    '=LOWER(REGEXREPLACE(REGEXREPLACE(TRIM(' + title_cell + '),'
+                    '"[^A-Za-z0-9]+","-"),"(^-+|-+$)",""))'
+                )
+                handle_values.append([formula])
+            else:
+                handle_values.append([_safe_str(row[handle_idx])])
+
+        gp._sheets_retry(
+            f"write Handle formulas/values rows={len(handle_values)} "
+            f"range={handle_col}3:{handle_col}{len(matrix)}",
+            lambda: input_ws.update(
+                range_name=f"{handle_col}3:{handle_col}{len(matrix)}",
+                values=handle_values,
+                value_input_option="USER_ENTERED",
+            ),
+        )
+
 
 def run(
     *,
@@ -1151,7 +1197,7 @@ def run(
     )
 
     try:
-        progress(3, 9, f"Read Source | tab={tab_source} | formal_columns=23")
+        progress(3, 9, f"Read Source | tab={tab_source} | formal_columns={SOURCE_COLUMN_COUNT}")
         source_ws = _require_worksheet(create_book, tab_source)
         source_values = gp._sheets_retry(
             "read SPU_Source", source_ws.get_all_values
