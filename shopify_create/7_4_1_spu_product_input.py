@@ -23,7 +23,7 @@ Scope
   Description HTML, so G/H are the same semantic content in two representations.
 - Overwrite ``Input`` with a two-row header (display name + field_key) and the
   generated rows.
-- Read ``V_Product_Handle`` only when ADD rows actually need to be generated.
+- Read ``V_V_Handle`` only when ADD rows actually need to be generated.
 - Missing/ambiguous ADD Product lookups are written to ``sys.input_error`` and
   do not stop the whole Input build; structural Source/Schema errors still fail fast.
 - Write RunLog evidence.
@@ -49,7 +49,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 
-MODULE_VERSION = "2026-08-04-handle-formula-v7"
+MODULE_VERSION = "2026-08-05-v-v-handle-product-size-v8"
 MODULE_PATH = "shopify_create.7_4_1_spu_product_input"
 DEFAULT_JOB_NAME = "spu_product_input"
 
@@ -123,6 +123,7 @@ INPUT_COLUMNS: List[Tuple[str, str, str]] = [
     ("Handle", "PRODUCT", "core.handle"),
     ("Description HTML", "PRODUCT", "core.description_html"),
     ("Product Description", "PRODUCT", "CFG"),
+    ("Size", "PRODUCT", "CFG"),
     ("Vendor", "PRODUCT", "core.vendor"),
     ("Product Type", "PRODUCT", "core.product_type"),
     ("Tags", "PRODUCT", "core.tags"),
@@ -772,7 +773,7 @@ def _read_product_handle_map(
     if not wanted:
         return {}
     if not values:
-        raise ValueError("V_Product_Handle is empty but ADD requires existing Product lookup.")
+        raise ValueError("V_V_Handle is empty but ADD requires existing Product lookup.")
 
     headers = [_normalize_header(v) for v in values[0]]
     required = {
@@ -782,7 +783,7 @@ def _read_product_handle_map(
     }
     missing = sorted(required - set(headers))
     if missing:
-        raise ValueError(f"V_Product_Handle missing required columns: {missing}")
+        raise ValueError(f"V_V_Handle missing required columns: {missing}")
     h = {name: headers.index(name) for name in required}
 
     matches: Dict[str, List[Tuple[str, str, int]]] = {pid: [] for pid in wanted}
@@ -801,7 +802,7 @@ def _read_product_handle_map(
         if not rows:
             # Business-data lookup errors are written into Input instead of
             # stopping the entire 7.4.1 generation job. The target ID itself
-            # is preserved so the operator can repair V_Product_Handle and rerun.
+            # is preserved so the operator can repair V_V_Handle and rerun.
             out[product_id] = {
                 "title": "",
                 "handle": "",
@@ -869,13 +870,124 @@ def _resolve_cfg_field_keys(cfg_fields: Mapping[str, Any]) -> List[str]:
     return resolved
 
 
+
+def _read_size_order(values: Sequence[Sequence[Any]]) -> Dict[str, int]:
+    """Read the formal Console Core ``Size顺序`` dictionary.
+
+    Contract:
+    - headers: ``排序`` and ``size``;
+    - one nonblank size maps to exactly one integer order;
+    - one order value maps to exactly one size.
+
+    The dictionary remains an operator-owned Sheet contract and is never
+    embedded as a hard-coded Python list.
+    """
+    if not values:
+        raise ValueError("Size顺序 is empty.")
+
+    headers = [_normalize_header(value) for value in values[0]]
+    header_lookup = {header.casefold(): index for index, header in enumerate(headers) if header}
+    order_key = "排序".casefold()
+    size_key = "size".casefold()
+    missing = []
+    if order_key not in header_lookup:
+        missing.append("排序")
+    if size_key not in header_lookup:
+        missing.append("size")
+    if missing:
+        raise ValueError(f"Size顺序 missing required columns: {missing}")
+
+    order_idx = header_lookup[order_key]
+    size_idx = header_lookup[size_key]
+    by_size: Dict[str, int] = {}
+    by_order: Dict[int, str] = {}
+
+    for sheet_row, raw in enumerate(values[1:], start=2):
+        padded = list(raw) + [""] * max(0, len(headers) - len(raw))
+        raw_order = _safe_str(padded[order_idx])
+        size = _safe_str(padded[size_idx])
+        if not raw_order and not size:
+            continue
+        if not raw_order or not size:
+            raise ValueError(
+                f"Size顺序 row {sheet_row} requires both 排序 and size; "
+                f"排序={raw_order!r}; size={size!r}."
+            )
+        order = _parse_integer(raw_order, label=f"Size顺序 row {sheet_row} 排序")
+        if order < 1:
+            raise ValueError(f"Size顺序 row {sheet_row}: 排序 must be >= 1; got={order}.")
+        if size in by_size and by_size[size] != order:
+            raise ValueError(
+                f"Size顺序 size {size!r} has conflicting orders "
+                f"{by_size[size]} and {order}."
+            )
+        if order in by_order and by_order[order] != size:
+            raise ValueError(
+                f"Size顺序 order {order} is assigned to multiple sizes: "
+                f"{by_order[order]!r} and {size!r}."
+            )
+        by_size[size] = order
+        by_order[order] = size
+
+    if not by_size:
+        raise ValueError("Size顺序 contains no usable size rows.")
+    return by_size
+
+
+def _aggregate_product_size(
+    meta: Mapping[str, Any],
+    size_order: Mapping[str, int],
+) -> Tuple[str, str, List[str]]:
+    """Aggregate all Source Size-V values for one SPU Product group.
+
+    All Source rows participate, including ADD rows already present on Shopify
+    and therefore excluded from new Input Variant generation. Blank Size-V is
+    allowed and ignored. Distinct known values follow ``Size顺序``; values absent
+    from the dictionary are retained at the end in first-seen order and produce
+    a soft ``sys.input_error`` so unrelated SPU groups can still be generated.
+    """
+    seen: List[str] = []
+    seen_set = set()
+    for source in meta.get("source_rows", []):
+        size = _safe_str(source.get(SRC_SIZE))
+        if not size or size in seen_set:
+            continue
+        seen_set.add(size)
+        seen.append(size)
+
+    known = sorted(
+        (size for size in seen if size in size_order),
+        key=lambda size: (int(size_order[size]), size),
+    )
+    missing = [size for size in seen if size not in size_order]
+    ordered = known + missing
+    product_size = ", ".join(ordered)
+    input_error = (
+        "SIZE_ORDER_NOT_FOUND: " + "; ".join(missing)
+        if missing
+        else ""
+    )
+    return product_size, input_error, missing
+
+
+def _join_input_errors(*errors: Any) -> str:
+    parts: List[str] = []
+    for error in errors:
+        text = _safe_str(error)
+        if text and text not in parts:
+            parts.append(text)
+    return " | ".join(parts)
+
 def _group_content(
     meta: Mapping[str, Any],
     product_handle_map: Mapping[str, Mapping[str, str]],
+    size_order: Mapping[str, int],
 ) -> Dict[str, str]:
     first: SourceRow = meta["first_row"]
     status = _safe_str(meta["status"])
     size_value = first.get(SRC_SIZE)
+
+    product_size, size_order_error, _missing_sizes = _aggregate_product_size(meta, size_order)
 
     input_error = ""
     if status == "CREATE":
@@ -909,11 +1021,13 @@ def _group_content(
         size_value,
     )
     description_json = html_to_shopify_rich_text_json(description_html)
+    input_error = _join_input_errors(input_error, size_order_error)
 
     return {
         "title": title,
         "handle": handle,
         "input_error": input_error,
+        "product_size": product_size,
         "description_html": description_html,
         "description_json": description_json,
     }
@@ -923,9 +1037,10 @@ def build_input_rows(
     source_rows: Sequence[SourceRow],
     group_meta: Mapping[str, Mapping[str, Any]],
     product_handle_map: Mapping[str, Mapping[str, str]],
+    size_order: Mapping[str, int],
 ) -> List[List[str]]:
     content_by_spu = {
-        spu_v: _group_content(meta, product_handle_map)
+        spu_v: _group_content(meta, product_handle_map, size_order)
         for spu_v, meta in group_meta.items()
         if meta.get("included_rows")
     }
@@ -959,6 +1074,7 @@ def build_input_rows(
                 content["handle"],                                  # Handle
                 content["description_html"],                        # Description HTML
                 content["description_json"],                        # Product Description
+                content["product_size"],                            # Size (PRODUCT aggregate)
                 "ERA",                                             # Vendor
                 "ERA Product",                                     # Product Type
                 source.spu_v,                                       # Tags
@@ -1066,7 +1182,7 @@ def _write_input_sheet(input_ws, matrix: Sequence[Sequence[Any]]) -> None:
     # =LOWER(REGEXREPLACE(REGEXREPLACE(TRIM(<TitleCell>),"[^A-Za-z0-9]+","-"),"(^-+|-+$)",""))
     # Do not hard-code Title/Handle column letters; derive them from the Input schema.
     # ADD rows keep the existing Shopify Product Handle already resolved from
-    # V_Product_Handle.
+    # V_V_Handle.
     if len(matrix) > 2:
         action_idx = INPUT_HEADERS.index("Action")
         title_idx = INPUT_HEADERS.index("Title")
@@ -1111,7 +1227,8 @@ def run(
     tab_cfg_fields: str = "Cfg__Fields",
     tab_source: str = "SPU_Source",
     tab_input: str = "Input",
-    tab_product_handle: str = "V_Product_Handle",
+    tab_product_handle: str = "V_V_Handle",
+    tab_size_order: str = "Size顺序",
     tab_preview: str = "Preview",
     tab_result: str = "Result",
     tab_runlog: str = "Ops__RunLog",
@@ -1140,7 +1257,7 @@ def run(
         if print_progress:
             print(f"[{step}/{total}] {message}")
 
-    progress(1, 9, f"Resolve Google access | site={site_code}")
+    progress(1, 10, f"Resolve Google access | site={site_code}")
     secret = gp.read_secret(
         bootstrap_gsheet_sa_b64_secret,
         explicit_value=sa_b64_value,
@@ -1164,7 +1281,7 @@ def run(
 
     progress(
         2,
-        9,
+        10,
         "Resolve routed workbooks | "
         f"create={create_sheet_label} | config={config_sheet_label}",
     )
@@ -1197,7 +1314,7 @@ def run(
     )
 
     try:
-        progress(3, 9, f"Read Source | tab={tab_source} | formal_columns={SOURCE_COLUMN_COUNT}")
+        progress(3, 10, f"Read Source | tab={tab_source} | formal_columns={SOURCE_COLUMN_COUNT}")
         source_ws = _require_worksheet(create_book, tab_source)
         source_values = gp._sheets_retry(
             "read SPU_Source", source_ws.get_all_values
@@ -1218,12 +1335,20 @@ def run(
         )
         progress(
             4,
-            9,
+            10,
             "Validate Source groups | "
             f"groups={len(groups)} | CREATE={create_groups} | ADD={add_groups} | "
             f"planned_variant_bases={len(planned_source_rows)} | "
             f"existing_variant_bases_skipped={existing_skipped}",
         )
+
+        progress(5, 10, f"Read Product Size order | tab={tab_size_order}")
+        size_order_ws = _require_worksheet(console, tab_size_order)
+        size_order = _read_size_order(
+            gp._sheets_retry(f"read {tab_size_order}", size_order_ws.get_all_values)
+        )
+        if print_progress:
+            print(f"[Size顺序] entries={len(size_order)}")
 
         target_ids = sorted(
             {
@@ -1236,20 +1361,20 @@ def run(
         product_handle_map: Dict[str, Dict[str, str]] = {}
         if target_ids:
             progress(
-                5,
-                9,
+                6,
+                10,
                 f"Resolve existing ADD Products | tab={tab_product_handle} | "
                 f"target_products={len(target_ids)}",
             )
             handle_ws = _require_worksheet(create_book, tab_product_handle)
             handle_values = gp._sheets_retry(
-                "read V_Product_Handle", handle_ws.get_all_values
+                f"read {tab_product_handle}", handle_ws.get_all_values
             )
             product_handle_map = _read_product_handle_map(handle_values, target_ids)
         else:
-            progress(5, 9, "Resolve existing ADD Products | not required")
+            progress(6, 10, "Resolve existing ADD Products | not required")
 
-        progress(6, 9, f"Resolve Config field identity | tab={tab_cfg_fields}")
+        progress(7, 10, f"Resolve Config field identity | tab={tab_cfg_fields}")
         cfg_ws = _require_worksheet(config_book, tab_cfg_fields)
         cfg_values = gp._sheets_retry("read Cfg__Fields", cfg_ws.get_all_values)
         cfg_fields = gp._read_cfg_fields(cfg_values)
@@ -1262,25 +1387,26 @@ def run(
                 f"input_columns={len(field_keys)}"
             )
 
-        progress(7, 9, "Build Input rows | expand Variant Base x Quantity")
+        progress(8, 10, "Build Input rows | expand Variant Base x Quantity")
         input_rows = build_input_rows(
             planned_source_rows,
             group_meta,
             product_handle_map,
+            size_order,
         )
         matrix: List[List[Any]] = [INPUT_HEADERS, field_keys, *input_rows]
 
         if write_input:
             progress(
-                8,
                 9,
+                10,
                 f"Write generated Input | tab={tab_input} | rows={len(input_rows)}",
             )
             input_ws = _require_worksheet(create_book, tab_input)
             _write_input_sheet(input_ws, matrix)
             rows_written = len(input_rows)
         else:
-            progress(8, 9, "Write generated Input | disabled")
+            progress(9, 10, "Write generated Input | disabled")
             rows_written = 0
 
         error_col = INPUT_HEADERS.index("Input Error")
@@ -1310,6 +1436,7 @@ def run(
             "input_rows_planned": len(input_rows),
             "input_rows_written": rows_written,
             "input_columns": len(INPUT_HEADERS),
+            "size_order_entries": len(size_order),
             "input_error_rows": len(input_error_rows),
             "input_error_types": len(distinct_input_errors),
             "target_products_requested": len(target_ids),
@@ -1319,8 +1446,8 @@ def run(
         }
 
         progress(
-            9,
-            9,
+            10,
+            10,
             "Complete | "
             f"status={final_status} | input_rows={len(input_rows)} | "
             f"input_errors={len(input_error_rows)} | written={rows_written} | "
@@ -1379,6 +1506,7 @@ def run(
                 "source_tab": tab_source,
                 "input_tab": tab_input,
                 "product_handle_tab": tab_product_handle,
+                "size_order_tab": tab_size_order,
                 "config_sheet_url": config_url,
                 "cfg_fields_tab": tab_cfg_fields,
                 "runlog_sheet_url": runlog_url,

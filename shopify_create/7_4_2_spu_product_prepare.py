@@ -10,7 +10,7 @@ Scope
 -----
 - Read ``Input`` as the authoritative output of 7.4.1. Input is read-only here.
 - Read ``Defaults``, ``Cfg__Fields``, ``Cfg__Locations`` and
-  ``V_Product_Handle`` using the existing Console Core routing/auth boundary.
+  ``V_V_Handle`` using the existing Console Core routing/auth boundary.
 - Preserve CREATE and ADD as distinct actions.
 - CREATE Product group identity = SPU-V.
 - ADD Product group identity = sys.target_product_id.
@@ -18,6 +18,8 @@ Scope
   Shopify Product group key for SPU Creation.
 - Apply all Defaults to CREATE rows; apply only VARIANT/INVENTORY Defaults to
   ADD rows because ADD only adds Variants and never mutates Product-level data.
+- Require Product ``Size`` from 7.4.1 to resolve as a PRODUCT field and let
+  Product-group consistency validation protect that aggregate value.
 - Validate Product-group consistency, Variant uniqueness, ADD existing Product
   identity, CREATE Handle non-existence, ADD SKU non-existence, SPU Variant
   relationships and Price reconciliation.
@@ -50,7 +52,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import pandas as pd
 
 
-MODULE_VERSION = "2026-08-05-spu-prepare-v1"
+MODULE_VERSION = "2026-08-05-v-v-handle-product-size-v2"
 MODULE_PATH = "shopify_create.7_4_2_spu_product_prepare"
 DEFAULT_JOB_NAME = "spu_product_prepare"
 
@@ -113,6 +115,7 @@ CREATE_REQUIRED_PRODUCT_FIELDS = {
 }
 
 REQUIRED_DISPLAY_NAMES = {
+    "Size",
     "SPU-V",
     "Variant Base",
     "SKU Suffix-V",
@@ -316,6 +319,13 @@ def _read_input_matrix_strict(
             )
         display_to_key[display] = key
 
+    product_size_key = display_to_key["Size"]
+    if _field_scope(product_size_key, cfg_fields) != "PRODUCT":
+        raise ValueError(
+            "Input Size must resolve through Cfg__Fields as a PRODUCT field; "
+            f"field_key={product_size_key!r}."
+        )
+
     columns: List[Dict[str, Any]] = []
     mapping_records: List[Dict[str, str]] = []
     for index, (display, key) in enumerate(zip(display_headers, field_keys), start=1):
@@ -361,12 +371,12 @@ def _read_input_matrix_strict(
 
 def _read_product_handle(values: Sequence[Sequence[Any]]) -> Dict[str, Any]:
     if not values:
-        raise ValueError("V_Product_Handle is empty.")
+        raise ValueError("V_V_Handle is empty.")
     headers = [_normalize_header(v) for v in values[0]]
     header_map = {header: i for i, header in enumerate(headers) if header}
     missing = [h for h in PRODUCT_HANDLE_REQUIRED_HEADERS if h not in header_map]
     if missing:
-        raise ValueError(f"V_Product_Handle missing required columns: {missing}")
+        raise ValueError(f"V_V_Handle missing required columns: {missing}")
 
     records: List[Dict[str, str]] = []
     by_product_id: Dict[str, List[Dict[str, str]]] = defaultdict(list)
@@ -628,6 +638,7 @@ def _build_prepare_plan(
     input_field_keys = list(input_contract["field_keys"])
     display_to_key = dict(input_contract["display_to_key"])
     spu_v_key = display_to_key["SPU-V"]
+    product_size_key = display_to_key["Size"]
 
     all_field_keys = list(input_field_keys)
     for field_key in defaults:
@@ -830,6 +841,29 @@ def _build_prepare_plan(
         if action not in {"CREATE", "ADD"}:
             continue
 
+        # PRODUCT Size is generated once per SPU group in 7.4.1 and repeated
+        # on Variant-grain Input rows. It must remain one consistent value for
+        # both CREATE and ADD. Blank is allowed only when every new Size-V is blank.
+        product_size_values = _unique_nonblank(rows, product_size_key)
+        if len(product_size_values) > 1:
+            _group_issue(
+                rows,
+                "PRODUCT_SIZE_CONFLICT",
+                f"Product group {group_key!r} has conflicting Product Size "
+                f"values={product_size_values}.",
+            )
+        any_size_v = any(
+            _row_field_by_display(row, display_to_key, "Size-V")
+            for row in rows
+        )
+        if any_size_v and not product_size_values:
+            _group_issue(
+                rows,
+                "PRODUCT_SIZE_MISSING",
+                f"Product group {group_key!r} has nonblank Size-V rows but "
+                "PRODUCT Size is blank.",
+            )
+
         # Option combinations must be unique inside a Product group.
         by_options: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
         for row in rows:
@@ -906,7 +940,7 @@ def _build_prepare_plan(
                         rows,
                         "CREATE_HANDLE_ALREADY_EXISTS",
                         f"CREATE Handle {handles[0]!r} already exists in "
-                        f"V_Product_Handle; product_ids={product_ids}.",
+                        f"V_V_Handle; product_ids={product_ids}.",
                     )
 
         elif action == "ADD":
@@ -935,7 +969,7 @@ def _build_prepare_plan(
                 _group_issue(
                     rows,
                     "TARGET_PRODUCT_NOT_FOUND",
-                    f"Target Product ID {target_id} was not found in V_Product_Handle.",
+                    f"Target Product ID {target_id} was not found in V_V_Handle.",
                 )
             else:
                 existing_titles = sorted(
@@ -992,7 +1026,7 @@ def _build_prepare_plan(
                     rows,
                     "ADD_SKU_ALREADY_EXISTS",
                     f"ADD Product group {target_id} contains SKU(s) already present "
-                    f"in V_Product_Handle: {duplicate_existing_skus}.",
+                    f"in V_V_Handle: {duplicate_existing_skus}.",
                 )
 
     # A blocking issue on any row blocks the whole Product group, but not other groups.
@@ -1150,7 +1184,7 @@ def run(
     tab_cfg_fields: str = "Cfg__Fields",
     tab_input: str = "Input",
     tab_defaults: str = "Defaults",
-    tab_product_handle: str = "V_Product_Handle",
+    tab_product_handle: str = "V_V_Handle",
     tab_preview: str = "Preview",
     tab_result: str = "Result",
     tab_runlog: str = "Ops__RunLog",
@@ -1284,7 +1318,7 @@ def run(
             )
         )
         print(
-            "[V_Product_Handle] "
+            "[V_V_Handle] "
             f"rows={len(product_handle['records'])} | "
             f"products={len(product_handle['by_product_id'])} | "
             f"skus={len(product_handle['existing_skus'])}"
