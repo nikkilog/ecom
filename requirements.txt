@@ -5,3 +5,4 @@ requests
 google-auth
 google-ads
 urllib3
+beautifulsoup4
