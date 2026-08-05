@@ -24,6 +24,8 @@ Scope
 - Overwrite ``Input`` with a two-row header (display name + field_key) and the
   generated rows.
 - Read ``V_Product_Handle`` only when ADD rows actually need to be generated.
+- Missing/ambiguous ADD Product lookups are written to ``sys.input_error`` and
+  do not stop the whole Input build; structural Source/Schema errors still fail fast.
 - Write RunLog evidence.
 
 This module does NOT Prepare/Preview and does NOT call Shopify. Preview and
@@ -47,7 +49,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 
-MODULE_VERSION = "2026-08-04-spu-source-input-v2"
+MODULE_VERSION = "2026-08-04-spu-input-error-field-v3"
 MODULE_PATH = "shopify_create.7_4_1_spu_product_input"
 DEFAULT_JOB_NAME = "spu_product_input"
 
@@ -115,6 +117,7 @@ INPUT_COLUMNS: List[Tuple[str, str, str]] = [
     ("Product Key", "SYSTEM", "sys.product_key"),
     ("Variant Key", "SYSTEM", "sys.variant_key"),
     ("Target Product ID", "SYSTEM", "sys.target_product_id"),
+    ("Input Error", "SYSTEM", "sys.input_error"),
     ("SKU Title", "SYSTEM", "sys.source_title"),
     ("Title", "PRODUCT", "core.title"),
     ("Handle", "PRODUCT", "core.handle"),
@@ -790,20 +793,36 @@ def _read_product_handle_map(
     for product_id in sorted(wanted):
         rows = matches.get(product_id, [])
         if not rows:
-            raise ValueError(
-                f"Target Product ID {product_id} was not found in V_Product_Handle."
-            )
+            # Business-data lookup errors are written into Input instead of
+            # stopping the entire 7.4.1 generation job. The target ID itself
+            # is preserved so the operator can repair V_Product_Handle and rerun.
+            out[product_id] = {
+                "title": "",
+                "handle": "",
+                "matching_rows": "0",
+                "input_error": f"TARGET_PRODUCT_NOT_FOUND: {product_id}",
+            }
+            continue
+
         titles = sorted({title for title, _handle, _row in rows if title})
         handles = sorted({handle for _title, handle, _row in rows if handle})
         if len(titles) != 1 or len(handles) != 1:
-            raise ValueError(
-                f"Target Product ID {product_id} must resolve one unique Product Title "
-                f"and Product Handle in V_Product_Handle; titles={titles}; handles={handles}."
-            )
+            out[product_id] = {
+                "title": "",
+                "handle": "",
+                "matching_rows": str(len(rows)),
+                "input_error": (
+                    "TARGET_PRODUCT_LOOKUP_AMBIGUOUS: "
+                    f"{product_id}; titles={titles}; handles={handles}"
+                ),
+            }
+            continue
+
         out[product_id] = {
             "title": titles[0],
             "handle": handles[0],
             "matching_rows": str(len(rows)),
+            "input_error": "",
         }
     return out
 
@@ -852,6 +871,7 @@ def _group_content(
     status = _safe_str(meta["status"])
     size_value = first.get(SRC_SIZE)
 
+    input_error = ""
     if status == "CREATE":
         title = remove_size_expressions(first.get(SRC_PRODUCT_TITLE), size_value)
         if not title:
@@ -863,13 +883,16 @@ def _group_content(
         target_product_id = _safe_str(meta["target_product_id"])
         existing = product_handle_map.get(target_product_id)
         if not existing:
-            # Can only happen if caller skipped the V_Product_Handle lookup.
-            raise ValueError(
-                f"ADD SPU-V {first.spu_v!r} has no resolved existing Product "
-                f"for Target Product ID {target_product_id}."
-            )
-        title = _safe_str(existing.get("title"))
-        handle = _safe_str(existing.get("handle"))
+            # Defensive fallback: normal callers populate one map entry for every
+            # requested target ID, including unresolved IDs. Do not make a single
+            # lookup miss abort the entire Input build.
+            title = ""
+            handle = ""
+            input_error = f"TARGET_PRODUCT_NOT_FOUND: {target_product_id}"
+        else:
+            title = _safe_str(existing.get("title"))
+            handle = _safe_str(existing.get("handle"))
+            input_error = _safe_str(existing.get("input_error"))
 
     description_html = remove_size_from_html(
         first.get(SRC_DESCRIPTION_HTML),
@@ -880,6 +903,7 @@ def _group_content(
     return {
         "title": title,
         "handle": handle,
+        "input_error": input_error,
         "description_html": description_html,
         "description_json": description_json,
     }
@@ -919,6 +943,7 @@ def build_input_rows(
                 source.variant_base,                                # Product Key
                 variant_key,                                        # Variant Key
                 _safe_str(meta.get("target_product_id")),           # Target Product ID
+                content["input_error"],                              # Input Error
                 source.get(SRC_PRODUCT_TITLE),                       # SKU Title
                 content["title"],                                   # Title
                 content["handle"],                                  # Handle
@@ -1192,6 +1217,21 @@ def run(
             progress(8, 9, "Write generated Input | disabled")
             rows_written = 0
 
+        error_col = INPUT_HEADERS.index("Input Error")
+        input_error_rows = [row for row in input_rows if _safe_str(row[error_col])]
+        distinct_input_errors = sorted({_safe_str(row[error_col]) for row in input_error_rows})
+        target_products_resolved = sum(
+            1
+            for record in product_handle_map.values()
+            if not _safe_str(record.get("input_error"))
+        )
+        target_products_unresolved = sum(
+            1
+            for record in product_handle_map.values()
+            if _safe_str(record.get("input_error"))
+        )
+        final_status = "SUCCESS_WITH_ERRORS" if input_error_rows else "SUCCESS"
+
         elapsed = round(time.monotonic() - started, 3)
         summary = {
             "source_rows_loaded": len(source_rows),
@@ -1204,7 +1244,11 @@ def run(
             "input_rows_planned": len(input_rows),
             "input_rows_written": rows_written,
             "input_columns": len(INPUT_HEADERS),
-            "target_products_resolved": len(product_handle_map),
+            "input_error_rows": len(input_error_rows),
+            "input_error_types": len(distinct_input_errors),
+            "target_products_requested": len(target_ids),
+            "target_products_resolved": target_products_resolved,
+            "target_products_unresolved": target_products_unresolved,
             "elapsed_seconds": elapsed,
         }
 
@@ -1212,13 +1256,29 @@ def run(
             9,
             9,
             "Complete | "
-            f"input_rows={len(input_rows)} | written={rows_written} | "
+            f"status={final_status} | input_rows={len(input_rows)} | "
+            f"input_errors={len(input_error_rows)} | written={rows_written} | "
             f"elapsed={elapsed}s",
         )
+
+        for error_text in distinct_input_errors:
+            logger.log(
+                phase="build_input",
+                log_type="warning",
+                status="WARNING",
+                entity_type="SPU_PRODUCT_INPUT",
+                rows_loaded=len(source_rows),
+                rows_pending=len(planned_source_rows),
+                rows_planned=len(input_rows),
+                rows_written=rows_written,
+                rows_skipped=existing_skipped,
+                message=error_text,
+            )
+
         logger.log(
             phase="build_input",
             log_type="summary",
-            status="SUCCESS",
+            status=final_status,
             entity_type="SPU_PRODUCT_INPUT",
             rows_loaded=len(source_rows),
             rows_pending=len(planned_source_rows),
@@ -1235,12 +1295,13 @@ def run(
             for row in input_rows[: max(int(preview_rows), 0)]
         ]
         return {
-            "status": "SUCCESS",
+            "status": final_status,
             "ok": True,
             "job_name": job_name,
             "run_id": run_id,
             "summary": summary,
             "field_keys": dict(zip(INPUT_HEADERS, field_keys)),
+            "input_errors": distinct_input_errors,
             "input_preview": preview,
             "runtime": {
                 "auth_type": "GOOGLE_SERVICE_ACCOUNT",
