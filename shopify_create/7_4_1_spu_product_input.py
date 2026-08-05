@@ -49,7 +49,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 
-MODULE_VERSION = "2026-08-04-spu-input-error-field-v3"
+MODULE_VERSION = "2026-08-04-dynamic-input-range-v4"
 MODULE_PATH = "shopify_create.7_4_1_spu_product_input"
 DEFAULT_JOB_NAME = "spu_product_input"
 
@@ -1002,10 +1002,30 @@ def _require_worksheet(book, title: str):
         raise ValueError(f"Required worksheet is missing: {title}") from exc
 
 
+def _a1_column_name(column_number: int) -> str:
+    """Convert a 1-based column number to an A1 column name (1=A, 27=AA)."""
+    if int(column_number) < 1:
+        raise ValueError(f"Column number must be >= 1; got {column_number}")
+    value = int(column_number)
+    parts: List[str] = []
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        parts.append(chr(ord("A") + remainder))
+    return "".join(reversed(parts))
+
+
 def _write_input_sheet(input_ws, matrix: Sequence[Sequence[Any]]) -> None:
     gp = _infra()
     rows_needed = max(len(matrix), 1)
     cols_needed = len(INPUT_HEADERS)
+
+    row_widths = {len(row) for row in matrix}
+    if row_widths and row_widths != {cols_needed}:
+        raise ValueError(
+            "Generated Input matrix width does not match Input schema: "
+            f"expected_columns={cols_needed}; observed_row_widths={sorted(row_widths)}"
+        )
+
     if input_ws.row_count < rows_needed or input_ws.col_count < cols_needed:
         gp._sheets_retry(
             "resize Input",
@@ -1021,9 +1041,9 @@ def _write_input_sheet(input_ws, matrix: Sequence[Sequence[Any]]) -> None:
         lambda: input_ws.batch_clear(["A:ZZ"]),
     )
 
-    end_col = "AN"  # 40 columns.
+    end_col = _a1_column_name(cols_needed)
     gp._sheets_retry(
-        f"write Input rows={len(matrix)}",
+        f"write Input rows={len(matrix)} cols={cols_needed} range=A1:{end_col}{len(matrix)}",
         lambda: input_ws.update(
             range_name=f"A1:{end_col}{len(matrix)}",
             values=[list(row) for row in matrix],
