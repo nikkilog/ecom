@@ -27,9 +27,11 @@ Execution contract
 6. DRY_RUN performs Shopify reads and builds exact payloads, but performs no
    Shopify mutations. Live writes require dry_run=False and confirmed=True.
 7. Product-group failures are isolated unless stop_on_first_error=True.
-8. Result owns a dedicated SPU schema. If Result still contains a different
-   (for example old Generic Apply) schema, its values are cleared once and the
-   SPU header is initialized before writing current results.
+8. Result is intentionally minimal: 18 execution-identity/status/link columns
+   only. Detailed payloads, API diagnostics, metafield counts and error bodies
+   remain in runtime logs rather than being duplicated into Google Sheets. If
+   Result still contains a different schema, its values are cleared once and
+   the minimal SPU header is initialized before writing current results.
 9. Input is read-only. Preview, when verification is enabled, is read-only;
    Result and Ops__RunLog are the only Sheet write targets.
 10. Images/media are out of scope.
@@ -49,7 +51,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import pandas as pd
 
 
-MODULE_VERSION = "2026-08-07-spu-apply-preview-optional-v2"
+MODULE_VERSION = "2026-08-07-spu-apply-minimal-result-v4"
 MODULE_PATH = "shopify_create.7_4_3_spu_product_apply"
 DEFAULT_JOB_NAME = "spu_product_apply"
 
@@ -59,6 +61,7 @@ GENERIC_APPLY_MODULE_PATH = "shopify_create.7_1_2_generic_product_apply"
 EXPECTED_GENERIC_APPLY_MODULE_VERSION = "2026-08-02-runtime-boundary-v1"
 GENERIC_PREPARE_MODULE_PATH = "shopify_create.7_1_1_generic_product_prepare"
 EXPECTED_GENERIC_PREPARE_MODULE_VERSION = "2026-08-02-runtime-boundary-v1"
+
 
 SPU_RESULT_HEADERS = [
     "run_id",
@@ -77,32 +80,8 @@ SPU_RESULT_HEADERS = [
     "product_handle",
     "product_title",
     "product_status",
-    "variant_gid",
-    "inventory_item_gid",
-    "sku",
-    "barcode",
-    "option_values",
-    "price",
-    "compare_at_price",
-    "cost",
-    "inventory_location_code",
-    "inventory_location_gid",
-    "inventory_quantity",
-    "product_metafields_planned",
-    "variant_metafields_planned",
-    "api_operations_planned",
-    "api_operations_succeeded",
-    "api_operations_failed",
-    "message",
-    "error_reason",
     "shopify_admin_url",
     "storefront_url",
-    "category_id",
-    "template_suffix",
-    "publish_all_channels",
-    "publications_planned",
-    "publications_published",
-    "publication_ids",
 ]
 
 Q_PRODUCT_BY_HANDLE = """
@@ -738,32 +717,8 @@ def _create_result_row(
         product_handle,
         product_title,
         product_status,
-        variant_gid,
-        inventory_item_gid,
-        _safe_str(source.get("core.sku")),
-        _safe_str(source.get("core.barcode")),
-        _option_text(source),
-        _safe_str(source.get("core.price")),
-        _safe_str(source.get("core.compare_at_price")),
-        _safe_str(source.get("core.cost")),
-        _safe_str(source.get("inventory.location_code")),
-        _safe_str(source.get("sys.inventory_location_gid")),
-        _safe_str(source.get("inventory.quantity")),
-        int(product_metafields_planned),
-        int(variant_metafields_planned),
-        int(api_operations_planned),
-        int(api_operations_succeeded),
-        int(api_operations_failed),
-        message,
-        error_reason,
         admin_url,
         storefront_url,
-        _safe_str(source.get("core.category_id")),
-        _safe_str(source.get("core.template_suffix")),
-        _safe_str(source.get("publish.all_channels")),
-        int(publications_planned),
-        int(publications_published),
-        ";".join(_safe_list(publication_ids)),
     ]
 
 
@@ -827,7 +782,15 @@ def _append_result_rows(ws, rows: Sequence[Sequence[Any]]) -> int:
     gp = _gp()
     values = gp._sheets_retry(f"read {ws.title}", ws.get_all_values)
     start_row = max(2, len(values) + 1)
-    required_rows = start_row + len(rows) - 1
+    safe_rows = [list(row) for row in rows]
+    for offset, row in enumerate(safe_rows):
+        if len(row) != len(SPU_RESULT_HEADERS):
+            raise ValueError(
+                "SPU Result row width mismatch: "
+                f"expected={len(SPU_RESULT_HEADERS)} actual={len(row)} "
+                f"sheet_row={start_row + offset}."
+            )
+    required_rows = start_row + len(safe_rows) - 1
     required_cols = len(SPU_RESULT_HEADERS)
     if ws.row_count < required_rows or ws.col_count < required_cols:
         gp._sheets_retry(
@@ -838,16 +801,16 @@ def _append_result_rows(ws, rows: Sequence[Sequence[Any]]) -> int:
             ),
         )
     end_col = gp._a1_col(required_cols)
-    end_row = start_row + len(rows) - 1
+    end_row = start_row + len(safe_rows) - 1
     gp._sheets_retry(
-        f"append {ws.title} rows={len(rows)}",
+        f"append {ws.title} rows={len(safe_rows)}",
         lambda: ws.update(
             range_name=f"A{start_row}:{end_col}{end_row}",
-            values=[list(row) for row in rows],
+            values=safe_rows,
             value_input_option="RAW",
         ),
     )
-    return len(rows)
+    return len(safe_rows)
 
 
 def _apply_create_group(
