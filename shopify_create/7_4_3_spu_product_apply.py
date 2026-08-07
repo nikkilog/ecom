@@ -9,8 +9,9 @@ Import path:
 Execution contract
 ------------------
 1. Rebuild the current 7.4.2 SPU Prepare plan from Input / Defaults /
-   Cfg__Fields / Cfg__Locations / V_V_Handle. Preview is then verified as a
-   human-reviewed snapshot for the selected Product groups.
+   Cfg__Fields / Cfg__Locations / V_V_Handle. This current plan is the Apply
+   execution authority. Preview verification is an optional audit gate only
+   and is disabled by default.
 2. CREATE Product group identity = SPU-V / sys.product_group_key. CREATE uses
    the validated Generic Apply ``productSet`` payload builder so Product core,
    Product metafields, Variant fields, Variant metafields and inventory keep
@@ -29,8 +30,8 @@ Execution contract
 8. Result owns a dedicated SPU schema. If Result still contains a different
    (for example old Generic Apply) schema, its values are cleared once and the
    SPU header is initialized before writing current results.
-9. Input is read-only; Preview is read-only; Result and Ops__RunLog are the
-   only Sheet write targets.
+9. Input is read-only. Preview, when verification is enabled, is read-only;
+   Result and Ops__RunLog are the only Sheet write targets.
 10. Images/media are out of scope.
 """
 from __future__ import annotations
@@ -48,7 +49,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import pandas as pd
 
 
-MODULE_VERSION = "2026-08-05-spu-apply-create-add-v1"
+MODULE_VERSION = "2026-08-07-spu-apply-preview-optional-v2"
 MODULE_PATH = "shopify_create.7_4_3_spu_product_apply"
 DEFAULT_JOB_NAME = "spu_product_apply"
 
@@ -1471,6 +1472,7 @@ def run(
     tab_product_handle: str = "V_V_Handle",
     tab_result: str = "Result",
     tab_runlog: str = "Ops__RunLog",
+    verify_preview: bool = False,
     only_product_group_keys: Optional[Iterable[str]] = None,
     apply_all_ready_groups: bool = True,
     max_product_groups_per_run: int = 5000,
@@ -1620,21 +1622,42 @@ def run(
             f"keys={selected_groups}"
         )
 
-        progress(5, 12, f"Verify reviewed Preview snapshot | tab={tab_preview}")
-        preview_ws = gp._require_worksheet(create_book, tab_preview)
-        preview_contract = _read_preview_contract(
-            gp._sheets_retry(f"read {tab_preview}", preview_ws.get_all_values)
-        )
-        preview_verification = _verify_preview_snapshot(
-            prepare_plan=prepare_plan,
-            preview_contract=preview_contract,
-            selected_group_keys=selected_groups,
-        )
-        print(
-            "[Preview Verification] "
-            f"groups={preview_verification['product_groups']} | "
-            f"rows={preview_verification['row_count']} | PASS"
-        )
+        progress(5, 12, "Optional Preview audit gate")
+        if verify_preview:
+            preview_ws = gp._require_worksheet(create_book, tab_preview)
+            preview_contract = _read_preview_contract(
+                gp._sheets_retry(f"read {tab_preview}", preview_ws.get_all_values)
+            )
+            preview_verification = _verify_preview_snapshot(
+                prepare_plan=prepare_plan,
+                preview_contract=preview_contract,
+                selected_group_keys=selected_groups,
+            )
+            preview_verification = {
+                "enabled": True,
+                "status": "PASS",
+                **preview_verification,
+            }
+            print(
+                "[Preview Verification] "
+                f"groups={preview_verification['product_groups']} | "
+                f"rows={preview_verification['row_count']} | PASS"
+            )
+        else:
+            preview_verification = {
+                "enabled": False,
+                "status": "SKIPPED",
+                "reason": (
+                    "VERIFY_PREVIEW=False; current rebuilt 7.4.2 Prepare plan "
+                    "is the Apply execution authority."
+                ),
+                "product_groups": len(selected_groups),
+                "row_count": sum(len(rows) for rows in product_rows.values()),
+            }
+            print(
+                "[Preview Verification] SKIPPED | "
+                "VERIFY_PREVIEW=False | current Prepare plan is authoritative"
+            )
 
         progress(6, 12, "Resolve Shopify configuration")
         shop_domain = _safe_str(account.get("SHOP_DOMAIN"))
@@ -1867,7 +1890,8 @@ def run(
             rows_written=result_rows_written,
             rows_skipped=summary["variants_skipped"],
             message=(
-                f"spu_apply | dry_run={dry_run} | groups={len(selected_groups)} | "
+                f"spu_apply | dry_run={dry_run} | verify_preview={verify_preview} | "
+                f"groups={len(selected_groups)} | "
                 f"create={summary['create_groups_selected']} | add={summary['add_groups_selected']} | "
                 f"variants_created={summary['variants_created']} | "
                 f"variants_skipped={summary['variants_skipped']} | "
@@ -1910,6 +1934,7 @@ def run(
             "run_id": run_id,
             "dry_run": bool(dry_run),
             "confirmed": bool(confirmed),
+            "verify_preview": bool(verify_preview),
             "module_version": MODULE_VERSION,
             "prepare_module_version": EXPECTED_PREPARE_MODULE_VERSION,
             "generic_apply_module_version": EXPECTED_GENERIC_APPLY_MODULE_VERSION,
@@ -1964,6 +1989,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--gsheet-secret", required=True)
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--confirmed", action="store_true")
+    parser.add_argument(
+        "--verify-preview",
+        action="store_true",
+        help="Require Preview to exactly match the rebuilt current SPU plan.",
+    )
     args = parser.parse_args(argv)
     result = run(
         site_code=args.site_code,
@@ -1971,6 +2001,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         bootstrap_gsheet_sa_b64_secret=args.gsheet_secret,
         dry_run=not args.live,
         confirmed=bool(args.confirmed),
+        verify_preview=bool(args.verify_preview),
     )
     print(json.dumps(result["summary"], ensure_ascii=False, indent=2, default=str))
     return 0 if result["status"] in {"DRY_RUN_READY", "SUCCESS", "PARTIAL_SUCCESS"} else 2
