@@ -28,8 +28,8 @@ Execution contract
    Shopify mutations. Live writes require dry_run=False and confirmed=True.
 7. Product-group failures are isolated unless stop_on_first_error=True.
 8. Result is intentionally minimal: 18 execution-identity/status/link columns
-   only. Detailed payloads, API diagnostics, metafield counts and error bodies
-   remain in runtime logs rather than being duplicated into Google Sheets. If
+   only. Detailed payloads and large API error bodies are not duplicated into Sheets.
+   Runtime and RunLog diagnostics are concise and bounded. If
    Result still contains a different schema, its values are cleared once and
    the minimal SPU header is initialized before writing current results.
 9. Input is read-only. Preview, when verification is enabled, is read-only;
@@ -51,7 +51,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import pandas as pd
 
 
-MODULE_VERSION = "2026-08-07-spu-apply-minimal-result-v4"
+MODULE_VERSION = "2026-08-07-spu-apply-add-inventory-fix-v5"
 MODULE_PATH = "shopify_create.7_4_3_spu_product_apply"
 DEFAULT_JOB_NAME = "spu_product_apply"
 
@@ -247,6 +247,17 @@ def _safe_str(value: Any) -> str:
     if isinstance(value, float) and value != value:
         return ""
     return str(value).strip()
+
+
+def _brief_log_text(value: Any, limit: int = 1800) -> str:
+    """Bound operator/runlog diagnostics without changing execution semantics."""
+    text = _safe_str(value)
+    limit = max(200, int(limit))
+    if len(text) <= limit:
+        return text
+    suffix = f"... [TRUNCATED original_chars={len(text)}]"
+    keep = max(0, limit - len(suffix))
+    return text[:keep] + suffix
 
 
 def _safe_list(values: Optional[Iterable[Any]]) -> List[str]:
@@ -645,11 +656,15 @@ def _build_add_variant_inputs(
             raise ValueError(
                 f"ADD SKU={row.get('core.sku')} has no resolved Location GID."
             )
+        # Shopify Admin GraphQL 2026-01:
+        # ProductVariantsBulkInput.inventoryQuantities uses InventoryLevelInput,
+        # whose contract is exactly locationId + availableQuantity.
         variant["inventoryQuantities"] = [
             {
                 "locationId": location_gid,
-                "name": "available",
-                "quantity": int(_safe_str(row.get("inventory.quantity")) or "0"),
+                "availableQuantity": int(
+                    _safe_str(row.get("inventory.quantity")) or "0"
+                ),
             }
         ]
         metafields = ga._variant_metafields(
@@ -1771,6 +1786,12 @@ def run(
                         f"skipped={item['variants_skipped']} | "
                         f"failed={item['variants_failed']}"
                     )
+                    if item["status"] in {"FAILED", "PARTIAL_SUCCESS"}:
+                        print(
+                            "[Group Error] "
+                            f"{group_key} | "
+                            f"{_brief_log_text(item.get('message', ''), 3000)}"
+                        )
                     if stop_on_first_error and item["status"] in {"FAILED", "PARTIAL_SUCCESS"}:
                         stop_requested = True
                 if stop_requested and pending:
@@ -1870,10 +1891,14 @@ def run(
                 status=item["status"],
                 entity_type="SPU_PRODUCT_APPLY",
                 gid=item.get("product_gid", ""),
-                message=(
-                    f"group={item['product_group_key']} | action={item['action']} | "
-                    f"created={item['variants_created']} | skipped={item['variants_skipped']} | "
-                    f"failed={item['variants_failed']} | {item['message']}"
+                message=_brief_log_text(
+                    (
+                        f"group={item['product_group_key']} | action={item['action']} | "
+                        f"created={item['variants_created']} | "
+                        f"skipped={item['variants_skipped']} | "
+                        f"failed={item['variants_failed']} | {item['message']}"
+                    ),
+                    1800,
                 ),
                 error_reason=(
                     "GROUP_APPLY_FAILED"
@@ -1934,7 +1959,10 @@ def run(
                 status="FAILED",
                 entity_type="SPU_PRODUCT_APPLY",
                 message="SPU Apply failed before completion.",
-                error_reason=f"{type(exc).__name__}: {exc}",
+                error_reason=_brief_log_text(
+                    f"{type(exc).__name__}: {exc}",
+                    1800,
+                ),
             )
             logger.flush()
         except Exception as log_exc:
