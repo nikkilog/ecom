@@ -632,21 +632,14 @@ def _resolve_sheet_url_by_label(
         lambda: worksheet.get_all_records(),
         action="cfg_sites.read",
     )
-    matches = [
-        row
-        for row in records
-        if _normalize_site_code(row.get("site_code")) == _normalize_site_code(site_code)
-        and _safe_str(row.get("label")) == _safe_str(label)
-    ]
-    if not matches:
-        raise ValueError(
-            f"No route in {tab_cfg_sites} for site_code={site_code}, label={label}."
-        )
-    if len(matches) > 1:
-        raise ValueError(
-            f"Duplicated route in {tab_cfg_sites} for site_code={site_code}, label={label}."
-        )
-    url = _safe_str(matches[0].get("sheet_url"))
+    from console_core.registry import _resolve_cfg_site_resource
+
+    route = _resolve_cfg_site_resource(
+        site_code=site_code,
+        sheet_label=label,
+        cfg_sites_rows=records,
+    )
+    url = _safe_str(route["sheet_url"])
     if not url:
         raise ValueError(
             f"Empty sheet_url in {tab_cfg_sites} for site_code={site_code}, label={label}."

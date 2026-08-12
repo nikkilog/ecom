@@ -24,6 +24,18 @@ No package is labeled production-ready by this map.
 
 ## Package Inventory
 
+### `console_core`
+
+Overall status: `CURRENT_AUTHORITY`
+
+- `console_core.registry` is the formal shared boundary for pure target-resource
+  Registry row selection and validation. Callers supply already-loaded Workspace
+  Project Registry and `Cfg__Sites` rows through their own supported access and
+  authentication boundary; this module performs no Secret resolution or cloud
+  access.
+- Existing Registry resolvers embedded in business modules remain compatibility
+  and migration evidence. They have not been mass-migrated or retired.
+
 ### `shopify_export`
 
 Overall status: `ACTIVE_BUT_UNVALIDATED`

@@ -57,6 +57,30 @@ Notebook Runners should remain thin:
 
 Real external writes require both `DRY_RUN = False` and `CONFIRMED = True`. Full details are in `docs/RUNTIME_CONTRACT.md`.
 
+## Public Registry Resolution
+
+Install the formal shared package from the canonical Local checkout:
+
+```bash
+python3 -m pip install -e /Users/nikki/Documents/AI_Workspace/Projects/Console_Core
+```
+
+Import the target-resource resolver with:
+
+```python
+from console_core import resolve_sheet_resource
+```
+
+`resolve_sheet_resource` is a pure row-selection and validation boundary. The
+caller supplies already-loaded Workspace Project Registry and `Cfg__Sites`
+rows. Console Core does not resolve caller execution identity, credentials, or
+Secrets through this API.
+
+For Colab, install from the repository only when the command pins a concrete,
+user-authorized commit revision rather than an unpinned branch.
+
+Real Colab installation and Registry access require separate authorization.
+
 ## Development Status
 
 Console Core is being governed around an existing implementation. Existing packages have not been certified end-to-end by this onboarding. Historical overlaps, placeholders, incomplete paths, and boundary questions are preserved for evidence-based review.
