@@ -170,15 +170,12 @@ def _resolve_cfg_site_resource(
     }
 
 
-def resolve_sheet_resource(
+def _resolve_project_route(
     *,
     project_code: str,
-    site_code: str,
-    sheet_label: str,
     project_registry_rows: Iterable[Mapping[str, object]],
-    cfg_sites_rows: Iterable[Mapping[str, object]],
 ) -> dict[str, str]:
-    """Resolve exactly one active project and one target Sheet resource."""
+    """Resolve one active project route for package-internal reuse."""
     normalized_project = _normalize_code(project_code)
     if not normalized_project:
         raise ValueError("project_code is required.")
@@ -213,10 +210,33 @@ def resolve_sheet_resource(
         source_row=project_source_row,
         required=True,
     )
-    if not _text(project_row.get("console core url")):
+    console_core_url = _text(project_row.get("console core url"))
+    if not console_core_url:
         raise ValueError(
             f"{identity} has empty console_core_url at row {project_source_row}."
         )
+
+    return {
+        "project_code": normalized_project,
+        "console_core_url": console_core_url,
+        "project_registry_source_row": str(project_source_row),
+        "project_registry_tab": PROJECT_REGISTRY_TAB,
+    }
+
+
+def resolve_sheet_resource(
+    *,
+    project_code: str,
+    site_code: str,
+    sheet_label: str,
+    project_registry_rows: Iterable[Mapping[str, object]],
+    cfg_sites_rows: Iterable[Mapping[str, object]],
+) -> dict[str, str]:
+    """Resolve exactly one active project and one target Sheet resource."""
+    project_route = _resolve_project_route(
+        project_code=project_code,
+        project_registry_rows=project_registry_rows,
+    )
 
     resource = _resolve_cfg_site_resource(
         site_code=site_code,
@@ -224,8 +244,10 @@ def resolve_sheet_resource(
         cfg_sites_rows=cfg_sites_rows,
     )
     return {
-        "project_code": normalized_project,
+        "project_code": project_route["project_code"],
         **resource,
-        "project_registry_source_row": str(project_source_row),
-        "project_registry_tab": PROJECT_REGISTRY_TAB,
+        "project_registry_source_row": project_route[
+            "project_registry_source_row"
+        ],
+        "project_registry_tab": project_route["project_registry_tab"],
     }

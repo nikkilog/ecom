@@ -42,7 +42,10 @@ def resolve(project=None, sites=None, **kwargs):
 
 class RegistryTests(unittest.TestCase):
     def test_public_export_and_signature(self):
-        self.assertEqual(console_core.__all__, ["resolve_sheet_resource"])
+        self.assertEqual(
+            console_core.__all__,
+            ["load_registry_rows", "resolve_sheet_resource"],
+        )
         self.assertEqual(
             list(inspect.signature(resolve_sheet_resource).parameters),
             [

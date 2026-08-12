@@ -30,9 +30,13 @@ Overall status: `CURRENT_AUTHORITY`
 
 - `console_core.registry` is the formal shared boundary for pure target-resource
   Registry row selection and validation. Callers supply already-loaded Workspace
-  Project Registry and `Cfg__Sites` rows through their own supported access and
-  authentication boundary; this module performs no Secret resolution or cloud
-  access.
+  Project Registry and `Cfg__Sites` rows; this module performs no Secret
+  resolution or cloud access.
+- `console_core.registry_io` is the formal caller-authenticated Google Sheets
+  IO boundary for loading those rows. Authentication remains caller-owned. The
+  module opens the caller-supplied Workspace Registry, derives the target
+  Console route through the shared pure project selector, and loads
+  `Cfg__Sites` with bounded transient retry.
 - Existing Registry resolvers embedded in business modules remain compatibility
   and migration evidence. They have not been mass-migrated or retired.
 

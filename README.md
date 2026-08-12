@@ -68,13 +68,32 @@ python3 -m pip install -e /Users/nikki/Documents/AI_Workspace/Projects/Console_C
 Import the target-resource resolver with:
 
 ```python
-from console_core import resolve_sheet_resource
+from console_core import load_registry_rows, resolve_sheet_resource
 ```
 
-`resolve_sheet_resource` is a pure row-selection and validation boundary. The
-caller supplies already-loaded Workspace Project Registry and `Cfg__Sites`
-rows. Console Core does not resolve caller execution identity, credentials, or
-Secrets through this API.
+The caller owns authentication and supplies both an authenticated
+gspread-compatible client and the Workspace Project Registry location:
+
+```python
+rows = load_registry_rows(
+    google_client=client,
+    workspace_registry_id="example-workspace-registry-id",
+    project_code="EXAMPLE",
+)
+
+resource = resolve_sheet_resource(
+    project_code="EXAMPLE",
+    site_code="EXAMPLE",
+    sheet_label="example_resource",
+    project_registry_rows=rows["project_registry_rows"],
+    cfg_sites_rows=rows["cfg_sites_rows"],
+)
+```
+
+`load_registry_rows` owns only retry-protected workbook, worksheet, and row
+loading. `resolve_sheet_resource` remains the pure row-selection and validation
+boundary. Neither API resolves caller execution identity, credentials, or
+Secrets.
 
 For Colab, install from the repository only when the command pins a concrete,
 user-authorized commit revision rather than an unpinned branch.
