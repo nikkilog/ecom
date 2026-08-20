@@ -1,7 +1,7 @@
-"""shopify_sync/1_1_2_edit_metafields.py
+"""shopify_sync/1_1_1_edit_metafields.py
 
 Edit Shopify metafields from the configured Edit__ValuesLong input.
-Derived from the verified 1_1_1 Current. This version preserves the existing
+This keeps the established 1_1_1 module identity and preserves the existing
 Local/Colab runtime, authentication, Sheet, and field contracts while fixing:
 
 - gspread numericisation corrupting comma-delimited numeric reference lists;
@@ -38,7 +38,7 @@ from google.oauth2 import service_account
 CFG_SITES_TAB_DEFAULT = "Cfg__Sites"
 CFG_FIELDS_TAB_DEFAULT = "Cfg__Fields"
 
-MODULE_PATH = "shopify_sync.1_1_2_edit_metafields"
+MODULE_PATH = "shopify_sync.1_1_1_edit_metafields"
 MODULE_VERSION = "2026-08-20-text-safe-atomic-set-v2"
 DEFAULT_JOB_NAME = "edit_metafields"
 
