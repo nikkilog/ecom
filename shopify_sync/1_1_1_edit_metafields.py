@@ -1,8 +1,13 @@
-"""shopify_sync/1_1_edit_metafields.py
+"""shopify_sync/1_1_2_edit_metafields.py
 
 Edit Shopify metafields from the configured Edit__ValuesLong input.
-Business behavior is preserved from the former edit_metafields.py Current;
-this module adds the verified Local/Colab runtime boundary and identity.
+Derived from the verified 1_1_1 Current. This version preserves the existing
+Local/Colab runtime, authentication, Sheet, and field contracts while fixing:
+
+- gspread numericisation corrupting comma-delimited numeric reference lists;
+- hidden Shopify userErrors;
+- incorrect success accounting for atomic metafieldsSet batches;
+- repeated full-batch failures continuing through the entire run.
 """
 
 from __future__ import annotations
@@ -33,8 +38,8 @@ from google.oauth2 import service_account
 CFG_SITES_TAB_DEFAULT = "Cfg__Sites"
 CFG_FIELDS_TAB_DEFAULT = "Cfg__Fields"
 
-MODULE_PATH = "shopify_sync.1_1_edit_metafields"
-MODULE_VERSION = "2026-08-01-runtime-boundary-v1"
+MODULE_PATH = "shopify_sync.1_1_2_edit_metafields"
+MODULE_VERSION = "2026-08-20-text-safe-atomic-set-v2"
 DEFAULT_JOB_NAME = "edit_metafields"
 
 SCOPES = [
@@ -100,7 +105,7 @@ M_SET = """
 mutation setMf($metafields: [MetafieldsSetInput!]!) {
   metafieldsSet(metafields: $metafields) {
     metafields { id namespace key type value }
-    userErrors { field message }
+    userErrors { field message code }
   }
 }
 """
@@ -124,6 +129,10 @@ class ShopifyClient:
     graph_url: str
     headers: dict[str, str]
     timeout: int = 60
+
+
+class NonRetryableGraphQLError(RuntimeError):
+    """A deterministic Shopify GraphQL/HTTP error that retries cannot fix."""
 
 
 # =========================================================
@@ -833,8 +842,9 @@ def update_existing_notebook_registry_row(
 def gql(client: ShopifyClient, query: str, variables: Optional[dict] = None, retries: int = 6) -> dict:
     payload = {"query": query, "variables": variables or {}}
     last_err = None
+    attempts = max(1, int(retries))
 
-    for i in range(retries):
+    for i in range(attempts):
         try:
             r = requests.post(
                 client.graph_url,
@@ -844,22 +854,52 @@ def gql(client: ShopifyClient, query: str, variables: Optional[dict] = None, ret
             )
             data = r.json()
 
-            if r.status_code >= 500:
-                raise RuntimeError(f"HTTP {r.status_code}")
+            if r.status_code == 429 or r.status_code >= 500:
+                raise requests.HTTPError(f"retryable HTTP {r.status_code}")
+
+            if r.status_code >= 400:
+                raise NonRetryableGraphQLError(
+                    f"Shopify HTTP {r.status_code}: {str(data)[:800]}"
+                )
 
             if data.get("errors"):
-                raise RuntimeError(data["errors"])
+                graph_errors = data["errors"]
+                error_codes = {
+                    _norm_str((error.get("extensions") or {}).get("code")).upper()
+                    for error in graph_errors
+                    if isinstance(error, dict)
+                }
+                if error_codes.intersection({"THROTTLED", "INTERNAL_SERVER_ERROR"}):
+                    raise requests.HTTPError(
+                        f"retryable Shopify GraphQL errors: {str(graph_errors)[:1200]}"
+                    )
+                raise NonRetryableGraphQLError(
+                    f"Shopify GraphQL errors: {str(graph_errors)[:1200]}"
+                )
 
             if data.get("data") is None:
-                raise RuntimeError(f"No data returned: {data}")
+                raise NonRetryableGraphQLError(
+                    f"Shopify returned no data: {str(data)[:800]}"
+                )
 
             return data["data"]
 
-        except Exception as e:
+        except NonRetryableGraphQLError:
+            raise
+        except (requests.RequestException, ValueError) as e:
             last_err = e
-            time.sleep(min(2**i, 12) + random.random())
+            if i + 1 >= attempts:
+                break
+            delay = min(2**i, 12) + random.random()
+            print(
+                "[Shopify retry] "
+                f"attempt={i + 1}/{attempts} | "
+                f"reason={type(e).__name__} | sleep={delay:.1f}s",
+                flush=True,
+            )
+            time.sleep(delay)
 
-    raise RuntimeError(f"GraphQL failed after retries: {last_err}")
+    raise RuntimeError(f"Shopify request failed after {attempts} attempts: {last_err}")
 
 
 # =========================================================
@@ -1036,7 +1076,11 @@ class RunLogger:
 
 def load_edit_values_long(ws_edit) -> pd.DataFrame:
     rows = _with_sheets_retry(
-        ws_edit.get_all_records,
+        # Edit__ValuesLong is a text contract. In particular, desired_value can
+        # contain comma-delimited numeric IDs. gspread's default numericisation
+        # removes those commas as if they were thousands separators, corrupting
+        # a reference list before business parsing sees it.
+        lambda: ws_edit.get_all_records(numericise_ignore=["all"]),
         action=f"input.get_all_records:{ws_edit.title}",
     )
     df = pd.DataFrame(rows)
@@ -1572,6 +1616,7 @@ def build_plan(
     cfg_type_map: dict[tuple[str, str], str],
     reference_default_kind: str,
     type_override_by_field_key: Optional[dict[str, str]],
+    allow_missing_cfg_type_fallback: bool = False,
 ) -> dict[str, Any]:
     """
     Build write plan.
@@ -1616,6 +1661,19 @@ def build_plan(
 
         if (not cfg_dt) and (not has_ov):
             missing_cfg_type += 1
+            if not allow_missing_cfg_type_fallback:
+                invalid_rows.append({
+                    "sheet_row": getattr(r, "sheet_row", None),
+                    "entity_type": et,
+                    "owner_id": owner_id,
+                    "field_key": fk,
+                    "error_reason": "missing_cfg_type",
+                    "message": (
+                        f"sheet_row={getattr(r, 'sheet_row', None)} | "
+                        f"field_key={fk} | no Cfg__Fields type or explicit override"
+                    ),
+                })
+                continue
 
         mf_type = mf_type_for_row(
             entity_type=et,
@@ -1680,6 +1738,14 @@ def build_plan(
         set_inputs.append(item)
         set_meta_rows.append(meta_row)
 
+        value_item_count = 1
+        if mf_type.startswith("list."):
+            try:
+                parsed_value = json.loads(str(value_to_write))
+                value_item_count = len(parsed_value) if isinstance(parsed_value, list) else 0
+            except Exception:
+                value_item_count = 0
+
         preview_rows.append({
             "sheet_row": getattr(r, "sheet_row", None),
             "entity_type": et,
@@ -1687,6 +1753,7 @@ def build_plan(
             "field_key": fk,
             "action": action,
             "mf_type": mf_type,
+            "value_item_count": value_item_count,
             "value_preview": str(value_to_write)[:200],
         })
 
@@ -1718,6 +1785,85 @@ def build_plan(
         "preview_rows": preview_rows,
         "invalid_rows": invalid_rows,
         "df_apply": df_apply,
+    }
+
+
+def validate_plan_invariants(plan: dict[str, Any]) -> dict[str, int]:
+    """Fail closed before write if the generated Shopify payload is malformed."""
+    set_inputs = plan.get("set_inputs") or []
+    set_meta_rows = plan.get("set_meta_rows") or []
+    delete_inputs = plan.get("delete_inputs") or []
+    delete_meta_rows = plan.get("delete_meta_rows") or []
+
+    if len(set_inputs) != len(set_meta_rows):
+        raise ValueError(
+            "Plan invariant failed: set_inputs and set_meta_rows length mismatch"
+        )
+    if len(delete_inputs) != len(delete_meta_rows):
+        raise ValueError(
+            "Plan invariant failed: delete_inputs and delete_meta_rows length mismatch"
+        )
+
+    reference_prefix_by_type = {
+        "product_reference": "gid://shopify/Product/",
+        "variant_reference": "gid://shopify/ProductVariant/",
+        "collection_reference": "gid://shopify/Collection/",
+    }
+    invalid_examples: list[str] = []
+    list_values_checked = 0
+    reference_values_checked = 0
+
+    for idx, item in enumerate(set_inputs):
+        mf_type = _norm_str(item.get("type")).lower()
+        raw_value = _norm_str(item.get("value"))
+        meta = set_meta_rows[idx]
+
+        values: list[Any]
+        scalar_type = mf_type
+        if mf_type.startswith("list."):
+            list_values_checked += 1
+            scalar_type = mf_type[5:]
+            try:
+                parsed = json.loads(raw_value)
+            except Exception as exc:
+                invalid_examples.append(
+                    f"sheet_row={meta.get('sheet_row')} type={mf_type} invalid_json={exc}"
+                )
+                continue
+            if not isinstance(parsed, list):
+                invalid_examples.append(
+                    f"sheet_row={meta.get('sheet_row')} type={mf_type} value_is_not_array"
+                )
+                continue
+            values = parsed
+        else:
+            values = [raw_value]
+
+        expected_prefix = reference_prefix_by_type.get(scalar_type)
+        if expected_prefix:
+            for value in values:
+                reference_values_checked += 1
+                text_value = _norm_str(value)
+                numeric_part = text_value[len(expected_prefix):] if text_value.startswith(expected_prefix) else ""
+                if not numeric_part or not re.fullmatch(r"\d+", numeric_part):
+                    invalid_examples.append(
+                        f"sheet_row={meta.get('sheet_row')} type={mf_type} invalid_reference={text_value[:160]}"
+                    )
+
+        if len(invalid_examples) >= 20:
+            break
+
+    if invalid_examples:
+        raise ValueError({
+            "message": "Plan invariant validation failed before Shopify write",
+            "examples": invalid_examples,
+        })
+
+    return {
+        "set_items_checked": len(set_inputs),
+        "delete_items_checked": len(delete_inputs),
+        "list_values_checked": list_values_checked,
+        "reference_values_checked": reference_values_checked,
     }
 
 
@@ -1784,9 +1930,16 @@ def apply_plan(
     set_batch_size: int,
     delete_inputs: Optional[list[dict[str, Any]]] = None,
     delete_meta_rows: Optional[list[dict[str, Any]]] = None,
+    isolate_set_user_errors: bool = True,
+    abort_after_full_failed_set_batches: int = 1,
 ) -> dict[str, Any]:
     delete_inputs = delete_inputs or []
     delete_meta_rows = delete_meta_rows or []
+
+    if not (1 <= int(set_batch_size) <= 25):
+        raise ValueError(
+            f"set_batch_size must be between 1 and Shopify's maximum 25; got {set_batch_size}"
+        )
 
     set_total = len(set_inputs)
     delete_total = len(delete_inputs)
@@ -1795,6 +1948,13 @@ def apply_plan(
     ok_count = 0
     fail_count = 0
     detail_fail_rows: list[dict[str, Any]] = []
+    aborted = False
+    abort_reason = ""
+    consecutive_full_failed_set_batches = 0
+    set_batches_attempted = 0
+    set_batches_succeeded = 0
+    set_batches_recovered_partial = 0
+    set_batches_failed = 0
 
     # -----------------------------
     # 1) Apply SET rows via metafieldsSet
@@ -1806,108 +1966,222 @@ def apply_plan(
         print(f"=== Applying metafieldsSet === total={set_total}, batches={total_batches}, batch_size={set_batch_size}")
 
         for batch_no, (start_idx, batch) in enumerate(_chunk_list(set_inputs, set_batch_size), start=1):
+            set_batches_attempted += 1
             meta_batch = set_meta_rows[start_idx:start_idx + len(batch)]
+            pending_inputs = list(batch)
+            pending_meta = list(meta_batch)
+            batch_ok = 0
+            batch_fail = 0
+
             print(f"SET Batch {batch_no}/{total_batches}: {len(batch)} items ... ", end="", flush=True)
 
-            try:
-                data = gql(client, M_SET, {"metafields": batch})
-                resp = data["metafieldsSet"]
-                user_errors = resp.get("userErrors") or []
+            while pending_inputs:
+                try:
+                    data = gql(client, M_SET, {"metafields": pending_inputs})
+                    resp = data["metafieldsSet"]
+                    user_errors = resp.get("userErrors") or []
 
-                if not user_errors:
-                    ok_count += len(batch)
-                    print("OK", flush=True)
-                    continue
+                    if not user_errors:
+                        committed = len(pending_inputs)
+                        ok_count += committed
+                        batch_ok += committed
+                        pending_inputs = []
+                        pending_meta = []
+                        break
 
-                err_by_i = {}
-                non_indexed_errors = []
+                    err_by_i: dict[int, list[dict[str, Any]]] = {}
+                    non_indexed_errors: list[dict[str, Any]] = []
 
-                for e in user_errors:
-                    idx = parse_error_index(e.get("field"))
-                    if idx is None:
-                        non_indexed_errors.append(e)
-                    else:
-                        err_by_i.setdefault(idx, []).append(e)
+                    for error in user_errors:
+                        idx = parse_error_index(error.get("field"))
+                        if idx is None or not (0 <= idx < len(pending_inputs)):
+                            non_indexed_errors.append(error)
+                        else:
+                            err_by_i.setdefault(idx, []).append(error)
 
-                fail_items = 0
+                    first_error = user_errors[0]
+                    first_code = _norm_str(first_error.get("code")) or "NO_CODE"
+                    first_message = _norm_str(first_error.get("message")) or "NO_MESSAGE"
+                    first_field = first_error.get("field")
 
-                for idx, errs in err_by_i.items():
-                    if not (0 <= idx < len(meta_batch)):
-                        continue
+                    print(
+                        "ATOMIC_ROLLBACK "
+                        f"(request_size={len(pending_inputs)}, indexed_errors={len(err_by_i)})",
+                        flush=True,
+                    )
+                    print(
+                        "  first_user_error: "
+                        f"code={first_code} | message={first_message} | field={first_field}",
+                        flush=True,
+                    )
 
-                    fail_items += 1
-                    r = meta_batch[idx]
-                    inp = batch[idx]
-                    detail_fail_rows.append({
-                        "entity_type": r.get("entity_type", ""),
-                        "owner_id": r.get("owner_id", ""),
-                        "field_key": r.get("field_key", ""),
-                        "error_reason": "shopify_user_error",
-                        "message": (
-                            f"sheet_row={r.get('sheet_row')} | action=SET | "
-                            f""
-                            f"msg={errs[0].get('message', '')} | "
-                            f"field={errs[0].get('field')} | "
-                            f"ns={inp.get('namespace')} key={inp.get('key')} "
-                            f"type={inp.get('type')} value={str(inp.get('value'))[:120]}"
-                        ),
-                    })
+                    if non_indexed_errors or not err_by_i:
+                        failed_now = len(pending_inputs)
+                        fail_count += failed_now
+                        batch_fail += failed_now
+                        for r, inp in zip(pending_meta, pending_inputs):
+                            detail_fail_rows.append({
+                                "entity_type": r.get("entity_type", ""),
+                                "owner_id": r.get("owner_id", ""),
+                                "field_key": r.get("field_key", ""),
+                                "error_reason": "shopify_atomic_batch_error",
+                                "message": (
+                                    f"sheet_row={r.get('sheet_row')} | action=SET | "
+                                    f"atomic_rollback=True | code={first_code} | "
+                                    f"msg={first_message} | field={first_field} | "
+                                    f"ns={inp.get('namespace')} key={inp.get('key')} "
+                                    f"type={inp.get('type')}"
+                                ),
+                            })
+                        pending_inputs = []
+                        pending_meta = []
+                        aborted = True
+                        abort_reason = "set_non_indexed_user_error"
+                        break
 
-                if fail_items == 0:
-                    fail_count += len(batch)
-                    print(f"FAILED (fail={len(batch)})", flush=True)
-                    detail_fail_rows.append({
-                        "entity_type": "",
-                        "owner_id": "",
-                        "field_key": "",
-                        "error_reason": "shopify_batch_error",
-                        "message": (
-                            f"SET batch_error start={start_idx} size={len(batch)} | "
-                            f"no per-item index returned | "
-                            f"user_errors={json.dumps(non_indexed_errors, ensure_ascii=False)[:500]}"
-                        ),
-                    })
-                else:
-                    batch_ok = len(batch) - fail_items
-                    ok_count += batch_ok
-                    fail_count += fail_items
-                    print(f"PARTIAL_FAIL (ok={batch_ok}, fail={fail_items})", flush=True)
+                    failed_indices = sorted(err_by_i)
+                    failed_index_set = set(failed_indices)
 
-                    for e in non_indexed_errors[:3]:
+                    for idx in failed_indices:
+                        errs = err_by_i[idx]
+                        error = errs[0]
+                        r = pending_meta[idx]
+                        inp = pending_inputs[idx]
                         detail_fail_rows.append({
-                            "entity_type": "",
-                            "owner_id": "",
-                            "field_key": "",
-                            "error_reason": "shopify_batch_error",
+                            "entity_type": r.get("entity_type", ""),
+                            "owner_id": r.get("owner_id", ""),
+                            "field_key": r.get("field_key", ""),
+                            "error_reason": "shopify_user_error",
                             "message": (
-                                f"SET batch_error start={start_idx} size={len(batch)} | "
-                                f""
-                                f"msg={e.get('message', '')} | "
-                                f"field={e.get('field')}"
+                                f"sheet_row={r.get('sheet_row')} | action=SET | "
+                                f"atomic_rollback=True | code={_norm_str(error.get('code')) or 'NO_CODE'} | "
+                                f"msg={error.get('message', '')} | field={error.get('field')} | "
+                                f"ns={inp.get('namespace')} key={inp.get('key')} "
+                                f"type={inp.get('type')} value={str(inp.get('value'))[:160]}"
                             ),
                         })
 
-            except Exception as e:
-                fail_count += len(batch)
-                print("FAILED", flush=True)
-                print(f"  exception: {e}", flush=True)
+                    explicit_fail = len(failed_indices)
 
-                for r, inp in zip(meta_batch, batch):
-                    detail_fail_rows.append({
-                        "entity_type": r.get("entity_type", ""),
-                        "owner_id": r.get("owner_id", ""),
-                        "field_key": r.get("field_key", ""),
-                        "error_reason": "batch_exception",
-                        "message": (
-                            f"sheet_row={r.get('sheet_row')} | action=SET | exception: {e} | "
-                            f"ns={inp.get('namespace')} key={inp.get('key')} type={inp.get('type')}"
-                        ),
-                    })
+                    if not isolate_set_user_errors:
+                        rolled_back_indices = [
+                            idx for idx in range(len(pending_inputs))
+                            if idx not in failed_index_set
+                        ]
+                        for idx in rolled_back_indices:
+                            r = pending_meta[idx]
+                            inp = pending_inputs[idx]
+                            detail_fail_rows.append({
+                                "entity_type": r.get("entity_type", ""),
+                                "owner_id": r.get("owner_id", ""),
+                                "field_key": r.get("field_key", ""),
+                                "error_reason": "shopify_atomic_rollback",
+                                "message": (
+                                    f"sheet_row={r.get('sheet_row')} | action=SET | "
+                                    f"rolled_back_by_other_item_error=True | "
+                                    f"ns={inp.get('namespace')} key={inp.get('key')} type={inp.get('type')}"
+                                ),
+                            })
+                        failed_now = len(pending_inputs)
+                        fail_count += failed_now
+                        batch_fail += failed_now
+                        pending_inputs = []
+                        pending_meta = []
+                        break
+
+                    fail_count += explicit_fail
+                    batch_fail += explicit_fail
+
+                    remaining_pairs = [
+                        (inp, meta)
+                        for idx, (inp, meta) in enumerate(zip(pending_inputs, pending_meta))
+                        if idx not in failed_index_set
+                    ]
+                    pending_inputs = [pair[0] for pair in remaining_pairs]
+                    pending_meta = [pair[1] for pair in remaining_pairs]
+
+                    if pending_inputs:
+                        print(
+                            f"  retrying_atomic_remainder: {len(pending_inputs)} items",
+                            flush=True,
+                        )
+
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    failed_now = len(pending_inputs)
+                    fail_count += failed_now
+                    batch_fail += failed_now
+                    print(
+                        f"FAILED_EXCEPTION (ok={batch_ok}, fail={batch_fail})",
+                        flush=True,
+                    )
+                    print(f"  exception: {type(exc).__name__}: {exc}", flush=True)
+
+                    for r, inp in zip(pending_meta, pending_inputs):
+                        detail_fail_rows.append({
+                            "entity_type": r.get("entity_type", ""),
+                            "owner_id": r.get("owner_id", ""),
+                            "field_key": r.get("field_key", ""),
+                            "error_reason": "batch_exception",
+                            "message": (
+                                f"sheet_row={r.get('sheet_row')} | action=SET | "
+                                f"exception={type(exc).__name__}: {exc} | "
+                                f"ns={inp.get('namespace')} key={inp.get('key')} type={inp.get('type')}"
+                            ),
+                        })
+                    pending_inputs = []
+                    pending_meta = []
+                    aborted = True
+                    abort_reason = "set_batch_exception"
+                    break
+
+            if batch_fail == 0:
+                consecutive_full_failed_set_batches = 0
+                set_batches_succeeded += 1
+                print("OK", flush=True)
+            elif batch_ok > 0:
+                consecutive_full_failed_set_batches = 0
+                set_batches_recovered_partial += 1
+                print(
+                    f"RECOVERED_PARTIAL (ok={batch_ok}, fail={batch_fail})",
+                    flush=True,
+                )
+            else:
+                consecutive_full_failed_set_batches += 1
+                set_batches_failed += 1
+                print(
+                    f"FAILED_ATOMIC (ok=0, fail={batch_fail})",
+                    flush=True,
+                )
+
+            if aborted:
+                break
+
+            fail_limit = max(0, int(abort_after_full_failed_set_batches))
+            if fail_limit and consecutive_full_failed_set_batches >= fail_limit:
+                aborted = True
+                abort_reason = (
+                    "consecutive_full_failed_set_batches="
+                    f"{consecutive_full_failed_set_batches}"
+                )
+                print(
+                    "SET circuit breaker: ABORT remaining operations | "
+                    f"reason={abort_reason}",
+                    flush=True,
+                )
+                break
 
     # -----------------------------
     # 2) Apply CLEAR rows via metafieldsDelete
     # -----------------------------
-    if delete_total == 0:
+    if aborted:
+        print(
+            "=== Applying metafieldsDelete === SKIPPED due to SET abort | "
+            f"reason={abort_reason}",
+            flush=True,
+        )
+    elif delete_total == 0:
         print("=== Applying metafieldsDelete === total=0, batches=0, batch_size=0")
     else:
         total_batches = (delete_total + set_batch_size - 1) // set_batch_size
@@ -1926,6 +2200,14 @@ def apply_plan(
                     ok_count += len(batch)
                     print("OK", flush=True)
                     continue
+
+                first_error = user_errors[0]
+                print(
+                    "USER_ERROR | "
+                    f"message={_norm_str(first_error.get('message')) or 'NO_MESSAGE'} | "
+                    f"field={first_error.get('field')}",
+                    flush=True,
+                )
 
                 err_by_i = {}
                 non_indexed_errors = []
@@ -1960,9 +2242,9 @@ def apply_plan(
                         ),
                     })
 
-                if fail_items == 0:
+                if non_indexed_errors or fail_items == 0:
                     fail_count += len(batch)
-                    print(f"FAILED (fail={len(batch)})", flush=True)
+                    print(f"FAILED (ok=0, fail={len(batch)})", flush=True)
                     detail_fail_rows.append({
                         "entity_type": "",
                         "owner_id": "",
@@ -1978,7 +2260,10 @@ def apply_plan(
                     batch_ok = len(batch) - fail_items
                     ok_count += batch_ok
                     fail_count += fail_items
-                    print(f"PARTIAL_FAIL (ok={batch_ok}, fail={fail_items})", flush=True)
+                    if batch_ok == 0:
+                        print(f"FAILED (ok=0, fail={fail_items})", flush=True)
+                    else:
+                        print(f"PARTIAL_FAIL (ok={batch_ok}, fail={fail_items})", flush=True)
 
                     for e in non_indexed_errors[:3]:
                         detail_fail_rows.append({
@@ -2011,8 +2296,12 @@ def apply_plan(
                         ),
                     })
 
+    unattempted_count = max(0, total - ok_count - fail_count)
     print(
-        f"=== Apply done === total={total}, ok={ok_count}, fail={fail_count}, set={set_total}, delete={delete_total}",
+        "=== Apply done === "
+        f"total={total}, ok={ok_count}, fail={fail_count}, "
+        f"unattempted={unattempted_count}, set={set_total}, delete={delete_total}, "
+        f"aborted={aborted}",
         flush=True,
     )
 
@@ -2022,6 +2311,13 @@ def apply_plan(
         "total": total,
         "set_total": set_total,
         "delete_total": delete_total,
+        "unattempted_count": unattempted_count,
+        "aborted": aborted,
+        "abort_reason": abort_reason,
+        "set_batches_attempted": set_batches_attempted,
+        "set_batches_succeeded": set_batches_succeeded,
+        "set_batches_recovered_partial": set_batches_recovered_partial,
+        "set_batches_failed": set_batches_failed,
         "detail_fail_rows": detail_fail_rows,
     }
 
@@ -2101,8 +2397,11 @@ def run(
 
     reference_default_kind: str = "mixed",
     type_override_by_field_key: Optional[dict[str, str]] = None,
+    allow_missing_cfg_type_fallback: bool = False,
 
     set_batch_size: int = 25,
+    isolate_set_user_errors: bool = True,
+    abort_after_full_failed_set_batches: int = 1,
     http_timeout: int = 60,
     abort_if_fieldkey_contains: str = ".shopify.",
 
@@ -2288,6 +2587,13 @@ def run(
         cfg_type_map=cfg_type_map,
         reference_default_kind=reference_default_kind,
         type_override_by_field_key=type_override_by_field_key,
+        allow_missing_cfg_type_fallback=allow_missing_cfg_type_fallback,
+    )
+    plan_validation = validate_plan_invariants(plan)
+    print(
+        "[Plan validation] PASS | "
+        + " | ".join(f"{key}={value}" for key, value in plan_validation.items()),
+        flush=True,
     )
 
     rows_planned = int(plan["summary"].get("rows_planned_total", plan["summary"].get("rows_planned_set", 0)))
@@ -2458,20 +2764,48 @@ def run(
             },
         }
 
-    apply_result = apply_plan(
-        client=shopify,
-        set_inputs=plan["set_inputs"],
-        set_meta_rows=plan["set_meta_rows"],
-        set_batch_size=set_batch_size,
-        delete_inputs=plan["delete_inputs"],
-        delete_meta_rows=plan["delete_meta_rows"],
-    )
+    try:
+        apply_result = apply_plan(
+            client=shopify,
+            set_inputs=plan["set_inputs"],
+            set_meta_rows=plan["set_meta_rows"],
+            set_batch_size=set_batch_size,
+            delete_inputs=plan["delete_inputs"],
+            delete_meta_rows=plan["delete_meta_rows"],
+            isolate_set_user_errors=isolate_set_user_errors,
+            abort_after_full_failed_set_batches=abort_after_full_failed_set_batches,
+        )
+    except KeyboardInterrupt:
+        logger.log_row(
+            phase="apply",
+            log_type="summary",
+            status="INTERRUPTED",
+            rows_loaded=rows_loaded,
+            rows_pending=rows_pending,
+            rows_recognized=rows_recognized,
+            rows_planned=rows_planned,
+            rows_written="",
+            rows_skipped=rows_skipped,
+            message=(
+                "Apply interrupted by operator. rows_written is intentionally blank because "
+                "completed writes were not reconciled; console progress is the only "
+                "per-batch evidence available before interruption."
+            ),
+            error_reason="keyboard_interrupt",
+        )
+        logger.flush()
+        raise
 
     rows_written = int(apply_result["ok_count"])
     apply_fail_count = int(apply_result["fail_count"])
+    rows_unattempted = int(apply_result.get("unattempted_count", 0))
+    apply_aborted = bool(apply_result.get("aborted", False))
+    apply_abort_reason = _norm_str(apply_result.get("abort_reason"))
 
     final_status = "SUCCESS"
-    if apply_fail_count > 0 and rows_written > 0:
+    if apply_aborted:
+        final_status = "ERROR_ABORTED"
+    elif apply_fail_count > 0 and rows_written > 0:
         final_status = "PARTIAL_SUCCESS"
     elif apply_fail_count > 0 and rows_written == 0:
         final_status = "ERROR"
@@ -2488,9 +2822,11 @@ def run(
         rows_skipped=rows_skipped,
         message=(
             f"Apply completed | rows_planned={rows_planned} | rows_written={rows_written} | "
-            f"rows_skipped={rows_skipped} | apply_fail_count={apply_fail_count}"
+            f"rows_skipped={rows_skipped} | apply_fail_count={apply_fail_count} | "
+            f"rows_unattempted={rows_unattempted} | aborted={apply_aborted} | "
+            f"abort_reason={apply_abort_reason}"
         ),
-        error_reason="",
+        error_reason=apply_abort_reason if apply_aborted else "",
     )
 
     log_grouped_details(
@@ -2509,7 +2845,7 @@ def run(
     logger.flush()
 
     return {
-        "status": "applied",
+        "status": "aborted" if apply_aborted else "applied",
         "summary": {
             "rows_loaded": rows_loaded,
             "rows_pending": rows_pending,
@@ -2518,6 +2854,8 @@ def run(
             "rows_written": rows_written,
             "rows_skipped": rows_skipped,
             "apply_fail_count": apply_fail_count,
+            "rows_unattempted": rows_unattempted,
+            "apply_aborted": apply_aborted,
         },
         "preview": preview,
         "warnings": warnings,
@@ -2528,5 +2866,10 @@ def run(
             "runlog_sheet_url": runlog_sheet_url,
             "runlog_tab_name": runlog_tab_name,
             "final_status": final_status,
+            "abort_reason": apply_abort_reason,
+            "set_batches_attempted": apply_result.get("set_batches_attempted", 0),
+            "set_batches_succeeded": apply_result.get("set_batches_succeeded", 0),
+            "set_batches_recovered_partial": apply_result.get("set_batches_recovered_partial", 0),
+            "set_batches_failed": apply_result.get("set_batches_failed", 0),
         },
     }
