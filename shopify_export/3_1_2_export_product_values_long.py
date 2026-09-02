@@ -18,13 +18,13 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import gspread
 import pandas as pd
 import requests
 from google.oauth2.service_account import Credentials
-from gspread_dataframe import set_with_dataframe
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -70,8 +70,10 @@ SCOPES = [
 ]
 
 MODULE_PATH = "shopify_export.3_1_2_export_product_values_long"
-MODULE_VERSION = "2026-08-01-runtime-boundary-v1"
+MODULE_VERSION = "2026-08-25-local-snapshot-chunked-sheets-v1"
 DEFAULT_JOB_NAME = "export_product_values_long"
+DEFAULT_SHEETS_WRITE_CHUNK_ROWS = 500
+DEFAULT_SHEETS_WRITE_MAX_ATTEMPTS = 6
 
 
 def _clean_str(x: Any) -> str:
@@ -779,8 +781,12 @@ def _with_sheets_retry(
         except Exception as exc:
             if not _is_retryable_sheets_error(exc) or attempt >= attempts:
                 raise
-            delay = min(2 ** (attempt - 1), float(max_delay)) + random.random()
             status = _sheets_error_status(exc)
+            if status == 429:
+                # Sheets quotas recover on a longer window than transient 5xx errors.
+                delay = min(15 * (2 ** (attempt - 1)), 60.0) + random.random()
+            else:
+                delay = min(2 ** (attempt - 1), float(max_delay)) + random.random()
             reason = f"HTTP {status}" if status is not None else type(exc).__name__
             print(
                 "[Sheets retry] "
@@ -791,6 +797,78 @@ def _with_sheets_retry(
     raise RuntimeError(f"Sheets operation exhausted retries: {action}")
 
 
+def _safe_filename_part(value: Any, fallback: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", _clean_str(value)).strip("._")
+    return cleaned or fallback
+
+
+def resolve_local_snapshot_path(
+    *,
+    local_snapshot_path: Optional[str],
+    job_name: str,
+    values_long_tab: str,
+) -> Path:
+    """Return the deterministic Current CSV used as the Sheets write source."""
+    explicit_path = _clean_str(local_snapshot_path)
+    if explicit_path:
+        return Path(explicit_path).expanduser().resolve()
+
+    project_root = Path(__file__).resolve().parents[1]
+    safe_job = _safe_filename_part(job_name, DEFAULT_JOB_NAME)
+    safe_tab = _safe_filename_part(values_long_tab, "DL__ValuesLong")
+    return project_root / "runtime_output" / safe_job / f"{safe_tab}__current.csv"
+
+
+def reset_local_snapshot(snapshot_path: Path) -> None:
+    """At run start, clear the existing Current CSV or create an empty one."""
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = snapshot_path.with_name(snapshot_path.name + ".tmp")
+    existed = snapshot_path.exists()
+    if temp_path.exists():
+        temp_path.unlink()
+    with snapshot_path.open("w", encoding="utf-8"):
+        pass
+    print(
+        "[Local snapshot] reset | "
+        f"path={snapshot_path} | action={'CLEARED' if existed else 'CREATED'} | bytes=0"
+    )
+
+
+def write_and_reload_local_snapshot(snapshot_path: Path, df: pd.DataFrame) -> pd.DataFrame:
+    """Atomically persist the completed export and reload it as the Sheets source."""
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = snapshot_path.with_name(snapshot_path.name + ".tmp")
+    frame = pd.DataFrame(columns=DL_HEADERS) if df is None else df.copy()
+    frame = frame.reindex(columns=DL_HEADERS).fillna("")
+
+    frame.to_csv(temp_path, index=False, encoding="utf-8")
+    os.replace(temp_path, snapshot_path)
+
+    persisted = pd.read_csv(
+        snapshot_path,
+        dtype=str,
+        keep_default_na=False,
+        na_filter=False,
+        encoding="utf-8",
+    )
+    if list(persisted.columns) != DL_HEADERS:
+        raise RuntimeError(
+            "Local snapshot header verification failed: "
+            f"expected={DL_HEADERS}; actual={list(persisted.columns)}; path={snapshot_path}"
+        )
+    if len(persisted) != len(frame):
+        raise RuntimeError(
+            "Local snapshot row-count verification failed: "
+            f"expected={len(frame)}; actual={len(persisted)}; path={snapshot_path}"
+        )
+
+    print(
+        "[Local snapshot] ready | "
+        f"path={snapshot_path} | rows={len(persisted)} | bytes={snapshot_path.stat().st_size}"
+    )
+    return persisted
+
+
 def ensure_ws(gc: gspread.Client, sheet_url: str, tab_name: str):
     sh = gc.open_by_url(sheet_url)
     try:
@@ -799,32 +877,90 @@ def ensure_ws(gc: gspread.Client, sheet_url: str, tab_name: str):
         return sh.add_worksheet(title=tab_name, rows=2000, cols=30)
 
 
-def write_df_replace(ws, df: pd.DataFrame):
-    """Replace the target Tab with bounded Sheets retry; payload semantics unchanged."""
+def write_df_replace(
+    ws,
+    df: pd.DataFrame,
+    *,
+    chunk_rows: int = DEFAULT_SHEETS_WRITE_CHUNK_ROWS,
+    max_attempts: int = DEFAULT_SHEETS_WRITE_MAX_ATTEMPTS,
+):
+    """Replace one Tab using small, independently retryable value updates."""
     row_count = 0 if df is None else len(df)
     col_count = 0 if df is None else len(df.columns)
-    print(f"[Sheets] write start | tab={ws.title} | rows={row_count} | cols={col_count}")
+    resolved_chunk_rows = int(chunk_rows)
+    resolved_max_attempts = int(max_attempts)
+    if resolved_chunk_rows <= 0:
+        raise ValueError(f"chunk_rows must be > 0; got {chunk_rows!r}")
+    if resolved_max_attempts <= 0:
+        raise ValueError(f"max_attempts must be > 0; got {max_attempts!r}")
+
+    print(
+        f"[Sheets] write start | tab={ws.title} | rows={row_count} | cols={col_count} | "
+        f"chunk_rows={resolved_chunk_rows}"
+    )
     started = time.time()
 
-    _with_sheets_retry(ws.clear, action=f"clear:{ws.title}")
-    if df is None or df.empty:
-        _with_sheets_retry(
-            lambda: ws.update(range_name="A1", values=[DL_HEADERS]),
-            action=f"update_header:{ws.title}",
-        )
-        print(f"[Sheets] write done | tab={ws.title} | rows=0 | elapsed={time.time() - started:.1f}s")
-        return
-
     _with_sheets_retry(
-        lambda: set_with_dataframe(
-            ws,
-            df,
-            include_index=False,
-            include_column_header=True,
-            resize=True,
-        ),
-        action=f"set_with_dataframe:{ws.title}:replace",
+        lambda: ws.resize(rows=max(1, row_count + 1), cols=max(1, col_count)),
+        action=f"resize:{ws.title}",
+        max_attempts=resolved_max_attempts,
     )
+    _with_sheets_retry(
+        ws.clear,
+        action=f"clear:{ws.title}",
+        max_attempts=resolved_max_attempts,
+    )
+
+    frame = pd.DataFrame(columns=DL_HEADERS) if df is None else df.copy()
+    frame = frame.fillna("")
+    all_values: List[List[Any]] = [list(frame.columns)] + frame.values.tolist()
+    total_batches = max(1, (len(all_values) + resolved_chunk_rows - 1) // resolved_chunk_rows)
+
+    for batch_number, start in enumerate(
+        range(0, len(all_values), resolved_chunk_rows),
+        start=1,
+    ):
+        batch_values = all_values[start:start + resolved_chunk_rows]
+        start_row = start + 1
+        end_row = start_row + len(batch_values) - 1
+        end_cell = gspread.utils.rowcol_to_a1(end_row, max(1, col_count))
+        range_name = f"A{start_row}:{end_cell}"
+        _with_sheets_retry(
+            lambda values=batch_values, target_range=range_name: ws.update(
+                range_name=target_range,
+                values=values,
+                value_input_option="USER_ENTERED",
+            ),
+            action=f"update_chunk:{ws.title}:{batch_number}/{total_batches}:{range_name}",
+            max_attempts=resolved_max_attempts,
+        )
+        print(
+            f"[Sheets] chunk done | tab={ws.title} | "
+            f"batch={batch_number}/{total_batches} | range={range_name}"
+        )
+
+    # One bounded read validates the formal target without per-chunk read traffic.
+    verify_end_cell = gspread.utils.rowcol_to_a1(max(1, row_count + 1), max(1, col_count))
+    verify_range = f"A1:{verify_end_cell}"
+    actual_values = _with_sheets_retry(
+        lambda: ws.get(verify_range),
+        action=f"verify_read:{ws.title}:{verify_range}",
+        max_attempts=resolved_max_attempts,
+    )
+    actual_header = [str(value) for value in (actual_values[0] if actual_values else [])]
+    expected_header = [str(value) for value in frame.columns]
+    actual_data_rows = max(0, len(actual_values) - 1)
+    if actual_header != expected_header or actual_data_rows != row_count:
+        raise RuntimeError(
+            "Google Sheets write-back verification failed: "
+            f"tab={ws.title}; expected_rows={row_count}; actual_rows={actual_data_rows}; "
+            f"expected_header={expected_header}; actual_header={actual_header}"
+        )
+    print(
+        f"[Sheets] verify done | tab={ws.title} | rows={actual_data_rows} | "
+        f"header=PASS | range={verify_range}"
+    )
+
     print(
         f"[Sheets] write done | tab={ws.title} | rows={row_count} | "
         f"elapsed={time.time() - started:.1f}s"
@@ -1611,9 +1747,18 @@ def run(
     gql_ids_per_query: int = 50,
     gql_mf_per_query: int = 25,
     job_name: str = DEFAULT_JOB_NAME,
+    local_snapshot_path: Optional[str] = None,
+    sheets_write_chunk_rows: int = DEFAULT_SHEETS_WRITE_CHUNK_ROWS,
+    sheets_write_max_attempts: int = DEFAULT_SHEETS_WRITE_MAX_ATTEMPTS,
 ) -> Dict[str, Any]:
 
     job_name = normalize_str(job_name) or DEFAULT_JOB_NAME
+    snapshot_path = resolve_local_snapshot_path(
+        local_snapshot_path=local_snapshot_path,
+        job_name=job_name,
+        values_long_tab=values_long_tab,
+    )
+    reset_local_snapshot(snapshot_path)
     print(f"[ValuesLong] start | job={job_name} | site={site_code}")
     gc = build_gspread_client_from_b64(gsheet_sa_b64)
     client = ShopifyClient(
@@ -1852,8 +1997,27 @@ def run(
     df_long = pd.DataFrame(long_rows, columns=DL_HEADERS).fillna("")
     df_long = dedupe_long_df(df_long)
 
+    # The completed export is made durable before the target Sheet is changed.
+    # Sheets is written from this verified local copy, not from memory only.
+    df_long = write_and_reload_local_snapshot(snapshot_path, df_long)
+
     ws_long = ensure_ws(gc, data_sheet_url, values_long_tab)
-    write_df_replace(ws_long, df_long)
+    try:
+        write_df_replace(
+            ws_long,
+            df_long,
+            chunk_rows=sheets_write_chunk_rows,
+            max_attempts=sheets_write_max_attempts,
+        )
+    except Exception as exc:
+        print(
+            "[Recovery] Google Sheets write failed; local snapshot retained | "
+            f"path={snapshot_path} | rows={len(df_long)}"
+        )
+        raise RuntimeError(
+            "Google Sheets write failed after the export was safely saved locally. "
+            f"snapshot_path={snapshot_path}; rows={len(df_long)}"
+        ) from exc
 
     summary = {
         "run_id": run_id,
@@ -1871,6 +2035,8 @@ def run(
         "config_sheet_url": config_sheet_url,
         "data_sheet_url": data_sheet_url,
         "values_long_tab": values_long_tab,
+        "local_snapshot_path": str(snapshot_path),
+        "sheets_write_chunk_rows": int(sheets_write_chunk_rows),
     }
 
     runlog_rows = [
