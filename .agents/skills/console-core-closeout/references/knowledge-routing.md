@@ -79,7 +79,7 @@ When `PROJECT_STRUCTURE_UPGRADE_RECOMMENDED: YES`, output a complete `$project-o
 ```text
 PROJECT_ACTION: UPGRADE_EXISTING
 PROJECT_PROFILE: COMPLEX
-TARGET_PROJECT_PATH: /Users/nikki/Documents/AI_Workspace/Projects/Console_Core
+TARGET_PROJECT_PATH: /Users/nikki/Documents/AI_Workspace_Next/Projects/Console_Core
 ```
 
 Do not perform the upgrade inside closeout.

@@ -35,7 +35,7 @@ Defaults:
 
 ```text
 PACKAGE_SCHEMA_VERSION: 1
-TARGET_PROJECT_PATH: /Users/nikki/Documents/AI_Workspace/Projects/Console_Core
+TARGET_PROJECT_PATH: /Users/nikki/Documents/AI_Workspace_Next/Projects/Console_Core
 SOURCE_MODE: CURRENT_CODEX_THREAD
 ACCEPTANCE_SCOPE: TASK_ONLY
 EXECUTION_MODE: AUDIT_THEN_CONFIRM
