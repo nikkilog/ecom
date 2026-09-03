@@ -1,4 +1,4 @@
-# delivery_name: 1_2_edit_core.py
+# delivery_name: 1_2_edit_core_text_safe_20260903_v2.py
 # deployment_path: shopify_sync/1_2_edit_core.py
 # Full Edit__Core apply engine: core fields, product status, metafields, SKU/cost/prices, and media.
 # core.cost uses the shop default currency and supports SET/CLEAR; core.cost_currency is intentionally not read or written.
@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 MODULE_PATH = "shopify_sync.1_2_edit_core"
-MODULE_VERSION = "2026-08-02-collection-api-2026-01-fix-v1"
+MODULE_VERSION = "2026-09-03-edit-core-text-safe-input-v2"
 DEFAULT_JOB_NAME = "edit_core"
 
 import base64
@@ -1447,7 +1447,14 @@ def log_grouped_details(
 # =========================================================
 
 def load_edit_core(ws_edit) -> pd.DataFrame:
-    rows = ws_edit.get_all_records()
+    rows = _with_sheets_retry(
+        # Edit__Core is a text contract. In particular, desired_value can
+        # contain comma-delimited numeric IDs. gspread's default numericisation
+        # removes those commas as if they were thousands separators, corrupting
+        # a reference list before business parsing sees it.
+        lambda: ws_edit.get_all_records(numericise_ignore=["all"]),
+        action=f"input.get_all_records:{ws_edit.title}",
+    )
     df = pd.DataFrame(rows)
 
     # Edit__Core requires the five operation columns below. The remaining
