@@ -29,7 +29,7 @@ SCOPES = [
 ]
 
 MODULE_PATH = "shopify_export.3_1_3_export_product_views"
-MODULE_VERSION = "2026-08-01-runtime-boundary-v1"
+MODULE_VERSION = "2026-09-05-filter-safe-perf-v4"
 DEFAULT_JOB_NAME = "export_product_views"
 
 
@@ -204,20 +204,60 @@ def _sheets_error_status(exc: BaseException) -> Optional[int]:
         return None
 
 
+def _exception_chain_text(exc: BaseException) -> str:
+    """Return a compact lower-case description of an exception chain."""
+    parts = []
+    seen = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        parts.append(type(cur).__name__)
+        parts.append(str(cur))
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return " | ".join(parts).lower()
+
+
 def _is_retryable_sheets_error(exc: BaseException) -> bool:
+    """Retry transient Google Sheets HTTP/network failures."""
     status = _sheets_error_status(exc)
     if status == 429 or status in {500, 502, 503, 504}:
         return True
-    text = str(exc).lower()
+
+    text = _exception_chain_text(exc)
     retry_tokens = (
+        # quota / transient API failures
         "resource_exhausted",
         "ratelimitexceeded",
         "userratelimitexceeded",
         "rate limit exceeded",
         "quota exceeded",
         "too many requests",
+        # transport failures seen through requests / urllib3 / http.client
+        "connectionerror",
+        "protocolerror",
+        "remotedisconnected",
+        "remote end closed connection without response",
+        "connection aborted",
+        "connection reset",
+        "connection broken",
+        "max retries exceeded",
+        "readtimeout",
+        "connecttimeout",
+        "read timed out",
+        "connect timed out",
+        "temporarily unavailable",
     )
     return any(token in text for token in retry_tokens)
+
+
+def _is_filter_related_sheets_error(exc: BaseException) -> bool:
+    """Skip only Google Sheets API failures that explicitly mention a filter."""
+    text = _exception_chain_text(exc)
+    status = _sheets_error_status(exc)
+    is_sheets_api_error = status is not None or "apierror" in text
+    if not is_sheets_api_error:
+        return False
+    return "filter" in text
 
 
 def _with_sheets_retry(
@@ -795,12 +835,29 @@ def clear_worksheet(ws):
 
 
 def resize_worksheet(ws, rows: int, cols: int):
-    rows = max(int(rows or 1), 1)
-    cols = max(int(cols or 1), 1)
-    if ws.row_count != rows or ws.col_count != cols:
+    """Ensure capacity without shrinking the sheet.
+
+    Google Sheets filters do not change physical A1 row/column coordinates, so
+    normal A1 writes can safely target hidden/filtered-out rows. Shrinking a grid
+    is unnecessary for replacement writes and is the operation most likely to
+    conflict with an existing filter/filter-view range. Therefore this helper
+    is deliberately grow-only.
+    """
+    required_rows = max(int(rows or 1), 1)
+    required_cols = max(int(cols or 1), 1)
+    current_rows = max(int(getattr(ws, "row_count", 1) or 1), 1)
+    current_cols = max(int(getattr(ws, "col_count", 1) or 1), 1)
+
+    target_rows = max(current_rows, required_rows)
+    target_cols = max(current_cols, required_cols)
+
+    if target_rows != current_rows or target_cols != current_cols:
         return _with_sheets_retry(
-            lambda: ws.resize(rows=rows, cols=cols),
-            action=f"worksheet.resize:{getattr(ws, 'title', '')}:{rows}x{cols}",
+            lambda: ws.resize(rows=target_rows, cols=target_cols),
+            action=(
+                f"worksheet.resize_grow_only:{getattr(ws, 'title', '')}:"
+                f"{current_rows}x{current_cols}->{target_rows}x{target_cols}"
+            ),
         )
     return None
 
@@ -1737,18 +1794,21 @@ def ensure_columns_from_long(
     """
     Ensure configured metafield columns can be resolved from DL__ValuesLong.
 
-    v6 behavior:
-    - add a configured mf./v_mf./custom. column when it is absent;
+    Current behavior:
+    - add configured mf./v_mf./custom. columns when absent;
     - backfill individual blank cells when the column already exists in IDX;
-    - preserve every non-blank IDX value as the first-priority source.
+    - preserve every non-blank IDX value as the first-priority source;
+    - batch all column additions/replacements and apply them with one pd.concat,
+      avoiding DataFrame fragmentation from repeated ``work[col] = ...`` inserts.
 
-    The previous implementation only added completely missing columns. Therefore,
-    an existing-but-empty VARIANT|v_mf.* column blocked the DL__ValuesLong fallback.
+    This keeps the same business result as the previous fallback logic while
+    removing the pandas PerformanceWarning caused by highly fragmented frames.
     """
     if df is None or df.empty or not needed_cols:
         return df
 
     work = df.copy()
+    original_columns = list(work.columns)
 
     var_gid_col = "VARIANT|core.gid"
     prd_gid_col = "PRODUCT|core.gid"
@@ -1770,6 +1830,11 @@ def ensure_columns_from_long(
             if has_var_prd else None
         )
     )
+
+    # Collect every changed/new column first. Applying them one-by-one is what
+    # fragments a pandas DataFrame when many metafields are requested.
+    patches: Dict[str, pd.Series] = {}
+    new_columns_in_order: List[str] = []
 
     for col in needed_cols:
         if not isinstance(col, str) or "|" not in col:
@@ -1803,12 +1868,34 @@ def ensure_columns_from_long(
         )
 
         if col not in work.columns:
-            work[col] = fallback
+            # Duplicate needed_cols should not create duplicate output columns.
+            if col not in patches:
+                patches[col] = fallback
+                new_columns_in_order.append(col)
             continue
 
         blank_mask = work[col].map(lambda x: _safe_str(x) == "")
         if blank_mask.any():
-            work.loc[blank_mask, col] = fallback.loc[blank_mask]
+            patched = work[col].copy()
+            patched.loc[blank_mask] = fallback.loc[blank_mask]
+            patches[col] = patched
+
+    if not patches:
+        return work
+
+    patch_df = pd.DataFrame(patches, index=work.index)
+
+    # Replace affected existing columns and append genuinely new columns in one
+    # concat operation. Then restore the original column order exactly, with
+    # newly added fallback fields appended in requested order.
+    existing_patched_cols = [col for col in original_columns if col in patches]
+    base = work.drop(columns=existing_patched_cols) if existing_patched_cols else work
+    work = pd.concat([base, patch_df], axis=1)
+
+    final_columns = original_columns + [
+        col for col in new_columns_in_order if col not in original_columns
+    ]
+    work = work.reindex(columns=final_columns)
 
     return work
 
@@ -2102,6 +2189,8 @@ def build_and_write_view(
         return {
             "view_id": view_id,
             "target_sheet": target_sheet,
+            "status": "WRITTEN",
+            "warning": "",
             "rows_written": 0,
             "cols_written": 0,
         }
@@ -2151,6 +2240,8 @@ def build_and_write_view(
     return {
         "view_id": view_id,
         "target_sheet": target_sheet,
+        "status": "WRITTEN",
+        "warning": "",
         "rows_written": int(len(out_df)),
         "cols_written": int(len(display_headers)),
     }
@@ -2293,19 +2384,57 @@ def run(
             print("target_sheet_label:", target_sheet_label)
             print("target_spreadsheet:", getattr(sh_out, "title", ""))
 
-        res = build_and_write_view(
-            sh_data=sh_out,
-            cfg_tabs_df=cfg_tabs_df,
-            cfg_fields_df=cfg_fields_df,
-            df_idx_products=df_idx_products,
-            df_idx_variants=df_idx_variants,
-            view_id=vid,
-            long_value_map=long_value_map,
-            global_filters=global_filters or {},
-            filter_mode=filter_mode,
-            view_filter_overrides=view_filter_overrides or {},
-            verbose=verbose,
-        )
+        try:
+            res = build_and_write_view(
+                sh_data=sh_out,
+                cfg_tabs_df=cfg_tabs_df,
+                cfg_fields_df=cfg_fields_df,
+                df_idx_products=df_idx_products,
+                df_idx_variants=df_idx_variants,
+                view_id=vid,
+                long_value_map=long_value_map,
+                global_filters=global_filters or {},
+                filter_mode=filter_mode,
+                view_filter_overrides=view_filter_overrides or {},
+                verbose=verbose,
+            )
+        except Exception as exc:
+            # A normal Basic Filter / Filter View should not affect physical A1
+            # writes. If Google nevertheless rejects an operation explicitly
+            # because of a filter, skip only this view instead of aborting the
+            # whole Product Views run. Unrelated data/config/auth errors still
+            # fail fast and remain visible.
+            if not _is_filter_related_sheets_error(exc):
+                raise
+
+            tab_hit = cfg_tabs_df[
+                cfg_tabs_df["view_id"].astype(str).str.strip() == _safe_str(vid)
+            ]
+            target_sheet_name = _safe_str(vid)
+            if not tab_hit.empty:
+                target_sheet_name = (
+                    _safe_str(tab_hit.iloc[0].get("target_sheet")) or target_sheet_name
+                )
+            warning = (
+                "Google Sheets rejected this tab operation because of an existing "
+                f"filter/filter view; skipped without interrupting other views. "
+                f"error={type(exc).__name__}: {exc}"
+            )
+            res = {
+                "view_id": vid,
+                "target_sheet": target_sheet_name,
+                "status": "SKIPPED_FILTERED_TAB",
+                "warning": warning,
+                "rows_written": 0,
+                "cols_written": 0,
+            }
+            print(
+                "[View skip] "
+                f"view={vid} | target_sheet={target_sheet_name} | "
+                "reason=FILTER_RELATED_SHEETS_ERROR"
+            )
+            print("[View skip detail]", warning)
+
         res["target_sheet_label"] = target_sheet_label
         res["target_spreadsheet_title"] = getattr(sh_out, "title", "")
         results.append(res)
@@ -2313,11 +2442,19 @@ def run(
         if verbose:
             print("done:", res)
 
+    skipped_results = [
+        item for item in results if _safe_str(item.get("status")) == "SKIPPED_FILTERED_TAB"
+    ]
+    warning_results = [item for item in results if _safe_str(item.get("warning"))]
+
     return {
         "site_code": site_code,
         "source_sheet_label": "export_product",
         "source_spreadsheet_title": getattr(sh_source, "title", ""),
         "view_count": len(results),
+        "written_view_count": len(results) - len(skipped_results),
+        "skipped_view_count": len(skipped_results),
+        "warning_count": len(warning_results),
         "output_sheet_labels": sorted(output_sheet_cache.keys()),
         "results": results,
         "finished_at": _now_ts(),
