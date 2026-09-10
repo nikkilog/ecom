@@ -19,7 +19,7 @@ Console_Core_Colab
 ```
 
 For the validated Product IDX Runner, Local execution uses only the canonical
-checkout at `/Users/nikki/Documents/AI_Workspace/Projects/Console_Core`. Local
+checkout at `/Users/nikki/Documents/AI_Workspace_Next/Projects/Console_Core`. Local
 must fail closed when that checkout or the target module is unavailable; it
 must not create, search for, or fall back to `.runtime/ecom` or another local
 checkout. Colab may create a clean, temporary Git clone at `/content/ecom`.
@@ -27,6 +27,28 @@ That clone is ephemeral Runtime material and never a second source of truth or
 an independent Current.
 
 Notebook code should progressively shrink to configuration, loading, invocation, and presentation. Core business logic belongs in Git-hosted Python modules.
+
+For the PBS OtherSize/Product-Group Runner, the Git-hosted business owner is
+`shopify_pre_edit.0_4_1_product_relationship_mappings`. The Runner must not
+embed a second copy of its grouping, ordering, reverse-matching, warning, or
+deduplication logic. Config owns route labels, Tab names, safe write switches,
+and an exact expected module version; Load owns authentication and provenance;
+Run loads both complete inputs, builds and validates all four tables in memory,
+shows the plan, then applies the write gate.
+
+Its default must be `DRY_RUN=True` and `CONFIRMED=False`. Dry Run must not
+create, resize, clear, or write a worksheet. A confirmed write may affect only
+the four allowlisted Tabs. It must resolve or create every required Tab before
+clearing any old value, then clear and overwrite each complete table. After
+writing, it must read back and compare the exact header, data-row count, and a
+deterministic content hash for every Tab. Partial clear/write/read-back failure
+is `PARTIAL_SUCCESS` or `FAILED_EXECUTION`, never `SUCCESS`.
+
+Progress should summarize QA counts by stable type and show only bounded
+examples by default. Full row-level diagnostics remain available in the four
+tables and structured result; uncontrolled printing of every event is not the
+normal Current contract. A static generator-model label is not Runtime
+provenance and must not be emitted as one.
 
 The Console Core Git repository is Current for Python, tests, and formal
 documentation. `Console_Core_Colab` carries Notebook entry points and Runtime

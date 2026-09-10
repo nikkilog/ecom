@@ -78,6 +78,14 @@ Overall status: `ACTIVE_BUT_UNVALIDATED`
 - `entries_create_wide_to_long.py`
 - `entries_update_wide_to_long.py`
 - `wide_to_media_edits.py`
+- `0_4_1_product_relationship_mappings.py`: PBS-specific, side-effect-free
+  builder for `M_OtherSize_E`, `M_OtherSize_W`, `M_Product-Group_E`, and
+  `M_Product-Group_W`. It consumes already-loaded Product View and `Size顺序`
+  records and returns a complete four-table plan with deterministic ordering,
+  row status, structured diagnostics, and reconciliation counters. Sheet
+  routing and writes remain Runner responsibilities. Status:
+  `ACTIVE_BUT_UNVALIDATED` pending exact-current thin-Runner alignment and a
+  clean-kernel run.
 
 Intended boundary: transform human-editable wide inputs into validated machine-facing long, block, skeleton, or edit contracts. It should not directly write Shopify.
 

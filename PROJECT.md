@@ -3,7 +3,7 @@
 ```text
 PROJECT_ID: CONSOLE_CORE
 PROJECT_NAME: Console Core
-REPOSITORY_PATH: /Users/nikki/Documents/AI_Workspace/Projects/Console_Core
+REPOSITORY_PATH: /Users/nikki/Documents/AI_Workspace_Next/Projects/Console_Core
 LIFECYCLE: ONBOARDING
 MAINTENANCE_PROFILE: COMPLEX
 CURRENT_AUTHORITY: This PROJECT.md for project state and routing; the Console_Core Git main branch for Python, requirements, tests, and formal project documentation
@@ -36,7 +36,7 @@ Detailed package status is owned by `docs/CODE_MAP.md`. Data stages and ownershi
 
 - This file is authoritative for project identity, lifecycle, current phase, boundary, maintenance map, and the unique next action.
 - The `Console_Core` Git repository on `main` is authoritative for Python source, requirements, future tests, and formal project documentation.
-- `/Users/nikki/Documents/AI_Workspace/Projects/Console_Core_Colab` is a Notebook Runner / operational workspace. It is not authoritative for Python source or Git history.
+- `/Users/nikki/Documents/AI_Workspace_Next/Projects/Console_Core_Colab` is a Notebook Runner / operational workspace. It is not authoritative for Python source or Git history.
 - `Console_Core_Colab/PBS/07. create_product/generic/.runtime/ecom` is a disposable Runtime Cache. It may be rebuilt from Git and is not a second source repository or an independent project.
 - Google Sheets, the central Console workbook, Google Drive, Colab Runtime state, and Shopify are operational resources. They do not silently override local Git Current.
 

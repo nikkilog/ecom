@@ -27,10 +27,13 @@ from typing import Any, Iterable, Optional
 
 
 MODULE_PATH = "shopify_sync.1_5_1_edit_files"
-MODULE_VERSION = "2026-09-02-edit-files-v1"
+MODULE_VERSION = "2026-09-06-edit-files-batched-v2"
 DEFAULT_JOB_NAME = "edit_files"
 DEFAULT_INPUT_SHEET_LABEL = "edit"
 DEFAULT_INPUT_TAB = "Edit_File"
+PRODUCT_MEDIA_BATCH_SIZE = 80
+DEFAULT_FILE_UPDATE_BATCH_SIZE = 25
+DEFAULT_PLAN_PROGRESS_EVERY_PRODUCTS = 10
 
 INPUT_COLUMNS = [
     "product_gid_or_handle",
@@ -279,6 +282,16 @@ def _fetch_file_info(client, file_ids: list[str]) -> dict[str, dict[str, str]]:
 
 
 def _fetch_product_media(client, product_gid: str) -> Optional[list[str]]:
+    return _fetch_product_media_tail(client, product_gid, [], None)
+
+
+def _fetch_product_media_tail(
+    client,
+    product_gid: str,
+    initial_ids: list[str],
+    after: Optional[str],
+) -> Optional[list[str]]:
+    """Read Product media from ``after``, preserving an already-read first page."""
     runtime = _runtime_module()
     query = """
     query EditFilesProductMedia($id: ID!, $after: String) {
@@ -291,8 +304,7 @@ def _fetch_product_media(client, product_gid: str) -> Optional[list[str]]:
       }
     }
     """
-    media_ids: list[str] = []
-    after = None
+    media_ids = list(initial_ids)
     while True:
         data = runtime.gql(client, query, {"id": product_gid, "after": after})
         product = data.get("product")
@@ -304,6 +316,75 @@ def _fetch_product_media(client, product_gid: str) -> Optional[list[str]]:
         if not page.get("hasNextPage"):
             return [item for item in media_ids if item]
         after = page.get("endCursor")
+        if not after:
+            raise RuntimeError(
+                f"Product media pagination returned no endCursor: {product_gid}"
+            )
+
+
+def _fetch_product_media_map(
+    client,
+    product_ids: list[str],
+    chunk_size: int = PRODUCT_MEDIA_BATCH_SIZE,
+) -> dict[str, Optional[list[str]]]:
+    """Read first media pages for many Products with one ``nodes`` query per chunk.
+
+    Products with more than 250 media items continue from the returned cursor
+    through the existing single-Product pagination path. Missing or non-Product
+    nodes map to ``None`` so plan validation still fails closed.
+    """
+    runtime = _runtime_module()
+    query = """
+    query EditFilesProductMediaNodes($ids: [ID!]!) {
+      nodes(ids: $ids) {
+        id
+        __typename
+        ... on Product {
+          media(first: 250) {
+            nodes { id }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      }
+    }
+    """
+    unique_ids = list(
+        dict.fromkeys(_norm(value) for value in product_ids if _norm(value))
+    )
+    result: dict[str, Optional[list[str]]] = {
+        product_gid: None for product_gid in unique_ids
+    }
+    size = min(PRODUCT_MEDIA_BATCH_SIZE, max(1, int(chunk_size)))
+    for part in _chunks(unique_ids, size):
+        data = runtime.gql(client, query, {"ids": part})
+        for node in data.get("nodes") or []:
+            if not node or _norm(node.get("__typename")) != "Product":
+                continue
+            product_gid = _norm(node.get("id"))
+            if product_gid not in result:
+                continue
+            connection = node.get("media") or {}
+            media_ids = [
+                _norm(item.get("id"))
+                for item in connection.get("nodes") or []
+                if _norm((item or {}).get("id"))
+            ]
+            page = connection.get("pageInfo") or {}
+            if page.get("hasNextPage"):
+                after = _norm(page.get("endCursor"))
+                if not after:
+                    raise RuntimeError(
+                        f"Product media pagination returned no endCursor: {product_gid}"
+                    )
+                result[product_gid] = _fetch_product_media_tail(
+                    client,
+                    product_gid,
+                    media_ids,
+                    after,
+                )
+            else:
+                result[product_gid] = media_ids
+    return result
 
 
 def _fetch_product_file_refs(client, product_gid: str) -> set[str]:
@@ -335,7 +416,7 @@ def _fetch_product_file_refs(client, product_gid: str) -> set[str]:
         after = page.get("endCursor")
 
 
-def _file_update(client, *, file_gid: str, product_gid: str, add: bool) -> None:
+def _file_update_payload(client, inputs: list[dict[str, Any]]) -> dict[str, Any]:
     runtime = _runtime_module()
     mutation = """
     mutation EditFilesReference($files: [FileUpdateInput!]!) {
@@ -345,16 +426,205 @@ def _file_update(client, *, file_gid: str, product_gid: str, add: bool) -> None:
       }
     }
     """
-    field = "referencesToAdd" if add else "referencesToRemove"
-    data = runtime.gql(
-        client,
-        mutation,
-        {"files": [{"id": file_gid, field: [product_gid]}]},
+    data = runtime.gql(client, mutation, {"files": inputs})
+    return data.get("fileUpdate") or {}
+
+
+def _file_update_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate Product-reference rows into one FileUpdateInput per File GID."""
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        op = row.get("_association_op", "")
+        if op not in {"ADD", "REMOVE"}:
+            continue
+        file_gid = row["file_gid"]
+        group = grouped.setdefault(
+            file_gid,
+            {
+                "input": {"id": file_gid},
+                "rows": [],
+                "rows_by_field": defaultdict(list),
+            },
+        )
+        field = "referencesToAdd" if op == "ADD" else "referencesToRemove"
+        group["input"].setdefault(field, []).append(row["_product_gid"])
+        group["rows"].append(row)
+        group["rows_by_field"][field].append(row)
+    return list(grouped.values())
+
+
+def _file_update_error_rows(
+    error: dict[str, Any],
+    batch: list[dict[str, Any]],
+) -> Optional[list[dict[str, Any]]]:
+    """Resolve an indexed Shopify userError to the narrowest affected rows."""
+    field_path = error.get("field")
+    if not isinstance(field_path, list):
+        return None
+    tokens = [str(token) for token in field_path]
+    try:
+        files_index = tokens.index("files")
+        input_index = int(tokens[files_index + 1])
+    except (ValueError, IndexError):
+        return None
+    if not 0 <= input_index < len(batch):
+        return None
+
+    group = batch[input_index]
+    for reference_field in ("referencesToAdd", "referencesToRemove"):
+        if reference_field not in tokens:
+            continue
+        field_index = tokens.index(reference_field)
+        field_rows = group["rows_by_field"].get(reference_field) or []
+        try:
+            reference_index = int(tokens[field_index + 1])
+        except (ValueError, IndexError):
+            return list(field_rows) or list(group["rows"])
+        if 0 <= reference_index < len(field_rows):
+            return [field_rows[reference_index]]
+        return list(field_rows) or list(group["rows"])
+    return list(group["rows"])
+
+
+def _apply_file_update_batches(
+    client,
+    rows: list[dict[str, Any]],
+    batch_size: int = DEFAULT_FILE_UPDATE_BATCH_SIZE,
+) -> dict[str, Any]:
+    """Apply File reference updates in batches with bounded row isolation.
+
+    Shopify can return a field path containing only ``files``. When such a
+    validation error returns zero updated files, the rejected batch is split
+    until the responsible File or Product-reference row is isolated. Transport
+    exceptions are not replayed here because the remote side effect is unknown.
+    """
+    groups = _file_update_groups(rows)
+    size = min(250, max(1, int(batch_size or 1)))
+    total_batches = (len(groups) + size - 1) // size if groups else 0
+    succeeded_rows: set[int] = set()
+    failed_rows: dict[int, str] = {}
+    attempted_batches = 0
+
+    print(
+        f"[FileUpdate] relations={len(rows)} | files={len(groups)} | "
+        f"batches={total_batches} | batch_size={size}",
+        flush=True,
     )
-    payload = data.get("fileUpdate") or {}
-    errors = payload.get("userErrors") or []
-    if errors:
-        raise RuntimeError("fileUpdate userErrors: " + json.dumps(errors, ensure_ascii=False))
+
+    def execute_batch(
+        batch: list[dict[str, Any]],
+        *,
+        batch_label: str,
+    ) -> None:
+        nonlocal attempted_batches
+        attempted_batches += 1
+        batch_rows = [row for group in batch for row in group["rows"]]
+        try:
+            payload = _file_update_payload(
+                client,
+                [group["input"] for group in batch],
+            )
+        except Exception as exc:
+            reason = f"{type(exc).__name__}:{exc}"
+            for row in batch_rows:
+                failed_rows[int(row["_sheet_row"])] = reason
+            print(
+                f"[FileUpdate] batch={batch_label} | "
+                f"relations={len(batch_rows)} | ok=0 | failed={len(batch_rows)}",
+                flush=True,
+            )
+            return
+
+        errors = payload.get("userErrors") or []
+        if not errors:
+            for row in batch_rows:
+                succeeded_rows.add(int(row["_sheet_row"]))
+            print(
+                f"[FileUpdate] batch={batch_label} | relations={len(batch_rows)} | "
+                f"ok={len(batch_rows)} | failed=0",
+                flush=True,
+            )
+            return
+
+        affected: dict[int, list[dict[str, Any]]] = {}
+        unindexed: list[dict[str, Any]] = []
+        for error in errors:
+            matched_rows = _file_update_error_rows(error, batch)
+            if matched_rows is None:
+                unindexed.append(error)
+                continue
+            for row in matched_rows:
+                affected.setdefault(int(row["_sheet_row"]), []).append(error)
+
+        updated_files = payload.get("files") or []
+        if unindexed and not updated_files:
+            if len(batch) > 1:
+                middle = len(batch) // 2
+                print(
+                    f"[FileUpdate] batch={batch_label} | unindexed_error | "
+                    f"isolating={len(batch_rows)} relations",
+                    flush=True,
+                )
+                execute_batch(
+                    batch[:middle],
+                    batch_label=batch_label + ".L",
+                )
+                execute_batch(
+                    batch[middle:],
+                    batch_label=batch_label + ".R",
+                )
+                return
+            if len(batch) == 1 and len(batch_rows) > 1:
+                middle = len(batch_rows) // 2
+                left = _file_update_groups(batch_rows[:middle])
+                right = _file_update_groups(batch_rows[middle:])
+                print(
+                    f"[FileUpdate] batch={batch_label} | unindexed_error | "
+                    f"isolating={len(batch_rows)} relations",
+                    flush=True,
+                )
+                execute_batch(
+                    left,
+                    batch_label=batch_label + ".L",
+                )
+                execute_batch(
+                    right,
+                    batch_label=batch_label + ".R",
+                )
+                return
+
+        if unindexed:
+            for row in batch_rows:
+                affected.setdefault(int(row["_sheet_row"]), []).extend(unindexed)
+
+        for row in batch_rows:
+            sheet_row = int(row["_sheet_row"])
+            row_errors = affected.get(sheet_row) or []
+            if row_errors:
+                failed_rows[sheet_row] = (
+                    "fileUpdate userErrors: "
+                    + json.dumps(row_errors, ensure_ascii=False)[:1000]
+                )
+            else:
+                succeeded_rows.add(sheet_row)
+
+        print(
+            f"[FileUpdate] batch={batch_label} | "
+            f"relations={len(batch_rows)} | "
+            f"ok={len(batch_rows) - len(affected)} | failed={len(affected)}",
+            flush=True,
+        )
+
+    for batch_no, batch in enumerate(_chunks(groups, size), start=1):
+        execute_batch(batch, batch_label=f"{batch_no}/{total_batches}")
+
+    return {
+        "succeeded_rows": succeeded_rows,
+        "failed_rows": failed_rows,
+        "file_inputs": len(groups),
+        "batches_planned": total_batches,
+        "batches_attempted": attempted_batches,
+    }
 
 
 def _start_reorder(client, product_gid: str, moves: list[dict[str, str]]) -> str:
@@ -482,6 +752,8 @@ def run(
     async_timeout_seconds: int = 120,
     poll_seconds: float = 2.0,
     writeback_chunk_size: int = 50,
+    file_update_batch_size: int = DEFAULT_FILE_UPDATE_BATCH_SIZE,
+    plan_progress_every_products: int = DEFAULT_PLAN_PROGRESS_EVERY_PRODUCTS,
 ) -> dict[str, Any]:
     """Preview or apply Edit_File rows.
 
@@ -538,6 +810,9 @@ def run(
         "rows_blocked": 0,
         "rows_failed": 0,
         "rows_skipped": 0,
+        "file_update_inputs_planned": 0,
+        "file_update_batches_planned": 0,
+        "file_update_batches_attempted": 0,
     }
     print(
         f"[Input] physical_rows={physical_rows} | loaded={len(all_rows)} | "
@@ -629,75 +904,124 @@ def run(
         if row["_decision"] != "BLOCK":
             groups[row["_product_gid"]].append(row)
 
+    product_ids = list(groups)
+    media_map = _fetch_product_media_map(
+        client,
+        product_ids,
+        chunk_size=PRODUCT_MEDIA_BATCH_SIZE,
+    )
+    media_batches = (
+        (len(product_ids) + PRODUCT_MEDIA_BATCH_SIZE - 1) // PRODUCT_MEDIA_BATCH_SIZE
+        if product_ids
+        else 0
+    )
+    print(
+        f"[Plan] products={len(product_ids)} | media_batches={media_batches} | "
+        f"refs_products_max={len(product_ids)}",
+        flush=True,
+    )
+
     product_state: dict[str, dict[str, Any]] = {}
+    progress_every = max(1, int(plan_progress_every_products or 1))
+    progress_counts = Counter()
     for index, (product_gid, group) in enumerate(groups.items(), start=1):
-        media = _fetch_product_media(client, product_gid)
+        media = media_map.get(product_gid)
         if media is None:
             for row in group:
                 row["_decision"] = "BLOCK"
                 row["_reason"] = "product_not_found"
-            continue
-        refs = _fetch_product_file_refs(client, product_gid)
-        product_state[product_gid] = {"media": media, "refs": refs}
-        media_position = {file_gid: pos for pos, file_gid in enumerate(media, start=1)}
-        projected_count = len(media)
-        for row in group:
-            attached = row["file_gid"] in refs
-            row["_attached"] = attached
-            row["_current_position"] = media_position.get(row["file_gid"], "")
-            action = row["action"]
-            if action == "ADD":
-                if attached and row["_media_position"] is None:
-                    row["_decision"] = "NO_CHANGE"
-                    row["_reason"] = "already_associated"
-                else:
-                    row["_decision"] = "APPLY"
-                    row["_association_op"] = "" if attached else "ADD"
-                    if not attached and row.get("_file_type") in ORDERABLE_FILE_TYPES:
-                        projected_count += 1
-            elif action == "REMOVE":
-                if not attached:
-                    row["_decision"] = "NO_CHANGE"
-                    row["_reason"] = "not_associated"
-                else:
-                    row["_decision"] = "APPLY"
-                    row["_association_op"] = "REMOVE"
-                    if row["file_gid"] in media:
-                        projected_count -= 1
-            elif action == "REORDER":
-                if row["file_gid"] not in media:
-                    row["_decision"] = "BLOCK"
-                    row["_reason"] = "REORDER_requires_existing_product_media"
-                else:
-                    # Keep every position directive in the same final-order
-                    # constraint set. A different move could otherwise displace
-                    # a row that happened to start at its requested position.
-                    row["_decision"] = "APPLY"
-                    row["_association_op"] = ""
+        else:
+            refs = _fetch_product_file_refs(client, product_gid)
+            product_state[product_gid] = {"media": media, "refs": refs}
+            media_position = {file_gid: pos for pos, file_gid in enumerate(media, start=1)}
+            projected_count = len(media)
+            for row in group:
+                attached = row["file_gid"] in refs
+                row["_attached"] = attached
+                row["_current_position"] = media_position.get(row["file_gid"], "")
+                action = row["action"]
+                if action == "ADD":
+                    if attached and row["_media_position"] is None:
+                        row["_decision"] = "NO_CHANGE"
+                        row["_reason"] = "already_associated"
+                    else:
+                        row["_decision"] = "APPLY"
+                        row["_association_op"] = "" if attached else "ADD"
+                        if not attached and row.get("_file_type") in ORDERABLE_FILE_TYPES:
+                            projected_count += 1
+                elif action == "REMOVE":
+                    if not attached:
+                        row["_decision"] = "NO_CHANGE"
+                        row["_reason"] = "not_associated"
+                    else:
+                        row["_decision"] = "APPLY"
+                        row["_association_op"] = "REMOVE"
+                        if row["file_gid"] in media:
+                            projected_count -= 1
+                elif action == "REORDER":
+                    if row["file_gid"] not in media:
+                        row["_decision"] = "BLOCK"
+                        row["_reason"] = "REORDER_requires_existing_product_media"
+                    else:
+                        # Keep every position directive in the same final-order
+                        # constraint set. A different move could otherwise displace
+                        # a row that happened to start at its requested position.
+                        row["_decision"] = "APPLY"
+                        row["_association_op"] = ""
 
-        for row in group:
-            position = row["_media_position"]
-            if (
-                row["_decision"] == "APPLY"
-                and position is not None
-                and position > projected_count
-            ):
-                row["_decision"] = "BLOCK"
-                row["_reason"] = (
-                    f"media_position_out_of_range:{position};"
-                    f"projected_media_count={projected_count}"
-                )
-        print(
-            f"[Plan] product {index}/{len(groups)} | {product_gid} | "
-            f"rows={len(group)} | refs={len(refs)} | media={len(media)}",
-            flush=True,
-        )
+            for row in group:
+                position = row["_media_position"]
+                if (
+                    row["_decision"] == "APPLY"
+                    and position is not None
+                    and position > projected_count
+                ):
+                    row["_decision"] = "BLOCK"
+                    row["_reason"] = (
+                        f"media_position_out_of_range:{position};"
+                        f"projected_media_count={projected_count}"
+                    )
+
+        progress_counts.update(row["_decision"] for row in group)
+        if index % progress_every == 0 or index == len(groups):
+            print(
+                f"[Plan] completed={index}/{len(groups)} | "
+                f"apply={progress_counts['APPLY']} | "
+                f"no_change={progress_counts['NO_CHANGE']} | "
+                f"blocked={progress_counts['BLOCK']}",
+                flush=True,
+            )
 
     summary["rows_recognized"] = sum(row["_decision"] != "BLOCK" for row in rows)
     summary["rows_planned"] = sum(row["_decision"] == "APPLY" for row in rows)
     summary["rows_no_change"] = sum(row["_decision"] == "NO_CHANGE" for row in rows)
     summary["rows_blocked"] = sum(row["_decision"] == "BLOCK" for row in rows)
     summary["rows_skipped"] = summary["rows_no_change"] + summary["rows_blocked"]
+    association_rows = [
+        row
+        for row in rows
+        if row["_decision"] == "APPLY"
+        and row.get("_association_op") in {"ADD", "REMOVE"}
+    ]
+    file_update_groups = _file_update_groups(association_rows)
+    effective_file_update_batch_size = min(
+        250,
+        max(1, int(file_update_batch_size or 1)),
+    )
+    summary["file_update_inputs_planned"] = len(file_update_groups)
+    summary["file_update_batches_planned"] = (
+        (len(file_update_groups) + effective_file_update_batch_size - 1)
+        // effective_file_update_batch_size
+        if file_update_groups
+        else 0
+    )
+    print(
+        f"[Plan] DONE | products={len(groups)} | rows={len(rows)} | "
+        f"apply={summary['rows_planned']} | no_change={summary['rows_no_change']} | "
+        f"blocked={summary['rows_blocked']} | "
+        f"file_update_batches={summary['file_update_batches_planned']}",
+        flush=True,
+    )
     preview = [_row_result(row) for row in rows[: max(0, int(preview_limit))]]
     warnings = []
     blocked = [item for item in preview if item["decision"] == "BLOCK"]
@@ -741,6 +1065,24 @@ def run(
     }
     failed_rows: set[int] = set()
 
+    batch_result = _apply_file_update_batches(
+        client,
+        association_rows,
+        batch_size=effective_file_update_batch_size,
+    )
+    summary["file_update_batches_attempted"] = batch_result["batches_attempted"]
+    failed_reasons = batch_result["failed_rows"]
+    for row in association_rows:
+        sheet_row = int(row["_sheet_row"])
+        if sheet_row in failed_reasons:
+            row["_result"] = "FAILED"
+            row["_reason"] = failed_reasons[sheet_row]
+            failed_rows.add(sheet_row)
+        else:
+            row["_result"] = f"{row['_association_op']}_OK"
+            if row["_media_position"] is None:
+                completed_rows.add(sheet_row)
+
     for product_index, (product_gid, group) in enumerate(groups.items(), start=1):
         active = [row for row in group if row["_decision"] == "APPLY"]
         if not active:
@@ -749,25 +1091,6 @@ def run(
             f"[Apply] product {product_index}/{len(groups)} | {product_gid} | rows={len(active)}",
             flush=True,
         )
-        for row in active:
-            op = row.get("_association_op", "")
-            if not op:
-                continue
-            try:
-                _file_update(
-                    client,
-                    file_gid=row["file_gid"],
-                    product_gid=product_gid,
-                    add=(op == "ADD"),
-                )
-                row["_result"] = f"{op}_OK"
-                if row["_media_position"] is None:
-                    completed_rows.add(int(row["_sheet_row"]))
-            except Exception as exc:
-                row["_result"] = "FAILED"
-                row["_reason"] = f"{type(exc).__name__}:{exc}"
-                failed_rows.add(int(row["_sheet_row"]))
-
         ordered_rows = [
             row for row in active
             if row["_media_position"] is not None
@@ -865,6 +1188,8 @@ __all__ = [
     "MODULE_PATH",
     "MODULE_VERSION",
     "INPUT_COLUMNS",
+    "PRODUCT_MEDIA_BATCH_SIZE",
+    "DEFAULT_FILE_UPDATE_BATCH_SIZE",
     "validate_input_rows",
     "build_target_media_order",
     "resolve_runtime_context",

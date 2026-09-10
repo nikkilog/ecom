@@ -107,6 +107,42 @@ Authority rules:
 
 Pre Edit does not own Shopify side effects.
 
+#### PBS Product Relationship Mapping
+
+The PBS relationship-mapping transformation is site-specific Pre Edit logic:
+
+```text
+export_product_view_1 / V_V_Price Matrix
++ PBS Console Core / Size顺序
+→ M_OtherSize_E + M_Product-Group_E
+→ Variant Base reverse match to Wholesale
+→ M_OtherSize_W + M_Product-Group_W
+```
+
+E rows retain the filtered source-row grain after exact input deduplication.
+Within each nonblank `SPU-V`, unique Product IDs are ordered by the exact
+`Size顺序` dictionary; unknown, blank, or conflicting target sizes follow all
+mapped sizes and use numeric Product ID only as a deterministic tie-breaker.
+OtherSize excludes the row's current Product ID, while Product Group includes
+it and is identical across successful rows in the same `SPU-V`.
+
+W does not regroup or reorder Wholesale data. It replaces the current owner by
+reverse-matching the E row's normalized `Variant Base` and inherits the E
+`desired_value` unchanged. A successful W mapping has business key:
+
+```text
+Wholesale Product ID + desired_value
+```
+
+Physical deduplication removes only exact four-column output rows; rows with
+different inherited diagnostics are retained. Multiple distinct values for
+one Wholesale Product ID remain successful warning rows under the confirmed
+business rule, but any downstream Apply must fail closed on that ambiguity
+rather than choose a value. Diagnostic failure rows keep a blank target
+Product ID and carry the source E Product ID and Variant Base in a stable
+detailed error. Downstream consumers must select only `是否成功 = 是`; the status
+and diagnostic columns are part of the handoff contract, not metafield values.
+
 ### 4. Review
 
 Purpose:

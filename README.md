@@ -62,7 +62,7 @@ Real external writes require both `DRY_RUN = False` and `CONFIRMED = True`. Full
 Install the formal shared package from the canonical Local checkout:
 
 ```bash
-python3 -m pip install -e /Users/nikki/Documents/AI_Workspace/Projects/Console_Core
+python3 -m pip install -e /Users/nikki/Documents/AI_Workspace_Next/Projects/Console_Core
 ```
 
 Import the target-resource resolver with:
