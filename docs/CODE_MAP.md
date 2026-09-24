@@ -183,6 +183,12 @@ output stops at step 5/10 and is not completed Dry Run evidence. No Collection
 creation, publication, Live readback, business reconciliation, or user
 acceptance is established.
 
+Static review also found a Live-recovery gap: the current Apply result row is
+populated with the new Collection GID only after publication and readback both
+succeed. If creation succeeds and either later step fails, the failure Result
+may omit the created GID required for safe recovery. This does not affect the
+next Dry Run, but it must be corrected and validated before Live execution.
+
 The sibling Collection Runners are operational assets, not Python Current.
 Their present expected-version checks do not fail closed. The Apply Runner also
 expects the Input version string for the Apply module and currently displays
