@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Apply READY Shopify Flexible Collection creation plans from Preview.
 
-GitHub target: ``ecom/shopify_create/7_5_2_collection_create_apply.py``
-Import path: ``shopify_create.7_5_2_collection_create_apply``
+GitHub target: ``ecom/shopify_create/7_5_3_collection_create_apply.py``
+Import path: ``shopify_create.7_5_3_collection_create_apply``
 
 Execution contract
 ------------------
@@ -30,14 +30,14 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
 
-cp = importlib.import_module("shopify_create.7_5_1_collection_create_prepare")
+cp = importlib.import_module("shopify_create.7_5_2_collection_create_input")
 gp = importlib.import_module("shopify_create.7_1_1_generic_product_prepare")
 ga = importlib.import_module("shopify_create.7_1_2_generic_product_apply")
 
-MODULE_VERSION = "2026-09-04-flexible-collection-create-v1"
-MODULE_PATH = "shopify_create.7_5_2_collection_create_apply"
+MODULE_VERSION = "2026-09-23-flexible-collection-create-v2"
+MODULE_PATH = "shopify_create.7_5_3_collection_create_apply"
 DEFAULT_JOB_NAME = "collection_create_apply"
-EXPECTED_PREPARE_MODULE_VERSION = cp.MODULE_VERSION
+EXPECTED_INPUT_MODULE_VERSION = cp.MODULE_VERSION
 
 RESULT_HEADERS = [
     "run_id",
@@ -155,7 +155,7 @@ query CollectionReadback($id: ID!) {
 
 def _read_preview(values: Sequence[Sequence[Any]]) -> Dict[str, Dict[str, str]]:
     if not values:
-        raise ValueError("Preview is empty. Run collection_create_prepare first.")
+        raise ValueError("Preview is empty. Run collection_create_input first.")
     headers = [cp._normalize_header(v) for v in values[0]]
     positions = {name: idx for idx, name in enumerate(headers) if name}
     required = {
@@ -231,7 +231,7 @@ def _select_handles(
     if not selected:
         raise ValueError(
             "No READY Collections are available to Apply. Review Preview/BLOCKED reasons "
-            "and run collection_create_prepare again after corrections."
+            "and run collection_create_input again after corrections."
         )
 
     for handle in selected:
@@ -267,7 +267,7 @@ def _verify_preview_hashes(
     if mismatches:
         raise RuntimeError(
             "Preview is stale or Input/Defaults/Shopify metadata changed after Prepare. "
-            "Run collection_create_prepare again. "
+            "Run collection_create_input again. "
             f"mismatches={mismatches[:10]}"
         )
     return {"status": "MATCHED", "checked": len(selected), "mismatches": []}
@@ -392,10 +392,10 @@ def run(
         raise ValueError("site_code is required.")
     if not dry_run and not confirmed:
         raise ValueError("Live Collection Apply requires confirmed=True.")
-    if cp.MODULE_VERSION != EXPECTED_PREPARE_MODULE_VERSION:
+    if cp.MODULE_VERSION != EXPECTED_INPUT_MODULE_VERSION:
         raise RuntimeError(
-            "Prepare module version mismatch. "
-            f"expected={EXPECTED_PREPARE_MODULE_VERSION}; loaded={cp.MODULE_VERSION}"
+            "Input module version mismatch. "
+            f"expected={EXPECTED_INPUT_MODULE_VERSION}; loaded={cp.MODULE_VERSION}"
         )
 
     run_id = run_id or gp._make_run_id(job_name, tz_name)
