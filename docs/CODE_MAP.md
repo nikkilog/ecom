@@ -152,6 +152,42 @@ Overall status: `EXPERIMENTAL`
   Product workers. Result and RunLog Google Sheets writes remain on the main
   thread through a single quota-safe writer with batching, minimum flush
   interval, pre-sizing, and retry protection.
+- `7_5_1_collection_create_prepare.py`: Current module version
+  `2026-09-23-collection-create-prepare-v2`. It converts a wide `Prepare` row
+  into condition-grain `Input`, supports dynamic ordered condition/value
+  pairs and mixed supported condition types, and resolves Product metafield
+  display names through `Cfg__Fields`. It performs no Shopify access.
+- `7_5_2_collection_create_input.py`: Current module version
+  `2026-09-23-flexible-collection-create-input-v2`. It groups Input by
+  normalized Collection handle, resolves current Shopify condition metadata,
+  applies canonical `AUTO` relations, checks handle availability, and writes
+  a hash-bound READY/BLOCKED Preview. Shopify access is read-only; Defaults,
+  Preview, and RunLog remain disclosed Google Sheets side effects.
+- `7_5_3_collection_create_apply.py`: Current module version
+  `2026-09-23-flexible-collection-create-v2`; it imports the Current Input
+  module. It rebuilds plans from current Input, Defaults, and Shopify facts,
+  requires matching READY Preview hashes, rechecks handle availability, and
+  defaults to `dry_run=True`, `confirmed=False`. Confirmed Live execution may
+  create a Collection, publish it to accessible Publications when configured,
+  and verify handle, condition count, and match type by readback.
+
+Collection Create uses the Flexible Collection `sources` model with a scoped
+effective Shopify API version of `2026-07` or later. The account-level API
+configuration is not globally rewritten.
+
+Current Collection evidence level is `STATICALLY_VERIFIED` for all three
+exact Git files. Exact-byte Runtime evidence additionally covers a successful
+Prepare write of four Input condition rows for one Collection and a successful
+Input run that wrote one READY Preview after Shopify reads. The saved Apply
+output stops at step 5/10 and is not completed Dry Run evidence. No Collection
+creation, publication, Live readback, business reconciliation, or user
+acceptance is established.
+
+The sibling Collection Runners are operational assets, not Python Current.
+Their present expected-version checks do not fail closed. The Apply Runner also
+expects the Input version string for the Apply module and currently displays
+`DRY_RUN=False`, `CONFIRMED=True`; it must be repaired in a separately scoped
+`Console_Core_Colab` task before operational acceptance.
 
 The area is still under design and construction. Existing generic, legacy, wholesale, and SPU preparation paths do not yet establish one final common product-creation contract.
 

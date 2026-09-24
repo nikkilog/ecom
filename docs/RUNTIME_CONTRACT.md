@@ -264,6 +264,68 @@ EXPECTED_MODULE_VERSION = <approved version>
 
 Failure of any required gate returns a Preview, `SKIPPED`, or validation failure without real business-object writes.
 
+## Flexible Collection Create Current
+
+The Collection Create Runtime is a three-job chain:
+
+```text
+collection_create_prepare | Prepare → Input
+collection_create_input   | Input → Preview
+collection_create_apply   | Preview selection → Result
+```
+
+The canonical modules and exact expected versions are:
+
+```text
+shopify_create.7_5_1_collection_create_prepare
+2026-09-23-collection-create-prepare-v2
+
+shopify_create.7_5_2_collection_create_input
+2026-09-23-flexible-collection-create-input-v2
+
+shopify_create.7_5_3_collection_create_apply
+2026-09-23-flexible-collection-create-v2
+```
+
+Every related Runner must fail closed on a module-path or expected-version
+mismatch. Printing a notice and continuing is not an acceptable gate. Runtime
+provenance must include Git commit plus the loaded module path, version, and a
+safe source fingerprint such as module SHA-256; Git HEAD alone does not prove
+the imported bytes when a worktree is dirty. Saved Notebook output is run
+history and cannot prove that a cell or run completed.
+
+Flexible Collection `sources` operations require Shopify API `2026-07` or
+later. Collection Input and Apply may raise their client to a scoped effective
+version while leaving the configured account version unchanged. Runtime output
+must show both configured and effective versions and whether the scoped upgrade
+occurred.
+
+Prepare does not call Shopify. It may overwrite `Input` and append RunLog
+evidence. Input performs Shopify reads only; it may seed `Defaults`, overwrite
+`Preview`, and append RunLog evidence. Apply must rebuild plans from current
+Input, Defaults, and Shopify facts, require matching READY `plan_hash` values,
+and recheck every selected handle immediately before creation.
+
+Apply defaults must be:
+
+```text
+DRY_RUN = True
+CONFIRMED = False
+```
+
+Dry Run performs no Shopify mutation, but may overwrite `Result` and append
+RunLog evidence. Those Sheet writes, along with any Defaults seeding, must be
+disclosed as actual side effects. Live execution requires both
+`DRY_RUN=False` and `CONFIRMED=True`. Creation, publication, and readback are
+separate outcomes; later failure after creation is partial execution and must
+retain the created Collection GID and recovery context.
+
+The current sibling Apply Runner is not operationally accepted: its Config
+shows live-write defaults, its expected Apply version equals the Input version,
+and version mismatches do not fail closed. Repair and a clean-kernel completed
+Dry Run are separate `Console_Core_Colab` work; saved output ending before the
+final Result is not Dry Run evidence.
+
 ## APOLLO Shipping Profile Assignment Current
 
 The stable Runner defaults to `DRY_RUN=True` and `CONFIRMED=False`. It requests

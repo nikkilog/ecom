@@ -52,6 +52,17 @@ Detailed package status is owned by `docs/CODE_MAP.md`. Data stages and ownershi
 - Existing Python and Notebook assets have been preserved in place.
 - Existing modules have not received end-to-end production validation as part of onboarding.
 - `shopify_create` remains under design and construction.
+- The three-stage Flexible Collection Create Python workflow is Current at Git
+  commit `25fdc986981c171e281dd05b732f8ee2e93816f6`: Prepare converts a
+  wide Collection row to condition-grain Input, Input builds a hash-bound
+  READY/BLOCKED Preview, and Apply rebuilds and verifies that plan before any
+  optional create, publication, and readback. Prepare and Input/Preview have
+  exact-byte run evidence; Apply has no completed Dry Run or Live evidence.
+- The corresponding Collection Notebook Runners exist in the sibling
+  workspace but are not safely aligned: their version mismatches do not fail
+  closed, and the Apply Runner currently has an incorrect expected Apply
+  version plus live-write Config defaults. Runner repair remains a separate
+  repository task.
 - Historical, empty, overlapping, and boundary-conflict candidates are recorded in `docs/CODE_MAP.md`; none have been deleted or retired.
 
 ## Explicitly Out of Scope
@@ -87,6 +98,7 @@ Detailed package status is owned by `docs/CODE_MAP.md`. Data stages and ownershi
 
 ## Next Action
 
-Run the stable APOLLO Shipping Profile Assignment Runner from a clean Colab
-kernel in safe Preview mode (`DRY_RUN=True`, `CONFIRMED=False`), including a
-missing-input-Tab fail-closed check, without repeating the completed full live Apply.
+In a separate `Console_Core_Colab` task, restore fail-closed expected-version
+gates and safe Apply defaults, then run Collection Create Apply from a clean
+kernel with `DRY_RUN=True` and `CONFIRMED=False` through a complete final
+result before considering any Live execution.

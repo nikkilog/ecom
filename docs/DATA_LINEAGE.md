@@ -151,6 +151,27 @@ Purpose:
 
 Review output must preserve a stable key so Apply can identify approved business objects without relying on row order. Approval is not a substitute for Apply-time validation against current configuration and Shopify state.
 
+Flexible Collection Create has three explicit handoffs:
+
+```text
+Prepare: one wide row per intended Collection
+→ Input: one row per Collection condition
+→ Preview: one READY/BLOCKED row per Collection handle
+→ Apply/Result: one selected Collection plan and one outcome per handle
+```
+
+The normalized Collection handle is the stable business-object key across
+Input, Preview, selection, existence checks, and Result. Input row order is
+not Collection identity. Rows sharing one handle form one Collection and must
+agree on title and `match_type`; each row carries one condition type, relation,
+and value, with namespace/key required for Product metafields. Prepare defaults
+generated groups to `ALL` and relations to `AUTO`.
+
+Preview owns the reviewed plan representation, not Shopify Current. Its
+`plan_hash` binds title, handle, match type, resolved conditions, publication
+choice, and mutation payload. READY is invalidated when current Input,
+Defaults, or Shopify metadata rebuilds to a different hash.
+
 Generic Create Input is Variant-grain. `sys.product_key` defines the Product
 group, so multiple Variant rows in one Product group normally share one
 `core.handle`. Prepare normalizes Handle with trim plus case-insensitive
@@ -191,6 +212,32 @@ Important distinctions:
 - rows/results actually written.
 
 These counts are not interchangeable.
+
+Flexible Collection Apply follows this specific execution path:
+
+```text
+current condition-grain Input + Defaults + Shopify metadata
+→ rebuild plans and current hashes
+→ select READY Preview handles
+→ require exact plan_hash agreement
+→ recheck handle availability immediately before Apply
+→ Dry Run: no Shopify mutation
+→ confirmed Live: create → optional publication → readback
+→ Result / RunLog
+```
+
+The Collection workflow uses Shopify API `2026-07` or later only within its
+own client boundary; it does not change the shared configured API version.
+Prepare may overwrite normalized Input. Input may seed Defaults and overwrite
+Preview. Apply Dry Run may overwrite Result and append RunLog evidence even
+though it performs no Shopify mutation. These Google Sheets effects are actual
+side effects and must not be reported as Shopify writes.
+
+Live Collection creation requires `DRY_RUN=False` and `CONFIRMED=True`.
+Publication is a separate Shopify operation after creation, and readback is a
+separate verification step. A created Collection followed by publication or
+readback failure is partial execution, not success; Result and RunLog evidence
+must preserve that distinction and the recovery identity.
 
 State-dependent operations must re-read current facts. Reference `LINK`, `UNLINK`, and `REPLACE_ALL` calculate differences from current values. `CLEAR` behavior is defined by field type and module. Variant updates prefer immutable IDs over the SKU being modified. Metaobject updates prefer `entry_gid`.
 
