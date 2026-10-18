@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-SCRIPT_BUILD = "2026-10-18-wide-keep-split-v1"
+SCRIPT_BUILD = "2026-10-18-wide-keep-split-v2"
 
 MODULE_PATH = "shopify_pre_edit.0_1_1_metafields_wide_to_long"
-MODULE_VERSION = "2026-10-18-wide-keep-split-v1"
+MODULE_VERSION = "2026-10-18-wide-keep-split-v2"
 DEFAULT_JOB_NAME = "wide_to_long"
 
 import base64
@@ -1564,13 +1564,16 @@ def resolve_field_type(field_key: str, meta: dict[str, str]) -> str:
         return ''
     ft = _canonical_type(meta.get('field_type', ''))
     dt = _canonical_type(meta.get('data_type', ''))
-    categories = {'metafield', 'core', 'field', 'native', 'calculated', 'display-only', 'display_only'}
-    candidates = [t for t in (ft, dt) if t and t not in categories]
-    if len(set(candidates)) > 1:
+    # Cfg__Fields.data_type owns the Shopify value type. field_type can be
+    # a registry category such as "raw"; never compare categories to data types.
+    # Keep compatibility with older configs that store a supported Shopify
+    # value type directly in field_type, but only when it really is a type.
+    ft_is_value_type = ft in SCALAR_TYPES or (ft.startswith('list.') and ft[5:] in LIST_TYPES)
+    if dt and ft_is_value_type and ft != dt:
         raise ValueError(f'{field_key}: field_type 与 data_type 不一致：{ft!r} / {dt!r}')
-    t = candidates[0] if candidates else ''
+    t = dt or (ft if ft_is_value_type else '')
     if not t:
-        raise ValueError(f'{field_key}: Cfg__Fields 缺少 Shopify 字段类型')
+        raise ValueError(f'{field_key}: Cfg__Fields 缺少 Shopify data_type（field_type={ft!r} 不是数据类型）')
     if t not in SCALAR_TYPES and not (t.startswith('list.') and t[5:] in LIST_TYPES):
         raise ValueError(f'{field_key}: 暂不支持字段类型 {t!r}，停止转换')
     return t
