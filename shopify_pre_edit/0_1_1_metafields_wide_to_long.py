@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-SCRIPT_BUILD = "2026-07-05-customer-order-owner-support"
+SCRIPT_BUILD = "2026-10-18-wide-keep-split-v1"
 
 MODULE_PATH = "shopify_pre_edit.0_1_1_metafields_wide_to_long"
-MODULE_VERSION = "2026-08-02-runtime-boundary-v1"
+MODULE_VERSION = "2026-10-18-wide-keep-split-v1"
 DEFAULT_JOB_NAME = "wide_to_long"
 
 import base64
@@ -14,6 +14,8 @@ import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from urllib.parse import urlparse
 from typing import Any, Optional
 
 import gspread
@@ -36,7 +38,7 @@ CFG_DATA_TYPE_COLUMN_CANDIDATES_DEFAULT = ["data_type", "data type"]
 CFG_PURPOSE_COLUMN_CANDIDATES_DEFAULT = ["purpose_1", "purpose", "usage", "用途"]
 
 WIDE_HEADER_ROW_DEFAULT = 1
-WIDE_WRITE_ROW_DEFAULT = 2
+WIDE_WRITE_ROW_DEFAULT = 3
 
 TARGET_WRITES_PER_MIN_DEFAULT = 40
 MAX_RETRIES_DEFAULT = 8
@@ -1528,85 +1530,339 @@ def scan_owner_columns(header_row: list[Any], *, last_col: int) -> dict[str, int
 
 
 # ============================================================
-# Wide row2 field_key write
-# ============================================================
+# Wide structure / value conversion. Planning is pure; writes happen afterwards.
+TYPE_ALIASES = {
+    'string': 'single_line_text_field', 'text': 'multi_line_text_field',
+    'int': 'number_integer', 'integer': 'number_integer', 'number': 'number_integer',
+    'float': 'number_decimal', 'decimal': 'number_decimal', 'bool': 'boolean',
+}
+REFERENCE_KINDS = {
+    'product_reference': {'Product'}, 'variant_reference': {'ProductVariant'},
+    'collection_reference': {'Collection'}, 'article_reference': {'Article'},
+    'page_reference': {'Page'}, 'customer_reference': {'Customer'},
+    'order_reference': {'Order'}, 'company_reference': {'Company'},
+    'metaobject_reference': {'Metaobject'}, 'mixed_reference': {'Metaobject'},
+    'product_taxonomy_value_reference': {'TaxonomyValue'},
+    'file_reference': {'MediaImage', 'GenericFile', 'Video'},
+}
+SCALAR_TYPES = {
+    'single_line_text_field', 'multi_line_text_field', 'number_integer',
+    'number_decimal', 'boolean', 'rich_text_field', 'json', 'date', 'date_time',
+    'url', 'color', 'id',
+} | set(REFERENCE_KINDS)
+LIST_TYPES = SCALAR_TYPES - {'boolean', 'json', 'rich_text_field', 'multi_line_text_field', 'id'}
+
+
+def _canonical_type(value: Any) -> str:
+    t = norm_text(value)
+    return ('list.' + TYPE_ALIASES.get(t[5:], t[5:])) if t.startswith('list.') else TYPE_ALIASES.get(t, t)
+
+
+def resolve_field_type(field_key: str, meta: dict[str, str]) -> str:
+    # Core fields retain their separate established write contract.
+    if field_key.startswith('core.'):
+        return ''
+    ft = _canonical_type(meta.get('field_type', ''))
+    dt = _canonical_type(meta.get('data_type', ''))
+    categories = {'metafield', 'core', 'field', 'native', 'calculated', 'display-only', 'display_only'}
+    candidates = [t for t in (ft, dt) if t and t not in categories]
+    if len(set(candidates)) > 1:
+        raise ValueError(f'{field_key}: field_type 与 data_type 不一致：{ft!r} / {dt!r}')
+    t = candidates[0] if candidates else ''
+    if not t:
+        raise ValueError(f'{field_key}: Cfg__Fields 缺少 Shopify 字段类型')
+    if t not in SCALAR_TYPES and not (t.startswith('list.') and t[5:] in LIST_TYPES):
+        raise ValueError(f'{field_key}: 暂不支持字段类型 {t!r}，停止转换')
+    return t
+
+
+def parse_input_rule(value: Any) -> str:
+    rule = str(value or '').strip().upper() or 'KEEP'
+    if rule not in {'KEEP', 'SPLIT'}:
+        raise ValueError(f'规则 {value!r} 无法识别，只能填写 KEEP / SPLIT 或留空')
+    return rule
+
+
+def _json_load(value: str) -> Any:
+    def invalid_constant(value):
+        raise ValueError(f'JSON 不允许 {value}')
+    return json.loads(value, parse_constant=invalid_constant)
+
+
+def _json_dump(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+
+
+def _validate_rich_text(node: Any, parent: str = '') -> None:
+    if not isinstance(node, dict):
+        raise ValueError('Rich Text 节点必须为对象')
+    kind = node.get('type')
+    allowed = {'': {'root'}, 'root': {'paragraph', 'heading', 'list'},
+               'paragraph': {'text', 'link', 'heading'}, 'heading': {'text', 'link'},
+               'link': {'text'}, 'list': {'list-item'}, 'list-item': {'text', 'link'}}
+    if kind not in allowed.get(parent, set()):
+        raise ValueError(f'Rich Text 节点关系不正确：{parent!r} / {kind!r}')
+    if kind == 'text':
+        if not isinstance(node.get('value'), str):
+            raise ValueError('Rich Text text.value 必须为文字')
+        for flag in ('bold', 'italic'):
+            if flag in node and not isinstance(node[flag], bool):
+                raise ValueError(f'Rich Text {flag} 必须为布尔值')
+        return
+    if kind == 'heading' and (type(node.get('level')) is not int or not 1 <= node['level'] <= 6):
+        raise ValueError('Rich Text heading.level 必须是 1–6')
+    if kind == 'list' and node.get('listType') not in {'ordered', 'unordered'}:
+        raise ValueError('Rich Text listType 必须为 ordered / unordered')
+    if kind == 'link' and not isinstance(node.get('url'), str):
+        raise ValueError('Rich Text link 缺少 url')
+    if not isinstance(node.get('children'), list) or not node['children']:
+        raise ValueError(f'Rich Text {kind} 缺少非空 children 数组')
+    for child in node['children']:
+        _validate_rich_text(child, kind)
+
+
+def _scalar_value(value: Any, t: str) -> Any:
+    if t in {'single_line_text_field', 'multi_line_text_field', 'id'}:
+        if not isinstance(value, str):
+            raise ValueError(f'{t} 必须是文字，不能是数组、对象或数字')
+        if t == 'single_line_text_field' and ('\n' in value or '\r' in value):
+            raise ValueError('单行文本不能包含换行')
+        return value
+    s = str(value).strip()
+    if t in {'number_integer', 'number_decimal'}:
+        if isinstance(value, bool):
+            raise ValueError('布尔值不能作为数字')
+        try:
+            n = Decimal(s)
+        except InvalidOperation:
+            raise ValueError(f'{t} 需要有效数字') from None
+        if not n.is_finite():
+            raise ValueError('数字不能是 NaN 或 Infinity')
+        if t == 'number_integer':
+            if n != n.to_integral_value() or abs(n) > 9007199254740991:
+                raise ValueError('整数无效或超出 Shopify 范围')
+            return str(int(n))
+        return format(n, 'f')
+    if t == 'boolean':
+        if s.lower() in {'true', '1', 'yes'}:
+            return 'true'
+        if s.lower() in {'false', '0', 'no'}:
+            return 'false'
+        raise ValueError('布尔字段请填写 true / false 或 1 / 0')
+    if t in REFERENCE_KINDS:
+        kinds = REFERENCE_KINDS[t]
+        if re.fullmatch(r'[1-9]\d*', s) and len(kinds) == 1:
+            return f'gid://shopify/{next(iter(kinds))}/{s}'
+        match = re.fullmatch(r'gid://shopify/([A-Za-z]+)/([1-9]\d*)', s)
+        if match and match.group(1) in kinds:
+            return s
+        raise ValueError(f'{t} 需要对应类型的 Shopify GID（对象类型明确时也可填数字 ID）')
+    if t == 'rich_text_field':
+        if isinstance(value, dict):
+            node = value
+        elif s.startswith(('{', '[')):
+            node = _json_load(s)
+        else:
+            if re.search(r'</?[a-zA-Z][^>]*>', s):
+                raise ValueError('Rich Text 不直接接收 HTML；请使用普通文字或 Shopify Rich Text JSON')
+            node = {'type': 'root', 'children': [
+                {'type': 'paragraph', 'children': [{'type': 'text', 'value': line}]}
+                for line in str(value).replace('\r\n', '\n').replace('\r', '\n').split('\n')
+            ]}
+        _validate_rich_text(node)
+        return node
+    if t == 'json':
+        return _json_load(value) if isinstance(value, str) else value
+    if t == 'date':
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', s):
+            raise ValueError('日期需要 YYYY-MM-DD')
+        datetime.strptime(s, '%Y-%m-%d')
+        return s
+    if t == 'date_time':
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?', s):
+            raise ValueError('日期时间需要 ISO 8601 格式')
+        datetime.fromisoformat(s.replace('Z', '+00:00'))
+        return s
+    if t == 'url':
+        parsed = urlparse(s)
+        if parsed.scheme not in {'http', 'https', 'mailto', 'sms', 'tel'} or not (parsed.netloc or parsed.path):
+            raise ValueError('URL 格式无效')
+        return s
+    if t == 'color':
+        if not re.fullmatch(r'#[0-9a-fA-F]{6}', s):
+            raise ValueError('颜色需要 #RRGGBB')
+        return s
+    raise ValueError(f'暂不支持类型 {t!r}')
+
+
+def convert_shopify_value(value: Any, t: str, rule: str = 'KEEP') -> str:
+    rule = parse_input_rule(rule)
+    is_list = t.startswith('list.')
+    if rule == 'SPLIT' and not is_list:
+        raise ValueError('只有列表字段可以填写 SPLIT')
+    if not t:
+        return '' if value is None else str(value)
+    if _is_blank(value):
+        # Preserve INCLUDE_EMPTY behavior; this is not a new CLEAR command.
+        return '[]' if is_list else ''
+    if is_list:
+        if t[5:] not in LIST_TYPES:
+            raise ValueError(f'暂不支持列表类型 {t}')
+        s = str(value).strip()
+        if isinstance(value, list):
+            items = value
+        elif s.startswith('['):
+            items = _json_load(s)  # explicit arrays win; never double-encode
+            if not isinstance(items, list):
+                raise ValueError('列表 JSON 必须为数组')
+        elif rule == 'SPLIT':
+            items = [p.strip() for p in s.split(',') if p.strip()]
+            if not items:
+                raise ValueError('SPLIT 后没有有效内容')
+        else:
+            items = [str(value)]
+        return _json_dump([_scalar_value(item, t[5:]) for item in items])
+    converted = _scalar_value(value, t)
+    return _json_dump(converted) if t in {'rich_text_field', 'json'} else str(converted)
+
+
+def plan_wide_layout(values: list[list[Any]], map_name_to_key: dict[str, str],
+                     *, generate_keys: bool = True) -> tuple[list[list[Any]], dict[str, Any]]:
+    """Recognize header/rules/keys/data without mutating a worksheet."""
+    if not values or not any(not _is_blank(v) for v in values[0]):
+        raise ValueError('Wide 第1行没有字段名')
+    width = max(i + 1 for i, v in enumerate(values[0]) if not _is_blank(v))
+    if any(any(not _is_blank(v) for v in row[width:]) for row in values):
+        raise ValueError('Wide 存在没有表头的非空列，无法安全处理')
+    rows = [list(r[:width]) + [''] * max(0, width - len(r)) for r in values]
+    while len(rows) < 3:
+        rows.append([''] * width)
+    header = rows[0]
+    owners = scan_owner_columns(header, last_col=width)
+    if not owners:
+        raise ValueError('Wide 缺少 Product ID / Variant ID 等对象身份列')
+    owner_indexes = set(owners.values())
+    known_keys = set(map_name_to_key.values()) | set(OWNER_KEY_TO_ENTITY)
+    expected = ['' if i in owner_indexes else map_name_to_key.get(norm_header(h), '')
+                for i, h in enumerate(header)]
+
+    def key_like(value):
+        s = norm_key(value)
+        return s in known_keys or bool(re.match(r'^(?:mf|v_mf|core|calc)\.', s))
+
+    def classify(row):
+        filled = [v for v in row if not _is_blank(v)]
+        if not filled:
+            return 'blank'
+        if all(str(v).strip().upper() in {'KEEP', 'SPLIT'} for v in filled):
+            if any(not _is_blank(row[i]) for i in owner_indexes):
+                raise ValueError('对象 ID 列的规则必须留空')
+            return 'rules'
+        if all(key_like(v) for v in filled):
+            return 'keys'
+        owner_values = [norm_key(row[i]) for i in owner_indexes if not _is_blank(row[i])]
+        # A nonblank cell alone is not proof of a data row. Auto-insertion
+        # requires an actual numeric ID or Shopify GID, never a misspelled rule.
+        if owner_values and all(re.fullmatch(r'[1-9]\d*|gid://shopify/[A-Za-z]+/[1-9]\d*', v)
+                                for v in owner_values):
+            return 'data'
+        raise ValueError('Wide 第2/3行存在混合内容或错误规则，无法安全判断；请检查 KEEP / SPLIT 和 Key 行')
+
+    kind2 = classify(rows[1])
+    insert_at, count = 0, 0
+    if kind2 == 'data':
+        insert_at, count = 2, 2
+    elif kind2 == 'keys':
+        insert_at, count = 2, 1
+    else:
+        kind3 = classify(rows[2])
+        if kind3 == 'data':
+            insert_at, count = 3, 1
+        elif kind3 == 'rules':
+            raise ValueError('Wide 第3行是规则，无法安全判断 Key 行位置')
+    if count:
+        rows[insert_at - 1:insert_at - 1] = [[''] * width for _ in range(count)]
+    for i, v in enumerate(rows[1]):
+        try:
+            parse_input_rule(v)
+        except ValueError as exc:
+            raise ValueError(f'Wide 第2行，第{i + 1}列：{exc}') from exc
+    for i, key in enumerate(rows[2]):
+        if _is_blank(key):
+            continue
+        owner_key = next((k for k, idx in owners.items() if idx == i), '')
+        if norm_key(key) != (owner_key if i in owner_indexes else expected[i]):
+            raise ValueError(f'Wide Key 不匹配：第{i + 1}列 {header[i]!r}，现有 {key!r}，配置 {expected[i]!r}')
+    if generate_keys:
+        rows[2] = expected
+    elif count or any(expected[i] and norm_key(rows[2][i]) != expected[i] for i in range(width)):
+        raise ValueError('Wide 需要补行或生成 Key，请启用 DO_WRITE_WIDE_KEYS')
+    misses = [{'col_num': i + 1, 'header': header[i]} for i in range(width)
+              if i not in owner_indexes and not expected[i]]
+    return rows, {'insert_at': insert_at, 'rows_inserted': count,
+                  'last_non_empty_col': width, 'hit': sum(bool(k) for k in expected),
+                  'miss': len(misses), 'owner_cols': len(owners), 'misses': misses}
+
+
+def apply_wide_layout(ws_wide, before: list[list[Any]], planned: list[list[Any]],
+                      layout_meta: dict[str, Any], *, target_writes_per_min: int,
+                      max_retries: int, base_backoff: float, jitter: float) -> None:
+    """One atomic Sheets batch: insert missing rows and write keys, never rules."""
+    current = _with_sheets_retry(lambda: ws_wide.get_all_values(), action='wide.recheck_before_write',
+                                 max_attempts=max_retries, base_sleep=base_backoff)
+    if current != before:
+        raise ValueError('Wide 在检查期间已改变，停止写入；请重新运行')
+    width = layout_meta['last_non_empty_col']
+    requests = []
+    count = layout_meta['rows_inserted']
+    if count:
+        index = layout_meta['insert_at'] - 1
+        if ws_wide.row_count < index + count:
+            requests.append({'appendDimension': {'sheetId': ws_wide.id, 'dimension': 'ROWS',
+                                                 'length': index + count - ws_wide.row_count}})
+        requests.append({'insertDimension': {'range': {'sheetId': ws_wide.id, 'dimension': 'ROWS',
+                         'startIndex': index, 'endIndex': index + count}, 'inheritFromBefore': True}})
+    elif ws_wide.row_count < 3:
+        requests.append({'appendDimension': {'sheetId': ws_wide.id, 'dimension': 'ROWS',
+                                             'length': 3 - ws_wide.row_count}})
+    requests.append({'updateCells': {'range': {'sheetId': ws_wide.id, 'startRowIndex': 2,
+                     'endRowIndex': 3, 'startColumnIndex': 0, 'endColumnIndex': width},
+                     'rows': [{'values': [{'userEnteredValue': {'stringValue': str(v)}} for v in planned[2]]}],
+                     'fields': 'userEnteredValue'}})
+    _throttle(target_writes_per_min)
+    try:
+        # Never blindly retry a non-idempotent insertion after a timeout.
+        ws_wide.spreadsheet.batch_update({'requests': requests})
+    except Exception as exc:
+        raise RuntimeError('Wide 整理请求失败或结果未知，Long 尚未覆盖；请重新运行，由程序重新识别结构') from exc
+    def canonical(rows):
+        result = [list(r) for r in rows]
+        for row in result:
+            while row and _is_blank(row[-1]):
+                row.pop()
+        while result and not result[-1]:
+            result.pop()
+        return result
+    after = _with_sheets_retry(lambda: ws_wide.get_all_values(), action='wide.verify_layout',
+                               max_attempts=max_retries, base_sleep=base_backoff)
+    if canonical(after) != canonical(planned):
+        raise RuntimeError('Wide 整理后核对不一致，停止覆盖 Long；请检查表格并重新运行')
+    print(f"✅ Wide 整理完成：插入 {count} 行 | 映射 {layout_meta['hit']} 个字段 | 规则行保留")
+
 
 def write_wide_keys_from_cfg(
-    ws_wide,
-    map_name_to_key: dict[str, str],
-    *,
-    wide_header_row: int,
-    wide_write_row: int,
-    target_writes_per_min: int,
-    max_retries: int,
-    base_backoff: float,
-    jitter: float,
+    ws_wide, map_name_to_key: dict[str, str], *, wide_header_row: int,
+    wide_write_row: int, target_writes_per_min: int, max_retries: int,
+    base_backoff: float, jitter: float,
 ) -> dict[str, Any]:
-    values = _with_sheets_retry(
-        lambda: ws_wide.get_all_values(),
-        action="wide.read_for_key_mapping",
-    )
-    if not values:
-        raise ValueError("❌ Wide 为空")
-
-    header_row = values[wide_header_row - 1] if len(values) >= wide_header_row else []
-    if not header_row:
-        raise ValueError("❌ Wide 第1行为空")
-
-    last_non_empty = 0
-    for i, v in enumerate(header_row):
-        if not _is_blank(v):
-            last_non_empty = i + 1
-    if last_non_empty == 0:
-        raise ValueError("❌ Wide 第1行没有任何字段名")
-
-    out: list[str] = []
-    hit = 0
-    miss = 0
-    owner_cols = 0
-    misses: list[dict[str, Any]] = []
-
-    for i in range(last_non_empty):
-        h = header_row[i]
-        if detect_owner_header(h):
-            out.append("")
-            owner_cols += 1
-            continue
-
-        nh = norm_header(h)
-        if nh and nh in map_name_to_key:
-            out.append(map_name_to_key[nh])
-            hit += 1
-        else:
-            out.append("")
-            miss += 1
-            misses.append({"col_num": i + 1, "header": h})
-
-    start = gspread.utils.rowcol_to_a1(wide_write_row, 1)
-    end = gspread.utils.rowcol_to_a1(wide_write_row, last_non_empty)
-    safe_update_range(
-        ws_wide,
-        f"{start}:{end}",
-        [out],
-        value_input_option="RAW",
-        target_writes_per_min=target_writes_per_min,
-        max_retries=max_retries,
-        base_backoff=base_backoff,
-        jitter=jitter,
-    )
-
-    print(
-        f"✅ Wide row{wide_write_row} written:"
-        f" cols=1..{last_non_empty} | mapped={hit} | unmapped={miss} | owner_cols={owner_cols}"
-    )
-
-    return {
-        "last_non_empty_col": last_non_empty,
-        "hit": hit,
-        "miss": miss,
-        "owner_cols": owner_cols,
-        "misses": misses,
-    }
+    if (wide_header_row, wide_write_row) != (1, 3):
+        raise ValueError("Wide 固定使用第1行表头、第2行规则、第3行 Key")
+    before = _with_sheets_retry(lambda: ws_wide.get_all_values(), action="wide.read_for_key_mapping")
+    planned, meta = plan_wide_layout(before, map_name_to_key)
+    apply_wide_layout(ws_wide, before, planned, meta,
+                      target_writes_per_min=target_writes_per_min,
+                      max_retries=max_retries, base_backoff=base_backoff, jitter=jitter)
+    return meta
 
 
 # ============================================================
@@ -1638,12 +1894,13 @@ def build_long_rows(
     """
     if len(values_2d) < 3:
         raise ValueError(
-            "❌ 宽表至少需要：第1行(header) + 第2行(field_key) + 第3行起(数据)"
+            "❌ 宽表至少需要：第1行字段名、第2行 KEEP/SPLIT、第3行 Key、第4行起数据"
         )
 
     header1 = values_2d[0]
-    key_row = values_2d[1]
-    data_rows = values_2d[2:]
+    rule_row = values_2d[1]
+    key_row = values_2d[2]
+    data_rows = values_2d[3:]
 
     last_col = 0
     for r in values_2d[: min(len(values_2d), 2000)]:
@@ -1653,6 +1910,7 @@ def build_long_rows(
 
     header1 = header1 + [""] * max(0, last_col - len(header1))
     key_row = key_row + [""] * max(0, last_col - len(key_row))
+    rules = [parse_input_rule(rule_row[i] if i < len(rule_row) else "") for i in range(last_col)]
 
     owner_cols = scan_owner_columns(header1, last_col=last_col)
     owner_col_indexes = set(owner_cols.values())
@@ -1709,10 +1967,14 @@ def build_long_rows(
 
     for col_idx in range(last_col):
         if col_idx in owner_col_indexes:
+            if col_idx < len(rule_row) and not _is_blank(rule_row[col_idx]):
+                raise ValueError(f"对象 ID 列的规则必须留空：第{col_idx + 1}列")
             continue
 
         k = norm_key(key_row[col_idx])
         if _is_blank(k):
+            if rules[col_idx] == "SPLIT":
+                raise ValueError(f"第{col_idx + 1}列填写了 SPLIT，但没有匹配到字段 Key")
             skipped_blank_key += 1
             continue
 
@@ -1731,6 +1993,10 @@ def build_long_rows(
         ):
             skipped_excluded_field += 1
             continue
+
+        field_type = resolve_field_type(k, meta)
+        if rules[col_idx] == "SPLIT" and not field_type.startswith("list."):
+            raise ValueError(f"第{col_idx + 1}列 {k}: 只有列表字段允许 SPLIT")
 
         cfg_entity = normalize_entity_type(
             map_key_to_entity.get(k, meta.get("entity_type", ""))
@@ -1780,6 +2046,8 @@ def build_long_rows(
                 "field_key": k,
                 "entity_type": entity,
                 "owner_id_key": owner_id_key,
+                "field_type": field_type,
+                "input_rule": rules[col_idx],
             }
         )
         planned_fields += 1
@@ -1799,7 +2067,7 @@ def build_long_rows(
 
     if not field_cols:
         raise ValueError(
-            "❌ 没有可输出字段列。请检查 Wide 第2行 field_key 或 Cfg__Fields。"
+            "❌ 没有可输出字段列。请检查 Wide 第3行 field_key 或 Cfg__Fields。"
         )
 
     def emit(
@@ -1825,7 +2093,7 @@ def build_long_rows(
             seen.add(row_key)
         out.append(row)
 
-    for source_row_num, r in enumerate(data_rows, start=3):
+    for source_row_num, r in enumerate(data_rows, start=4):
         if not r:
             continue
 
@@ -1862,11 +2130,18 @@ def build_long_rows(
                 )
                 continue
 
+            try:
+                converted_value = convert_shopify_value(v, fc["field_type"], fc["input_rule"])
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"Wide 第{source_row_num}行、第{fc['col_idx'] + 1}列 "
+                    f"{fc['field_key']} ({fc['field_type'] or 'core'})：{exc}"
+                ) from exc
             emit(
                 fc["entity_type"],
                 owner_id,
                 fc["field_key"],
-                v,
+                converted_value,
             )
 
     # A populated Wide sheet is never allowed to silently become an empty Long.
@@ -1897,6 +2172,8 @@ def build_long_rows(
         "skipped_excluded_field": skipped_excluded_field,
         "skipped_blank_key": skipped_blank_key,
         "rows_to_write": len(out),
+        "converted_values": len(out),
+        "error_count": 0,
     }
 
     return out, meta
@@ -2065,34 +2342,46 @@ def run(
                 cfg_entity_column_candidates=cfg_entity_column_candidates,
             )
 
-        if do_write_wide_keys:
-            wide_key_write_meta = write_wide_keys_from_cfg(
-                ws_wide,
-                map_name_to_key,
-                wide_header_row=wide_header_row,
-                wide_write_row=wide_write_row,
-                target_writes_per_min=target_writes_per_min,
-                max_retries=max_retries,
-                base_backoff=base_backoff,
-                jitter=jitter,
-            )
-            rows_recognized = int(wide_key_write_meta.get("hit", 0) or 0)
+        if (wide_header_row, wide_write_row) != (1, 3):
+            raise ValueError("Wide 固定使用第1行表头、第2行规则、第3行 Key；请同步更新 Notebook")
+        if out_chunk_rows < 1:
+            raise ValueError("out_chunk_rows 必须大于 0")
 
+        before: list[list[Any]] = []
+        values: list[list[Any]] = []
+        long_rows: list[list[str]] = []
+        if do_write_wide_keys or do_build_long:
+            before = _with_sheets_retry(lambda: ws_wide.get_all_values(), action="wide.read_for_plan")
+            values, wide_key_write_meta = plan_wide_layout(
+                before, map_name_to_key, generate_keys=do_write_wide_keys,
+            )
+            rows_recognized = int(wide_key_write_meta.get("hit", 0))
+            rows_read = max(0, len(values) - 3)
+
+        # Build and validate the COMPLETE output before any Wide/Long mutation.
         if do_build_long:
-            values = _with_sheets_retry(
-                lambda: ws_wide.get_all_values(),
-                action="wide.read_for_long_build",
-            )
-            rows_read = max(0, len(values) - 2)
-
             long_rows, long_meta = build_long_rows(
-                values,
-                map_key_to_entity,
-                map_key_meta,
-                include_empty=include_empty,
-                dedup_output=dedup_output,
+                values, map_key_to_entity, map_key_meta,
+                include_empty=include_empty, dedup_output=dedup_output,
                 exclude_display_only=exclude_display_only,
             )
+            if not long_rows:
+                raise ValueError("没有可写入的 Long 数据，保留原 Long；仅生成 Key 可关闭 DO_BUILD_LONG")
+            rows_planned = len(long_rows)
+            rows_skipped = int(long_meta.get("skipped_missing_owner", 0) or 0) + int(long_meta.get("skipped_empty_value", 0) or 0)
+
+        if do_write_wide_keys:
+            apply_wide_layout(
+                ws_wide, before, values, wide_key_write_meta,
+                target_writes_per_min=target_writes_per_min,
+                max_retries=max_retries, base_backoff=base_backoff, jitter=jitter,
+            )
+        elif do_build_long:
+            current = _with_sheets_retry(lambda: ws_wide.get_all_values(), action="wide.recheck_before_long")
+            if current != before:
+                raise ValueError("Wide 在检查期间已改变，停止覆盖 Long；请重新运行")
+
+        if do_build_long:
             rows_planned = len(long_rows)
             rows_skipped = int(long_meta.get("skipped_missing_owner", 0) or 0) + int(long_meta.get("skipped_empty_value", 0) or 0)
 
@@ -2215,7 +2504,8 @@ def run(
                 rows_planned=rows_planned,
                 rows_written=rows_written,
                 rows_skipped=rows_skipped,
-                message="wide_to_long completed",
+                message=(f"wide_to_long completed | rows_inserted={wide_key_write_meta.get('rows_inserted', 0)}"
+                         f" | converted_values={long_meta.get('converted_values', 0)} | errors=0"),
                 error_reason="",
                 target_writes_per_min=target_writes_per_min,
                 max_retries=max_retries,
@@ -2237,6 +2527,9 @@ def run(
                 "rows_recognized": rows_recognized,
                 "rows_planned": rows_planned,
                 "rows_skipped": rows_skipped,
+                "rows_inserted": wide_key_write_meta.get("rows_inserted", 0),
+                "converted_values": long_meta.get("converted_values", 0),
+                "error_count": 0,
                 "mapped_columns": wide_key_write_meta.get("hit", 0),
                 "unmapped_columns": wide_key_write_meta.get("miss", 0),
                 "owner_columns": wide_key_write_meta.get("owner_cols", 0),
