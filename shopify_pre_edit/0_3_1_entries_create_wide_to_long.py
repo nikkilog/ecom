@@ -172,7 +172,7 @@ def read_secret(
             "Workspace Secret Resolver is required for Local execution. "
             "Install it once into the active Python environment with:\n"
             f"{sys.executable} -m pip install -e "
-            "/Users/nikki/Documents/AI_Workspace/Projects/Workspace_Secret_Resolver"
+            "/Users/nikki/Documents/AI_Workspace_Next/Projects/Workspace_Secret_Resolver"
         ) from exc
 
     resolver = WorkspaceSecretResolver(
