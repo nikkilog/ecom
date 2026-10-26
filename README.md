@@ -57,6 +57,8 @@ Notebook Runners should remain thin:
 
 Real external writes require both `DRY_RUN = False` and `CONFIRMED = True`. Full details are in `docs/RUNTIME_CONTRACT.md`.
 
+实际 Notebook 的选择、逐功能默认值与已知风险，见独立工作区的 [Runner 运行导航](../Console_Core_Colab/README.md)。Python 源码的安装范围以本仓库 [pyproject.toml](pyproject.toml)（`>=3.9`）和 [requirements.txt](requirements.txt) 为准；具体 Runner 可能另有依赖。Local 按各 Notebook 的 Load 格使用正式 checkout 或其他明确路径，Colab 按实际加载格获取源码；运行时必须核对模块路径、版本和 commit。`DRY_RUN` 可能仍写 Result、Defaults 或 RunLog，详见 Runtime 合同与具体 Runner，不能只看统一门禁来判定无副作用。
+
 ## Public Registry Resolution
 
 Install the formal shared package from the canonical Local checkout:
