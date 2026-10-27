@@ -6,10 +6,12 @@ Import path: ``shopify_create.7_5_3_collection_create_apply``
 
 Execution contract
 ------------------
-1. Rebuild the current plan from Input/Defaults/Shopify using Prepare logic.
+1. Rebuild the current plan from Input/Defaults/Shopify metadata using Input logic,
+   without checking whether Collection handles exist in Shopify.
 2. Read Preview and require a matching READY row + plan_hash for every selected
    Collection. This prevents applying a stale Preview after Input changes.
-3. Re-check handle existence immediately before creation.
+3. Use Preview READY status as the handle-check decision made by Input. Apply
+   never repeats handle existence queries, including in DRY_RUN.
 4. DRY_RUN performs no Shopify writes.
 5. Live writes require ``dry_run=False`` and ``confirmed=True``.
 6. Create each Collection with ``collectionCreate(collection: ...)``.
@@ -34,7 +36,7 @@ cp = importlib.import_module("shopify_create.7_5_2_collection_create_input")
 gp = importlib.import_module("shopify_create.7_1_1_generic_product_prepare")
 ga = importlib.import_module("shopify_create.7_1_2_generic_product_apply")
 
-MODULE_VERSION = "2026-09-23-flexible-collection-create-v2"
+MODULE_VERSION = "2026-10-26-collection-apply-no-handle-recheck-v3"
 MODULE_PATH = "shopify_create.7_5_3_collection_create_apply"
 DEFAULT_JOB_NAME = "collection_create_apply"
 EXPECTED_INPUT_MODULE_VERSION = cp.MODULE_VERSION
@@ -196,7 +198,11 @@ def _select_handles(
     ready = [
         gp._safe_str(plan.get("handle"))
         for plan in current_plans
-        if plan.get("status") == "READY" and gp._safe_str(plan.get("handle"))
+        if plan.get("status") == "READY"
+        and gp._safe_str(plan.get("handle"))
+        and gp._safe_str(
+            preview_rows.get(gp._safe_str(plan.get("handle")), {}).get("status")
+        ).upper() == "READY"
     ]
     ready_set = set(ready)
 
@@ -211,7 +217,7 @@ def _select_handles(
         missing = [handle for handle in requested if handle not in ready_set]
         if missing:
             raise ValueError(
-                "Requested handles are not READY in the current rebuilt plan: "
+                "Requested handles must be READY in both Preview and the current rebuilt plan: "
                 f"{missing}"
             )
         selected = requested
@@ -451,16 +457,13 @@ def run(
         defaults = cp._ensure_defaults(create_book, tab_defaults)
         publish_all_channels = bool(gp._normalize_bool(defaults["publish_all_channels"]))
         definitions = cp._load_metafield_definitions(client)
-        grouped = cp._group_rows(rows)
-        existing_by_handle: Dict[str, Optional[Mapping[str, Any]]] = {
-            handle: (cp._collection_by_handle(client, handle) if handle else None)
-            for handle in grouped
-        }
+        # Input already checked handles (or accepted manual verification).
+        # Rebuild content/conditions only; Preview remains the eligibility gate.
         plans = cp._build_plans(
             rows=rows,
             metafield_definitions=definitions,
             publish_all_channels=publish_all_channels,
-            existing_by_handle=existing_by_handle,
+            existing_by_handle={},
         )
         plans_by_handle = {gp._safe_str(plan.get("handle")): plan for plan in plans}
 
@@ -487,14 +490,7 @@ def run(
             publication_ids = _publication_ids(client)
         print(f"[Publications] available={len(publication_ids)}")
 
-        progress(6, 10, "Re-check selected handles immediately before create")
-        for handle in selected:
-            existing = cp._collection_by_handle(client, handle)
-            if existing:
-                raise RuntimeError(
-                    f"Collection handle became occupied after Prepare: {handle} | "
-                    f"gid={gp._safe_str(existing.get('id'))}. Run Prepare again."
-                )
+        progress(6, 10, "Use Preview READY decisions | no Handle existence queries")
 
         progress(7, 10, f"Apply Collections | dry_run={dry_run} | confirmed={confirmed}")
         result_rows: List[Dict[str, Any]] = []
@@ -637,6 +633,7 @@ def run(
             message=(
                 f"dry_run={dry_run} | confirmed={confirmed} | selected={len(selected)} | "
                 f"succeeded={succeeded} | failed={failed} | result_rows_written={rows_written} | "
+                "handle_check_mode=USE_PREVIEW | handle_lookup_requests=0 | "
                 f"shopify_requests={client.request_count} | shopify_retries={client.retry_count}"
             ),
             error_reason="COLLECTION_CREATE_FAILURE" if failed else "",
@@ -661,6 +658,8 @@ def run(
                 "collections_failed": failed,
                 "result_rows_written": rows_written,
                 "publications_available": len(publication_ids),
+                "handle_check_mode": "USE_PREVIEW",
+                "handle_lookup_requests": 0,
                 "shopify_requests": client.request_count,
                 "shopify_retries": client.retry_count,
                 "elapsed_seconds": elapsed,

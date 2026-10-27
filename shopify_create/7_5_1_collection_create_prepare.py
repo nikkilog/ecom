@@ -7,15 +7,15 @@ Import path: ``shopify_create.7_5_1_collection_create_prepare``
 Scope
 -----
 - Resolve the ``create_collection`` workbook and ``config`` workbook via Console Core.
-- Read ``Prepare`` where column A is ``Title`` and every remaining condition is a
-  dynamic pair: ``<CONDITION_TYPE>-N`` + ``Value-N``.
+- Read ``Prepare`` where column A is ``Title``, column B is ``Handle``, and
+  conditions start in column C as dynamic pairs: ``<CONDITION_TYPE>-N`` + ``Value-N``.
 - Convert each wide Collection row to the long ``Input`` contract used by
   Collection Create Prepare/Apply.
 - For ``PRODUCT_METAFIELD-N``, resolve the cell value under that header against
   ``Cfg__Fields.display_name`` and output product metafield ``namespace`` + ``key``.
 - Default ``match_type=ALL`` and ``relation=AUTO``.
 - If a title contains no uppercase letters, apply Title Case; otherwise preserve it.
-- Generate a URL-safe handle from the normalized title.
+- Use a supplied handle (trimmed); otherwise generate one from the normalized title.
 - Overwrite ``Input`` and write RunLog evidence.
 
 This module does not call Shopify and does not touch Preview/Defaults/Result.
@@ -24,7 +24,13 @@ Prepare contract
 ----------------
 Example headers::
 
-    Title | PRODUCT_METAFIELD-1 | Value-1 | PRODUCT_TYPE-2 | Value-2 | ...
+    Title | Handle | PRODUCT_METAFIELD-1 | Value-1 | PRODUCT_TYPE-2 | Value-2 | ...
+
+Column B must be ``Handle``. Each row may leave it blank (including whitespace)
+to generate a URL-safe handle using the existing title-based rule. A nonblank
+handle is used as supplied after trimming leading/trailing whitespace; it is
+not slugified or replaced. Duplicate final handles are rejected regardless of
+whether they were supplied or generated.
 
 The sequence is global across a row and may contain mixed condition types. Header
 pairs must be consecutive and numbered 1..N with no gaps. A row may leave a whole
@@ -54,7 +60,7 @@ import pandas as pd
 
 gp = importlib.import_module("shopify_create.7_1_1_generic_product_prepare")
 
-MODULE_VERSION = "2026-09-23-collection-create-prepare-v2"
+MODULE_VERSION = "2026-10-26-collection-create-prepare-v3"
 MODULE_PATH = "shopify_create.7_5_1_collection_create_prepare"
 DEFAULT_JOB_NAME = "collection_create_prepare"
 
@@ -151,9 +157,15 @@ def _parse_prepare_schema(headers: Sequence[Any]) -> List[ConditionColumn]:
             f"got={normalized[0] if normalized else '<missing>'!r}."
         )
 
+    if len(normalized) < 2 or normalized[1].casefold() != "handle":
+        raise ValueError(
+            "Prepare column B must be Handle (values may be blank). "
+            f"got={normalized[1] if len(normalized) > 1 else '<missing>'!r}."
+        )
+
     specs: List[ConditionColumn] = []
     seen_seq = set()
-    i = 1
+    i = 2
     while i < len(normalized):
         header = normalized[i]
         if not header:
@@ -345,20 +357,21 @@ def build_input_matrix(
     for source_row, raw in enumerate(prepare_values[1:], start=2):
         padded = list(raw) + [""] * max(0, width - len(raw))
         title_raw = _normalize_space(padded[0] if padded else "")
+        handle_raw = _safe_str(padded[1])
         pair_values = [
             _safe_str(padded[spec.condition_col]) or _safe_str(padded[spec.value_col])
             for spec in specs
         ]
-        if not title_raw and not any(pair_values):
+        if not title_raw and not handle_raw and not any(pair_values):
             continue
         if not title_raw:
             raise ValueError(f"Prepare row {source_row}: Title is required.")
 
         title = _normalize_title(title_raw)
-        handle = _slugify_title(title)
+        handle = handle_raw or _slugify_title(title)
         if handle in seen_handles:
             raise ValueError(
-                f"Prepare rows {seen_handles[handle]} and {source_row} generate duplicate "
+                f"Prepare rows {seen_handles[handle]} and {source_row} have duplicate "
                 f"handle={handle!r}. Use one Prepare row per Collection."
             )
         seen_handles[handle] = source_row

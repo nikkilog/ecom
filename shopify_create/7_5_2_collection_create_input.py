@@ -10,7 +10,7 @@ Scope
 - Read ``Input`` with one row per collection condition.
 - Group rows by Collection handle; mixed condition types are supported.
 - Resolve metafield definitions from Shopify and convert ``AUTO`` relations.
-- Detect existing Collection handles before Apply.
+- Check existing Collection handles in batches, or accept manual verification.
 - Overwrite ``Preview`` with READY/BLOCKED plans and a stable plan hash.
 - Seed/read ``Defaults`` with ``publish_all_channels=TRUE``.
 - Write RunLog evidence.
@@ -59,7 +59,7 @@ import pandas as pd
 gp = importlib.import_module("shopify_create.7_1_1_generic_product_prepare")
 ga = importlib.import_module("shopify_create.7_1_2_generic_product_apply")
 
-MODULE_VERSION = "2026-09-23-flexible-collection-create-input-v2"
+MODULE_VERSION = "2026-10-26-collection-input-batch-handles-v3"
 MODULE_PATH = "shopify_create.7_5_2_collection_create_input"
 DEFAULT_JOB_NAME = "collection_create_input"
 MIN_API_VERSION = (2026, 7)
@@ -368,6 +368,100 @@ def _collection_by_handle(client: ga.ShopifyClient, handle: str) -> Optional[Dic
     )
     node = data.get("collectionByIdentifier")
     return dict(node) if isinstance(node, Mapping) else None
+
+
+def _validate_handle_check_options(
+    handles_already_verified: bool, handle_check_batch_size: int
+) -> None:
+    if not isinstance(handles_already_verified, bool):
+        raise ValueError("handles_already_verified must be True or False.")
+    if (
+        isinstance(handle_check_batch_size, bool)
+        or not isinstance(handle_check_batch_size, int)
+        or not 1 <= handle_check_batch_size <= 100
+    ):
+        raise ValueError("handle_check_batch_size must be an integer from 1 to 100.")
+
+
+def _check_existing_handles(
+    client: ga.ShopifyClient,
+    handles: Iterable[str],
+    *,
+    handles_already_verified: bool = False,
+    handle_check_batch_size: int = 30,
+    print_progress: bool = True,
+) -> Tuple[Dict[str, Optional[Dict[str, Any]]], Dict[str, Any]]:
+    """Batch exact identifier lookups; manual mode performs no handle queries.
+
+    Keep GraphQL values in variables, and distinguish an explicit null (absent)
+    from a missing alias or invalid response (lookup failed).
+    """
+    _validate_handle_check_options(handles_already_verified, handle_check_batch_size)
+    unique_handles = list(dict.fromkeys(handles))
+    wanted = [handle for handle in unique_handles if handle]
+    result: Dict[str, Optional[Dict[str, Any]]] = {
+        handle: None for handle in unique_handles
+    }
+    evidence: Dict[str, Any] = {
+        "mode": "MANUAL_VERIFIED" if handles_already_verified else "BATCH_QUERY",
+        "batch_size": handle_check_batch_size,
+        "handles_total": len(wanted),
+        "handles_checked": 0,
+        "handles_existing": 0,
+        "batches_completed": 0,
+    }
+    if handles_already_verified:
+        if print_progress:
+            print(
+                "[Handle check] MANUAL_VERIFIED | "
+                "人工已核查，跳过在线查重 | "
+                f"handles={len(wanted)} | handle_lookup_requests=0"
+            )
+        return result, evidence
+
+    batch_count = (len(wanted) + handle_check_batch_size - 1) // handle_check_batch_size
+    for offset in range(0, len(wanted), handle_check_batch_size):
+        batch = wanted[offset:offset + handle_check_batch_size]
+        declarations = ", ".join(
+            f"$identifier_{index}: CollectionIdentifierInput!"
+            for index in range(len(batch))
+        )
+        fields = "\n".join(
+            f"  h{index}: collectionByIdentifier(identifier: $identifier_{index}) "
+            "{ id title handle }"
+            for index in range(len(batch))
+        )
+        query = f"query CollectionHandlesBatch({declarations}) {{\n{fields}\n}}"
+        variables = {
+            f"identifier_{index}": {"handle": handle}
+            for index, handle in enumerate(batch)
+        }
+        data = client.gql(query, variables, operation_name="CollectionHandlesBatch")
+        if not isinstance(data, Mapping):
+            raise RuntimeError("Handle batch lookup returned invalid GraphQL data.")
+        for index, handle in enumerate(batch):
+            alias = f"h{index}"
+            if alias not in data:
+                raise RuntimeError(f"Handle lookup missing response for {handle!r}.")
+            node = data[alias]
+            if node is not None:
+                if (
+                    not isinstance(node, Mapping)
+                    or not gp._safe_str(node.get("id"))
+                    or gp._safe_str(node.get("handle")) != handle
+                ):
+                    raise RuntimeError(f"Handle lookup returned invalid result for {handle!r}.")
+                result[handle] = dict(node)
+        evidence["handles_checked"] += len(batch)
+        evidence["handles_existing"] += sum(result[handle] is not None for handle in batch)
+        evidence["batches_completed"] += 1
+        if print_progress:
+            print(
+                f"[Handle check {evidence['batches_completed']}/{batch_count}] "
+                f"checked={evidence['handles_checked']}/{len(wanted)} | "
+                f"existing={evidence['handles_existing']}"
+            )
+    return result, evidence
 
 
 def _auto_relation(condition_type: str, metafield_type: str = "") -> str:
@@ -776,7 +870,10 @@ def run(
     shopify_token_value: Optional[str] = None,
     api_timeout_seconds: int = 120,
     api_max_retries: int = 6,
+    handles_already_verified: bool = False,
+    handle_check_batch_size: int = 30,
 ) -> Dict[str, Any]:
+    _validate_handle_check_options(handles_already_verified, handle_check_batch_size)
     site_code = gp._normalize_site_code(site_code)
     if not site_code:
         raise ValueError("site_code is required.")
@@ -860,18 +957,14 @@ def run(
         definitions = _load_metafield_definitions(client)
         print(f"[Metafield definitions] usable_product_definitions={len(definitions)}")
 
-        progress(6, 9, "Check existing Collection handles")
-        existing_by_handle: Dict[str, Optional[Mapping[str, Any]]] = {}
-        for index, handle in enumerate(_group_rows(rows), start=1):
-            if not handle:
-                existing_by_handle[handle] = None
-                continue
-            existing_by_handle[handle] = _collection_by_handle(client, handle)
-            if print_progress:
-                print(
-                    f"  [{index}/{len(_group_rows(rows))}] {handle} | "
-                    f"exists={bool(existing_by_handle[handle])}"
-                )
+        progress(6, 9, "Resolve Handle check mode: batch query or manual verification")
+        existing_by_handle, handle_check = _check_existing_handles(
+            client,
+            _group_rows(rows),
+            handles_already_verified=handles_already_verified,
+            handle_check_batch_size=handle_check_batch_size,
+            print_progress=print_progress,
+        )
 
         progress(7, 9, "Resolve mixed conditions and build Preview plans")
         plans = _build_plans(
@@ -914,6 +1007,9 @@ def run(
             message=(
                 f"collections={len(plans)} | ready={len(ready)} | blocked={len(blocked)} | "
                 f"publish_all_channels={publish_all_channels} | "
+                f"handle_check_mode={handle_check['mode']} | "
+                f"handles_checked={handle_check['handles_checked']} | "
+                f"handle_check_batches={handle_check['batches_completed']} | "
                 f"shopify_requests={client.request_count} | shopify_retries={client.retry_count}"
             ),
             error_reason="COLLECTIONS_BLOCKED" if blocked else "",
@@ -954,10 +1050,15 @@ def run(
                 "collections_blocked": len(blocked),
                 "preview_rows_written": rows_written,
                 "publish_all_channels": publish_all_channels,
+                "handle_check_mode": handle_check["mode"],
+                "handles_checked": handle_check["handles_checked"],
+                "handles_existing": handle_check["handles_existing"],
+                "handle_check_batches": handle_check["batches_completed"],
                 "shopify_requests": client.request_count,
                 "shopify_retries": client.retry_count,
                 "elapsed_seconds": elapsed,
             },
+            "handle_check": handle_check,
             "plans": plans,
             "preview": df,
             "runtime": {
@@ -1007,6 +1108,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--create-sheet-label", default="create_collection")
     parser.add_argument("--runlog-sheet-label", default="runlog_sheet")
     parser.add_argument("--no-write-preview", action="store_true")
+    parser.add_argument(
+        "--handles-already-verified", action="store_true",
+        help="I have manually verified that these handles do not exist; skip online handle checks.",
+    )
+    parser.add_argument("--handle-check-batch-size", type=int, default=30)
     return parser
 
 
@@ -1019,6 +1125,8 @@ def main() -> None:
         create_sheet_label=args.create_sheet_label,
         runlog_sheet_label=args.runlog_sheet_label,
         write_preview=not args.no_write_preview,
+        handles_already_verified=args.handles_already_verified,
+        handle_check_batch_size=args.handle_check_batch_size,
     )
     print(json.dumps({k: v for k, v in result.items() if k not in {"plans", "preview"}}, ensure_ascii=False, indent=2))
 
